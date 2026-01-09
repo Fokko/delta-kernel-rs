@@ -8,10 +8,10 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema, get_log_add_schema,
-    get_log_content_root_schema, get_log_domain_metadata_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata, SetTransaction,
-    INTERNAL_DOMAIN_PREFIX,
+    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_add_schema,
+    get_log_commit_info_schema, get_log_content_root_schema, get_log_domain_metadata_schema,
+    get_log_remove_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
+    SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -19,9 +19,9 @@ use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
-use crate::metadata::writer::MetadataWriter;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
+use crate::metadata::writer::MetadataWriter;
 use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
@@ -1222,29 +1222,27 @@ impl Transaction {
                 Some("deletionVector"),
                 Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
                     .into(),
-
             )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
             .with_dropped_field("modificationTime")
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::null_literal(DataType::STRING).into(),
-                )
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::null_literal(DataType::LONG).into(),
-                )
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::null_literal(DataType::STRING).into(),
-                )
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::null_literal(DataType::LONG).into(),
-                )
-                .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-                .with_dropped_field("modificationTime");
-        
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::null_literal(DataType::STRING).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::null_literal(DataType::LONG).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::null_literal(DataType::STRING).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::null_literal(DataType::LONG).into(),
+            )
+            .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+            .with_dropped_field("modificationTime");
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {

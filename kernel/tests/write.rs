@@ -2250,12 +2250,12 @@ async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> 
 
         // Test that the transaction can be committed successfully
         assert!(txn.commit(&engine)?.is_committed());
-
     }
 
     Ok(())
 }
 
+#[tokio::test]
 async fn test_update_deletion_vectors_adds_expected_entries(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that deletion vector updates write proper Remove and Add actions

@@ -245,7 +245,8 @@ impl Snapshot {
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            }.build()?,
+            }
+            .build()?,
             log_root,
             new_version,
             // Preserve checkpoint schema from old segment
@@ -559,7 +560,6 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFilesBuilder;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;

@@ -23,11 +23,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-<<<<<<< HEAD
-use crate::scan::log_replay::BASE_ROW_ID_NAME;
-=======
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
->>>>>>> c942285093004b849176881dd7e997573eb7fa30
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,

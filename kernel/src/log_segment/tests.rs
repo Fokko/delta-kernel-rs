@@ -2517,6 +2517,7 @@ fn test_content_root_found_in_commit() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;

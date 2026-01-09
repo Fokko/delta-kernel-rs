@@ -235,6 +235,7 @@ impl ListedLogFiles {
     // Note: for now we expose the constructor as pub(crate) to allow for use in testing. Ideally,
     // we should explore entirely encapsulating ListedLogFiles within LogSegment - currently
     // LogSegment constructor requires a ListedLogFiles.
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn try_new(
         ascending_commit_files: Vec<ParsedLogPath>,
@@ -321,7 +322,7 @@ impl ListedLogFiles {
     pub(crate) fn latest_commit_file(&self) -> &Option<ParsedLogPath> {
         &self.latest_commit_file
     }
-    
+
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
     /// (inclusive). All other types are ignored.
     pub(crate) fn list_commits(

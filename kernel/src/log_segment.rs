@@ -12,12 +12,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
-<<<<<<< HEAD
-use crate::schema::ToSchema;
-use crate::schema::{SchemaRef, StructField};
-=======
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
->>>>>>> c942285093004b849176881dd7e997573eb7fa30
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
