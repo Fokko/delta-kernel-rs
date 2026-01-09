@@ -49,6 +49,7 @@ typedef struct
 {
   int list_count;
   SchemaItemList* lists;
+  SharedExternEngine* engine;
 } SchemaBuilder;
 
 typedef struct
@@ -109,12 +110,22 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
-void print_physical_name(const char *name, const CStringMap* metadata)
+void print_physical_name(const char *name, const CStringMap* metadata, SharedExternEngine* engine)
 {
 #ifdef VERBOSE
   char* key_str = "delta.columnMapping.physicalName";
   KernelStringSlice key = { key_str, strlen(key_str) };
+<<<<<<< HEAD
   char* value = get_from_string_map(metadata, key, allocate_string);
+=======
+  ExternResultNullableCvoid res = get_from_string_map(metadata, key, allocate_string, engine);
+  if (res.tag != OkNullableCvoid) {
+    printf("Failed to get physical name\n");
+    free_error((Error*)res.err);
+    return;
+  }
+  char* value = res.ok;
+>>>>>>> c942285093004b849176881dd7e997573eb7fa30
   if (value) {
     printf("Physical name of %s is %s\n", name, value);
     free(value);
@@ -124,6 +135,7 @@ void print_physical_name(const char *name, const CStringMap* metadata)
 #else
   (void)name;
   (void)metadata;
+  (void)engine;
 #endif
 }
 
@@ -157,7 +169,7 @@ void visit_struct(
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
   PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
-  print_physical_name(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata, builder->engine);
   SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct", is_nullable);
   struct_item->children = child_list_id;
 }
@@ -172,7 +184,11 @@ void visit_array(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
+<<<<<<< HEAD
   print_physical_name(name_ptr, metadata);
+=======
+  print_physical_name(name_ptr, metadata, builder->engine);
+>>>>>>> c942285093004b849176881dd7e997573eb7fa30
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
@@ -188,7 +204,11 @@ void visit_map(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
+<<<<<<< HEAD
   print_physical_name(name_ptr, metadata);
+=======
+  print_physical_name(name_ptr, metadata, builder->engine);
+>>>>>>> c942285093004b849176881dd7e997573eb7fa30
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
@@ -207,7 +227,7 @@ void visit_decimal(
   char* name_ptr = allocate_string(name);
   char* type = malloc(19 * sizeof(char));
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
-  print_physical_name(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
@@ -222,7 +242,7 @@ void visit_simple_type(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  print_physical_name(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
@@ -273,12 +293,13 @@ void free_cschema(CSchema *schema) {
 }
 
 // Get the schema of the snapshot
-CSchema* get_cschema(SharedSnapshot* snapshot)
+CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
 {
   print_diag("Building schema\n");
   SchemaBuilder* builder = malloc(sizeof(SchemaBuilder));
   builder->list_count = 0;
   builder->lists = NULL;
+  builder->engine = engine;
   EngineSchemaVisitor visitor = {
     .data = builder,
     .make_field_list = make_field_list,
