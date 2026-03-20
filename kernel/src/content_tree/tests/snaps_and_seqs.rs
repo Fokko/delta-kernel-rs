@@ -73,7 +73,7 @@ fn write_root_manifest(
     table_root: &Url,
     snapshot_id: i64,
 ) -> DeltaResult<String> {
-    let root = builder.build(engine, snapshot_id)?;
+    let (root, _) = builder.build(engine, snapshot_id, None)?;
     let root_url = ContentTreeNodeWriter::try_new(root)?
         .write(engine)?
         .location;
@@ -86,7 +86,7 @@ fn build_and_read_root(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let root_metadata = builder.build(engine, snapshot_id)?;
+    let (root_metadata, _) = builder.build(engine, snapshot_id, None)?;
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(engine)?
@@ -105,7 +105,7 @@ fn build_and_read_leaf(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let leaf_metadata = builder.build_leaf(engine, snapshot_id)?;
+    let (leaf_metadata, _) = builder.build_leaf(engine, snapshot_id, None)?;
     let table_root = leaf_metadata.table_root.clone();
     let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?
         .write(engine)?
@@ -222,7 +222,7 @@ fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::erro
     )?;
 
     // Write as a leaf manifest and verify the CombinedManifest entry
-    let manifest_entry = builder.write_leaf(&engine, 3)?;
+    let (manifest_entry, _) = builder.write_leaf(&engine, 3, None)?;
     assert_eq!(
         manifest_entry.content_type,
         DataContentType::CombinedManifest

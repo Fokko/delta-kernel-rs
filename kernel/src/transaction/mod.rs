@@ -10,8 +10,8 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_content_root_schema,
-    get_log_remove_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
-    SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
@@ -458,7 +458,7 @@ impl<S> Transaction<S> {
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
-        let (domain_metadata_actions, dm_changes) =
+        let (domain_metadata_actions, mut dm_changes) =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Start with commit info action
@@ -646,7 +646,42 @@ impl<S> Transaction<S> {
                 }
             }
 
-            let new_metadata = metadata_builder.build(engine, snapshot_id)?;
+            // Determine starting row ID for row tracking in the content tree.
+            // Use the batch state's cursor (which was advanced by leaf writes) if available,
+            // otherwise read the HWM from the snapshot.
+            let needs_row_tracking = self
+                .read_snapshot
+                .table_configuration()
+                .should_write_row_tracking();
+            let starting_first_row_id = if needs_row_tracking {
+                let cursor = self.batch_state.as_ref().and_then(|b| b.row_id_cursor);
+                if let Some(c) = cursor {
+                    Some(c)
+                } else {
+                    let hwm = RowTrackingDomainMetadata::get_high_water_mark(
+                        &self.read_snapshot,
+                        engine,
+                    )?;
+                    Some(hwm.unwrap_or(-1) + 1)
+                }
+            } else {
+                None
+            };
+
+            let (new_metadata, next_row_id) =
+                metadata_builder.build(engine, snapshot_id, starting_first_row_id)?;
+
+            // Write new row tracking HWM domain metadata for the batch commit path
+            if let Some(final_cursor) = next_row_id {
+                let new_hwm = final_cursor - 1;
+                let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
+                let dm_action: DomainMetadata = rt_dm.try_into()?;
+                let schema = get_log_domain_metadata_schema().clone();
+                let dm_data = dm_action.clone().into_engine_data(schema, engine)?;
+                actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(dm_data)));
+                dm_changes.push(dm_action);
+            }
+
             let ContentTreeWriteResult {
                 location: content_metadata_path,
                 size_in_bytes,
@@ -2449,11 +2484,11 @@ mod tests {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let (root_metadata, _) = root_builder.build(&engine, 1, None)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2547,11 +2582,11 @@ mod tests {
         for path in &data_files {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let (root_metadata, _) = root_builder.build(&engine, 1, None)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2686,14 +2721,14 @@ mod tests {
         // File without DV
         data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1)?;
+        let (data_leaf_entry, _) = data_leaf_builder.write_leaf(&engine, 1, None)?;
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let (root_metadata, _) = root_builder.build(&engine, 1, None)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;

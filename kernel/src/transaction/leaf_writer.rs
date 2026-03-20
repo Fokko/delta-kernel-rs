@@ -27,6 +27,10 @@ pub struct LeafNodeWriterResult {
 
     /// Root DV entries to remove (DV paths that should be removed from root DV manifest)
     pub(crate) root_dv_entries_to_remove: HashSet<String>,
+
+    /// Next available row ID after all assignments in this leaf.
+    /// `Some` when row tracking is enabled, `None` otherwise.
+    pub(crate) next_row_id: Option<i64>,
 }
 
 /// Builder for creating leaf manifests.
@@ -66,6 +70,10 @@ pub struct LeafNodeWriter {
     /// Whether to track root entries for removal.
     /// Set to false when Transaction has released root to client control.
     track_root_removals: bool,
+
+    /// Starting first_row_id for row tracking assignment in the leaf.
+    /// When `Some`, `first_row_id` values are assigned to data entries sequentially.
+    starting_first_row_id: Option<i64>,
 }
 
 /// Context for tracking manifest entry deletions
@@ -225,6 +233,7 @@ impl LeafNodeWriter {
         table_schema: SchemaRef,
         track_root_removals: bool,
         root_manifest_path: Option<String>,
+        starting_first_row_id: Option<i64>,
     ) -> Self {
         Self {
             data_builder: ContentTreeNodeBuilder::new_for(
@@ -240,6 +249,7 @@ impl LeafNodeWriter {
             snapshot_id,
             root_manifest_path,
             track_root_removals,
+            starting_first_row_id,
         }
     }
 
@@ -328,11 +338,15 @@ impl LeafNodeWriter {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
         // In the new CombinedManifest model, DV info is inline on data entries,
         // so no separate DV manifest is needed.
-        let data_manifest_entry = if self.data_builder.has_entries() {
-            let entry = self.data_builder.write_leaf(engine, self.snapshot_id)?;
-            Some(entry)
+        let (data_manifest_entry, next_row_id) = if self.data_builder.has_entries() {
+            let (entry, next_id) = self.data_builder.write_leaf(
+                engine,
+                self.snapshot_id,
+                self.starting_first_row_id,
+            )?;
+            (Some(entry), next_id)
         } else {
-            None
+            (None, self.starting_first_row_id)
         };
 
         Ok(LeafNodeWriterResult {
@@ -340,6 +354,7 @@ impl LeafNodeWriter {
             root_entries_to_remove: self.root_entries_to_remove,
             root_dv_entries_to_remove: self.root_dv_entries_to_remove,
             data_file_manifest_written: data_manifest_entry,
+            next_row_id,
         })
     }
 }
@@ -933,6 +948,7 @@ mod tests {
             schema.clone(),
             true,
             None,
+            None,
         );
 
         // Add files with Delta JSON format stats (like the engine produces when writing parquet).
@@ -1180,8 +1196,15 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema,
+            true,
+            None,
+            None,
+        );
 
         // Add 10 files (path, size, modification_time)
         let files: Vec<_> = (0..10)
@@ -1214,8 +1237,15 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
+        let writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema,
+            true,
+            None,
+            None,
+        );
 
         // Don't add any files, just call finish
         let result = writer.finish(engine.as_ref())?;
@@ -1243,8 +1273,15 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema,
+            true,
+            None,
+            None,
+        );
 
         // 4 files with no stats — selection vector keeps rows 0 and 2
         let engine_data = create_scan_row_engine_data(
@@ -1369,6 +1406,7 @@ mod tests {
             schema.clone(),
             true,
             None,
+            None,
         );
 
         // Scan row with non-null `stats` JSON and null `stats_parsed` — fallback path of coalesce.
@@ -1417,6 +1455,7 @@ mod tests {
             snapshot_id,
             schema.clone(),
             true,
+            None,
             None,
         );
 

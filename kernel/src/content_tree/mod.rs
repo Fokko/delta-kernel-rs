@@ -3552,7 +3552,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        builder.build(engine, 1)
+        builder.build(engine, 1, None).map(|(node, _)| node)
     }
 
     /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
@@ -3570,7 +3570,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        let metadata = builder.build(engine, 1)?;
+        let (metadata, _) = builder.build(engine, 1, None)?;
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?
