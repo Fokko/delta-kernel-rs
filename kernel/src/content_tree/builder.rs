@@ -1094,16 +1094,16 @@ impl ContentTreeNodeBuilder {
     #[instrument(name = "content_tree.write_leaf", skip_all, err)]
     /// Builds and writes a leaf manifest, returning the CombinedManifest entry for the root.
     ///
-    /// When `starting_first_row_id` is `Some`, assigns sequential `first_row_id` values to
-    /// data entries in the leaf. The returned CombinedManifest entry will have its
+    /// Assigns sequential `first_row_id` values to data entries in the leaf starting from
+    /// `starting_first_row_id`. The returned CombinedManifest entry will have its
     /// `first_row_id` set to the starting value used for the leaf's data entries.
-    /// Returns the manifest entry and the next available row ID (if row tracking enabled).
+    /// Returns the manifest entry and the next available row ID after all assignments.
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: i64,
-        starting_first_row_id: Option<i64>,
-    ) -> DeltaResult<(ContentTreeNodeEntry, Option<i64>)> {
+        starting_first_row_id: i64,
+    ) -> DeltaResult<(ContentTreeNodeEntry, i64)> {
         // Build the leaf metadata with a UUID
         let (leaf_metadata, next_row_id) =
             self.build_leaf(engine, snapshot_id, starting_first_row_id)?;
@@ -1190,7 +1190,7 @@ impl ContentTreeNodeBuilder {
                 sequence_number: None,
                 file_sequence_number: None,
                 // Set to the starting row ID used for data entries in this leaf
-                first_row_id: starting_first_row_id,
+                first_row_id: Some(starting_first_row_id),
                 changes_dv: None,
             })
             .record_count(record_count)
@@ -1204,28 +1204,25 @@ impl ContentTreeNodeBuilder {
 
     /// Builds a root ContentTreeNode instance (leaf is `None`).
     ///
-    /// When `starting_first_row_id` is `Some`, assigns sequential `first_row_id` values to
-    /// entries that don't already have one. Returns the built node and the next available
+    /// Assigns sequential `first_row_id` values to entries that don't already have one,
+    /// starting from `starting_first_row_id`. Returns the built node and the next available
     /// row ID (for updating the high water mark).
     pub(crate) fn build(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: i64,
-        starting_first_row_id: Option<i64>,
-    ) -> DeltaResult<(ContentTreeNode, Option<i64>)> {
+        starting_first_row_id: i64,
+    ) -> DeltaResult<(ContentTreeNode, i64)> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
 
-        // Assign first_row_id values if row tracking is enabled
-        let next_row_id = if let Some(start) = starting_first_row_id {
-            let cursor = self.assign_first_row_ids(start);
-            let cursor = self.assign_first_row_ids_pre_built(engine, cursor)?;
-            Some(cursor)
-        } else {
-            None
+        // Assign first_row_id values
+        let next_row_id = {
+            let cursor = self.assign_first_row_ids(starting_first_row_id);
+            self.assign_first_row_ids_pre_built(engine, cursor)?
         };
 
         // Use cached schema with content_stats based on table schema
@@ -1278,27 +1275,24 @@ impl ContentTreeNodeBuilder {
 
     /// Builds a leaf ContentTreeNode instance with a generated UUID.
     ///
-    /// When `starting_first_row_id` is `Some`, assigns sequential `first_row_id` values to
-    /// data entries. Returns the built node and the next available row ID.
+    /// Assigns sequential `first_row_id` values to data entries starting from
+    /// `starting_first_row_id`. Returns the built node and the next available row ID.
     pub(crate) fn build_leaf(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: i64,
-        starting_first_row_id: Option<i64>,
-    ) -> DeltaResult<(ContentTreeNode, Option<i64>)> {
+        starting_first_row_id: i64,
+    ) -> DeltaResult<(ContentTreeNode, i64)> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
 
-        // Assign first_row_id values if row tracking is enabled
-        let next_row_id = if let Some(start) = starting_first_row_id {
-            let cursor = self.assign_first_row_ids(start);
-            let cursor = self.assign_first_row_ids_pre_built(engine, cursor)?;
-            Some(cursor)
-        } else {
-            None
+        // Assign first_row_id values
+        let next_row_id = {
+            let cursor = self.assign_first_row_ids(starting_first_row_id);
+            self.assign_first_row_ids_pre_built(engine, cursor)?
         };
 
         // Use cached schema with content_stats based on table schema
@@ -2157,7 +2151,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let (root_metadata, _) = builder.build(engine, snapshot_id, None)?;
+        let (root_metadata, _) = builder.build(engine, snapshot_id, 0)?;
         let table_root = root_metadata.table_root.clone();
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
@@ -2356,7 +2350,7 @@ mod tests {
 
         // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
-        let (metadata, _) = builder.build(&engine, 1, None)?;
+        let (metadata, _) = builder.build(&engine, 1, 0)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].record_count, 100);
@@ -2611,7 +2605,7 @@ mod tests {
         builder.add_entry(entry2);
 
         // Write the leaf manifest
-        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, 0)?;
 
         // Verify content_stats is populated on the leaf manifest entry
         assert!(
@@ -2708,7 +2702,7 @@ mod tests {
         builder.add_entry(entry);
 
         // Write the leaf manifest
-        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, 0)?;
 
         // When all entries have None content_stats, the aggregate should also be None
         assert!(
@@ -2908,7 +2902,7 @@ mod tests {
         }
 
         // Write the leaf
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
@@ -2995,7 +2989,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
@@ -3066,7 +3060,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
@@ -3121,7 +3115,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
@@ -3188,7 +3182,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
         // leaf_path is now already relative
         let relative_path = &leaf_path;
@@ -3326,7 +3320,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
@@ -3563,7 +3557,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, None)?;
+        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
@@ -3852,26 +3846,10 @@ mod tests {
             .build()
     }
 
-    fn row_tracking_test_setup() -> (Url, Schema) {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
-        let table_root = Url::parse("memory:///test/").unwrap();
-        let table_schema = Schema::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::new("value", DataType::STRING, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
-        ]);
-        (table_root, table_schema)
-    }
-
     #[test]
     fn test_assign_first_row_ids_data_entries_only() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         builder
             .pending_entries
@@ -3914,14 +3892,12 @@ mod tests {
 
     #[test]
     fn test_assign_first_row_ids_combined_manifest_entries() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
-        // CombinedManifest with 100 added + 200 existing = 300 row increment
         builder
             .pending_entries
             .push(make_manifest_entry(100, 200, TrackingStatus::Added, None));
-        // CombinedManifest with 50 added + 50 existing = 100 row increment
         builder
             .pending_entries
             .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
@@ -3949,24 +3925,21 @@ mod tests {
 
     #[test]
     fn test_assign_first_row_ids_preserves_existing() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
-        // Existing manifest with first_row_id already set
         builder.pending_entries.push(make_manifest_entry(
             100,
             200,
             TrackingStatus::Existed,
             Some(0),
         ));
-        // New manifest without first_row_id
         builder
             .pending_entries
             .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
 
         let next = builder.assign_first_row_ids(0);
 
-        // Existing preserved, cursor advanced past it, new one assigned after
         assert_eq!(
             builder.pending_entries[0]
                 .tracking_info
@@ -3988,13 +3961,12 @@ mod tests {
 
     #[test]
     fn test_assign_first_row_ids_deleted_entries_skipped() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         builder
             .pending_entries
             .push(make_data_entry(100, TrackingStatus::Added, None));
-        // Deleted entry should not get first_row_id and should not affect cursor
         builder
             .pending_entries
             .push(make_data_entry(200, TrackingStatus::Deleted, Some(999)));
@@ -4012,7 +3984,6 @@ mod tests {
                 .first_row_id,
             Some(0)
         );
-        // Deleted entry should have None, not the previous 999
         assert_eq!(
             builder.pending_entries[1]
                 .tracking_info
@@ -4034,18 +4005,15 @@ mod tests {
 
     #[test]
     fn test_assign_first_row_ids_mixed_data_and_manifests() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
-        // Data entry: 100 records
         builder
             .pending_entries
             .push(make_data_entry(100, TrackingStatus::Added, None));
-        // CombinedManifest: 50 added + 150 existing = 200 row increment
         builder
             .pending_entries
             .push(make_manifest_entry(50, 150, TrackingStatus::Added, None));
-        // Data entry: 75 records
         builder
             .pending_entries
             .push(make_data_entry(75, TrackingStatus::Added, None));
@@ -4081,8 +4049,8 @@ mod tests {
 
     #[test]
     fn test_assign_first_row_ids_nonzero_starting_value() {
-        let (table_root, table_schema) = row_tracking_test_setup();
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         builder
             .pending_entries
@@ -4091,7 +4059,6 @@ mod tests {
             .pending_entries
             .push(make_data_entry(200, TrackingStatus::Added, None));
 
-        // Starting from HWM of 500 (so starting_row_id=501)
         let next = builder.assign_first_row_ids(501);
 
         assert_eq!(
@@ -4111,71 +4078,5 @@ mod tests {
             Some(601)
         );
         assert_eq!(next, 801);
-    }
-
-    /// Helper: builds a root manifest with row tracking, writes to disk, and reads back.
-    fn build_and_read_root_with_row_tracking(
-        builder: &mut ContentTreeNodeBuilder,
-        engine: &dyn crate::Engine,
-        snapshot_id: i64,
-        starting_first_row_id: Option<i64>,
-    ) -> DeltaResult<(Vec<ContentTreeNodeEntry>, Option<i64>)> {
-        let (root_metadata, next_row_id) =
-            builder.build(engine, snapshot_id, starting_first_row_id)?;
-        let table_root = root_metadata.table_root.clone();
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-            .write(engine)?
-            .location;
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
-            engine.parquet_handler(),
-            &root_url,
-            root_path,
-            None,
-            None,
-        )?;
-        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-        let root =
-            ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-        Ok((root.entries()?, next_row_id))
-    }
-
-    #[test]
-    fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
-        use crate::engine::default::DefaultEngineBuilder;
-        use object_store::local::LocalFileSystem;
-
-        let temp_path = tempfile::tempdir().unwrap().keep();
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(store).build();
-        let table_root = Url::from_directory_path(&temp_path).unwrap();
-        let table_schema = row_tracking_test_setup().1;
-        let snapshot_id = 1;
-
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, table_schema);
-
-        builder
-            .pending_entries
-            .push(make_data_entry(100, TrackingStatus::Added, None));
-        builder
-            .pending_entries
-            .push(make_data_entry(200, TrackingStatus::Added, None));
-
-        // Build with row tracking starting at 42, write, and read back
-        let (entries, next_row_id) =
-            build_and_read_root_with_row_tracking(&mut builder, &engine, snapshot_id, Some(42))?;
-
-        assert_eq!(next_row_id, Some(342));
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[0].tracking_info.as_ref().unwrap().first_row_id,
-            Some(42)
-        );
-        assert_eq!(
-            entries[1].tracking_info.as_ref().unwrap().first_row_id,
-            Some(142)
-        );
-
-        Ok(())
     }
 }

@@ -157,16 +157,14 @@ impl BatchState {
                 .make_physical(column_mapping_mode),
         );
 
-        // Lazily initialize the row_id_cursor from the snapshot HWM on first use
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
-        if needs_row_tracking && self.row_id_cursor.is_none() {
+        // Lazily initialize the row_id_cursor from the snapshot HWM on first use.
+        // Row tracking is always required for content trees.
+        if self.row_id_cursor.is_none() {
             use crate::row_tracking::RowTrackingDomainMetadata;
             let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
             self.row_id_cursor = Some(hwm.unwrap_or(-1) + 1);
         }
+        let starting_first_row_id = self.row_id_cursor.unwrap_or(0);
 
         let writer = LeafNodeWriter::new(
             self.read_snapshot.table_root().clone(),
@@ -175,7 +173,7 @@ impl BatchState {
             physical_schema,
             track_root_removals,
             root_manifest_path,
-            self.row_id_cursor,
+            starting_first_row_id,
         );
 
         Ok(writer)
@@ -231,9 +229,7 @@ impl BatchState {
         }
 
         // Advance the row ID cursor with the leaf's next available row ID
-        if let Some(next) = leaf_result.next_row_id {
-            self.row_id_cursor = Some(next);
-        }
+        self.row_id_cursor = Some(leaf_result.next_row_id);
 
         Ok(())
     }

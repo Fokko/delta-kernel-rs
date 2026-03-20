@@ -10,6 +10,10 @@ pub(crate) mod writer;
 #[path = "tests/snaps_and_seqs.rs"]
 mod snaps_and_seqs_tests;
 
+#[cfg(test)]
+#[path = "tests/row_tracking.rs"]
+mod row_tracking_tests;
+
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ADD_NAME, REMOVE_NAME};
@@ -3552,7 +3556,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        builder.build(engine, 1, None).map(|(node, _)| node)
+        builder.build(engine, 1, 0).map(|(node, _)| node)
     }
 
     /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
@@ -3570,7 +3574,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        let (metadata, _) = builder.build(engine, 1, None)?;
+        let (metadata, _) = builder.build(engine, 1, 0)?;
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?

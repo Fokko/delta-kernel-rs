@@ -29,8 +29,7 @@ pub struct LeafNodeWriterResult {
     pub(crate) root_dv_entries_to_remove: HashSet<String>,
 
     /// Next available row ID after all assignments in this leaf.
-    /// `Some` when row tracking is enabled, `None` otherwise.
-    pub(crate) next_row_id: Option<i64>,
+    pub(crate) next_row_id: i64,
 }
 
 /// Builder for creating leaf manifests.
@@ -72,8 +71,7 @@ pub struct LeafNodeWriter {
     track_root_removals: bool,
 
     /// Starting first_row_id for row tracking assignment in the leaf.
-    /// When `Some`, `first_row_id` values are assigned to data entries sequentially.
-    starting_first_row_id: Option<i64>,
+    starting_first_row_id: i64,
 }
 
 /// Context for tracking manifest entry deletions
@@ -233,7 +231,7 @@ impl LeafNodeWriter {
         table_schema: SchemaRef,
         track_root_removals: bool,
         root_manifest_path: Option<String>,
-        starting_first_row_id: Option<i64>,
+        starting_first_row_id: i64,
     ) -> Self {
         Self {
             data_builder: ContentTreeNodeBuilder::new_for(
@@ -948,7 +946,7 @@ mod tests {
             schema.clone(),
             true,
             None,
-            None,
+            0,
         );
 
         // Add files with Delta JSON format stats (like the engine produces when writing parquet).
@@ -1203,7 +1201,7 @@ mod tests {
             schema,
             true,
             None,
-            None,
+            0,
         );
 
         // Add 10 files (path, size, modification_time)
@@ -1244,7 +1242,7 @@ mod tests {
             schema,
             true,
             None,
-            None,
+            0,
         );
 
         // Don't add any files, just call finish
@@ -1280,7 +1278,7 @@ mod tests {
             schema,
             true,
             None,
-            None,
+            0,
         );
 
         // 4 files with no stats — selection vector keeps rows 0 and 2
@@ -1406,7 +1404,7 @@ mod tests {
             schema.clone(),
             true,
             None,
-            None,
+            0,
         );
 
         // Scan row with non-null `stats` JSON and null `stats_parsed` — fallback path of coalesce.
@@ -1456,7 +1454,7 @@ mod tests {
             schema.clone(),
             true,
             None,
-            None,
+            0,
         );
 
         // Scan row with null `stats` JSON and non-null `stats_parsed` — preferred path of coalesce.
