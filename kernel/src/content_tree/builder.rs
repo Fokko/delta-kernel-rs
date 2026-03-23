@@ -1441,9 +1441,7 @@ impl ContentTreeNodeBuilder {
         let mut cursor = starting_row_id;
 
         for entry in &mut self.pending_entries {
-            let Some(ref mut ti) = entry.tracking_info else {
-                continue;
-            };
+            let ti = &mut entry.tracking;
 
             // Deleted entries always have null first_row_id
             if ti.status == TrackingStatus::Deleted {
