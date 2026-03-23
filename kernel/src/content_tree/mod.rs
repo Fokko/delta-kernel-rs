@@ -3481,18 +3481,23 @@ mod tests {
 
         let read_metadata = build_and_roundtrip(vec![entry.clone()], 6, &table_root_url, &engine)?;
 
+        // build_and_roundtrip runs assign_first_row_ids which assigns first_row_id=Some(0)
+        // to Added entries that have first_row_id=None
+        let mut expected_entry = entry;
+        expected_entry.tracking.first_row_id = Some(0);
+
         // Verify
         let entries = read_metadata.entries()?;
         assert_eq!(entries.len(), 1);
-        assert_metadata_entry_eq(&entry, &entries[0]);
+        assert_metadata_entry_eq(&expected_entry, &entries[0]);
 
-        // Specifically verify the None values
+        // Specifically verify the None values (except first_row_id which gets assigned)
         let actual = &entries[0];
         let ti = &actual.tracking;
         assert!(ti.snapshot_id.is_none());
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
-        assert!(ti.first_row_id.is_none());
+        assert_eq!(ti.first_row_id, Some(0));
         assert!(ti.changes_dv.is_none());
         assert!(actual.manifest_dv.is_none());
         assert!(actual.manifest_stats.is_none());

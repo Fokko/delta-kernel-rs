@@ -1440,9 +1440,8 @@ impl ContentTreeNodeBuilder {
         for entry in &mut self.pending_entries {
             let ti = &mut entry.tracking;
 
-            // Deleted entries always have null first_row_id
+            // Deleted entries preserve their existing first_row_id but don't consume row IDs
             if ti.status == TrackingStatus::Deleted {
-                ti.first_row_id = None;
                 continue;
             }
 
@@ -3868,7 +3867,7 @@ mod tests {
         let next = builder.assign_first_row_ids(0);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
-        assert_eq!(builder.pending_entries[1].tracking.first_row_id, None);
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(999));
         assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(100));
         assert_eq!(next, 150);
     }
