@@ -3746,7 +3746,7 @@ mod tests {
     ) -> ContentTreeNodeEntry {
         ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(format!("file-{}.parquet", record_count))
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status,
                 snapshot_id: Some(1),
                 sequence_number: Some(1),
@@ -3767,7 +3767,7 @@ mod tests {
     ) -> ContentTreeNodeEntry {
         ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
             .location(format!("manifest-{}-{}.parquet", added_rows, existing_rows))
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status,
                 snapshot_id: Some(1),
                 sequence_number: None,
@@ -3809,25 +3809,19 @@ mod tests {
         assert_eq!(next, 350);
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(0)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(100)
         );
         assert_eq!(
             builder.pending_entries[2]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(300)
         );
@@ -3850,17 +3844,13 @@ mod tests {
         assert_eq!(next, 400);
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(0)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(300)
         );
@@ -3885,17 +3875,13 @@ mod tests {
 
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(0)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(300)
         );
@@ -3921,25 +3907,19 @@ mod tests {
 
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(0)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             None
         );
         assert_eq!(
             builder.pending_entries[2]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(100)
         );
@@ -3965,25 +3945,19 @@ mod tests {
 
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(0)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(100)
         );
         assert_eq!(
             builder.pending_entries[2]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(300)
         );
@@ -4006,20 +3980,179 @@ mod tests {
 
         assert_eq!(
             builder.pending_entries[0]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(501)
         );
         assert_eq!(
             builder.pending_entries[1]
-                .tracking_info
-                .as_ref()
-                .unwrap()
+                .tracking
                 .first_row_id,
             Some(601)
         );
         assert_eq!(next, 801);
+    }
+
+    // --- Tests for Iceberg row lineage compatibility ---
+
+    /// Verifies that the eager first_row_id assignment for data files within a leaf
+    /// produces values equivalent to Iceberg's lazy inheritance model: each data file's
+    /// first_row_id == manifest's first_row_id + sum of preceding files' record_counts.
+    #[test]
+    fn test_assign_first_row_ids_iceberg_inheritance_equivalence() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Simulate a leaf manifest containing 3 data files: 100, 50, 200 records
+        let record_counts = [100i64, 50, 200];
+        for &rc in &record_counts {
+            builder
+                .pending_entries
+                .push(make_data_entry(rc, TrackingStatus::Added, None));
+        }
+
+        let manifest_first_row_id = 42i64;
+        let next = builder.assign_first_row_ids(manifest_first_row_id);
+
+        // Verify Iceberg inheritance equivalence:
+        // file[i].first_row_id == manifest_first_row_id + sum(record_counts[0..i])
+        let mut cumulative = 0i64;
+        for (i, &rc) in record_counts.iter().enumerate() {
+            let expected = manifest_first_row_id + cumulative;
+            assert_eq!(
+                builder.pending_entries[i]
+                    .tracking
+                    .first_row_id,
+                Some(expected),
+                "file {i}: expected first_row_id={expected} (manifest={manifest_first_row_id} + cumulative={cumulative})"
+            );
+            cumulative += rc;
+        }
+
+        // next_row_id == manifest_first_row_id + total_records
+        assert_eq!(next, manifest_first_row_id + cumulative);
+    }
+
+    /// Existed data entries with null first_row_id (from scan-row rebuild) get
+    /// correctly assigned new IDs, matching Iceberg's rule that all unassigned
+    /// first_row_id values require inheritance assignment.
+    #[test]
+    fn test_assign_first_row_ids_existed_null_get_assigned() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Existed entry with null first_row_id (e.g., from table upgrade or scan rebuild)
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Existed, None));
+        // Added entry after it
+        builder
+            .pending_entries
+            .push(make_data_entry(50, TrackingStatus::Added, None));
+
+        let next = builder.assign_first_row_ids(0);
+
+        // The Existed entry should be assigned first_row_id=0
+        assert_eq!(
+            builder.pending_entries[0]
+                .tracking
+                .first_row_id,
+            Some(0),
+            "Existed entry with null first_row_id should be assigned"
+        );
+        // The Added entry should follow sequentially
+        assert_eq!(
+            builder.pending_entries[1]
+                .tracking
+                .first_row_id,
+            Some(100)
+        );
+        assert_eq!(next, 150);
+    }
+
+    /// PositionDeletes and EqualityDeletes content types never get first_row_id
+    /// assigned, matching Iceberg's rule that delete files always have null first_row_id.
+    #[test]
+    fn test_assign_first_row_ids_delete_content_types_always_null() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Data entry first
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+
+        // PositionDeletes entry
+        builder
+            .pending_entries
+            .push(ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
+                .location("pos-deletes.parquet")
+                .tracking(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                })
+                .record_count(50)
+                .file_size_in_bytes(512)
+                .build());
+
+        // EqualityDeletes entry
+        builder
+            .pending_entries
+            .push(ContentTreeNodeEntryBuilder::new(DataContentType::EqualityDeletes)
+                .location("eq-deletes.parquet")
+                .tracking(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                })
+                .record_count(25)
+                .file_size_in_bytes(256)
+                .build());
+
+        // Another data entry after the deletes
+        builder
+            .pending_entries
+            .push(make_data_entry(75, TrackingStatus::Added, None));
+
+        let next = builder.assign_first_row_ids(0);
+
+        // Data entry gets assigned
+        assert_eq!(
+            builder.pending_entries[0]
+                .tracking
+                .first_row_id,
+            Some(0)
+        );
+        // PositionDeletes: no first_row_id assignment
+        assert_eq!(
+            builder.pending_entries[1]
+                .tracking
+                .first_row_id,
+            None,
+            "PositionDeletes should not get first_row_id"
+        );
+        // EqualityDeletes: no first_row_id assignment
+        assert_eq!(
+            builder.pending_entries[2]
+                .tracking
+                .first_row_id,
+            None,
+            "EqualityDeletes should not get first_row_id"
+        );
+        // Next data entry picks up where the first left off (deletes don't consume IDs)
+        assert_eq!(
+            builder.pending_entries[3]
+                .tracking
+                .first_row_id,
+            Some(100)
+        );
+        assert_eq!(next, 175);
     }
 }

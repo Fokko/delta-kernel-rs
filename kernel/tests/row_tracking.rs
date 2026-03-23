@@ -1218,3 +1218,107 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
 
     Ok(())
 }
+
+/// Verifies the Iceberg row lineage equivalence: Delta's rowIdHighWaterMark + 1
+/// equals Iceberg's next-row-id, and consecutive commits produce contiguous
+/// ID spaces with no gaps or overlaps.
+#[tokio::test]
+async fn test_batch_commit_hwm_is_next_row_id_minus_one(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Commit 0: 10 + 20 = 30 records
+    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    {
+        let batch = txn.with_batch_commit();
+        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+        leaf.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![
+                    ("file1.parquet", 1024, 1_000_000, 10),
+                    ("file2.parquet", 2048, 1_000_001, 20),
+                ],
+            )?,
+        )?;
+        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+    }
+    assert!(matches!(
+        txn.commit(engine.as_ref())?,
+        CommitResult::CommittedTransaction(_)
+    ));
+
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    // HWM = 29, Iceberg next-row-id = 30
+    verify_batch_commit_hwm(&table_url, 0, 29).await?;
+
+    // Commit 1: 15 records (should start at row ID 30 = previous HWM + 1)
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let schema = txn2.add_files_schema();
+    {
+        let batch = txn2.with_batch_commit();
+        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+        leaf.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![("file3.parquet", 3072, 1_000_002, 15)],
+            )?,
+        )?;
+        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+    }
+    assert!(matches!(
+        txn2.commit(engine.as_ref())?,
+        CommitResult::CommittedTransaction(_)
+    ));
+
+    // HWM = 44, Iceberg next-row-id = 45
+    // Contiguity: commit 0 used [0, 30), commit 1 used [30, 45)
+    verify_batch_commit_hwm(&table_url, 1, 44).await?;
+
+    // Commit 2: 5 + 10 = 15 records across 2 leaves
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn3 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let schema = txn3.add_files_schema();
+    {
+        let batch = txn3.with_batch_commit();
+
+        let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
+        leaf1.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![("file4.parquet", 512, 1_000_003, 5)],
+            )?,
+        )?;
+        batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
+
+        let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
+        leaf2.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![("file5.parquet", 768, 1_000_004, 10)],
+            )?,
+        )?;
+        batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
+    }
+    assert!(matches!(
+        txn3.commit(engine.as_ref())?,
+        CommitResult::CommittedTransaction(_)
+    ));
+
+    // HWM = 59, Iceberg next-row-id = 60
+    // Contiguity: commit 2 used [45, 60)
+    verify_batch_commit_hwm(&table_url, 2, 59).await?;
+
+    // Verify all 5 files visible
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    assert_eq!(paths.len(), 5, "Should have 5 data files total");
+
+    Ok(())
+}
