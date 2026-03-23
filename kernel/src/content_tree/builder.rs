@@ -3804,24 +3804,9 @@ mod tests {
         let next = builder.assign_first_row_ids(0);
 
         assert_eq!(next, 350);
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(100)
-        );
-        assert_eq!(
-            builder.pending_entries[2]
-                .tracking
-                .first_row_id,
-            Some(300)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(300));
     }
 
     #[test]
@@ -3839,18 +3824,8 @@ mod tests {
         let next = builder.assign_first_row_ids(0);
 
         assert_eq!(next, 400);
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(300)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(300));
     }
 
     #[test]
@@ -3870,18 +3845,8 @@ mod tests {
 
         let next = builder.assign_first_row_ids(0);
 
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(300)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(300));
         assert_eq!(next, 400);
     }
 
@@ -3902,24 +3867,9 @@ mod tests {
 
         let next = builder.assign_first_row_ids(0);
 
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            None
-        );
-        assert_eq!(
-            builder.pending_entries[2]
-                .tracking
-                .first_row_id,
-            Some(100)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, None);
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(100));
         assert_eq!(next, 150);
     }
 
@@ -3940,24 +3890,9 @@ mod tests {
 
         let next = builder.assign_first_row_ids(0);
 
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(100)
-        );
-        assert_eq!(
-            builder.pending_entries[2]
-                .tracking
-                .first_row_id,
-            Some(300)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(300));
         assert_eq!(next, 375);
     }
 
@@ -3975,18 +3910,8 @@ mod tests {
 
         let next = builder.assign_first_row_ids(501);
 
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(501)
-        );
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(601)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(501));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(601));
         assert_eq!(next, 801);
     }
 
@@ -4051,19 +3976,12 @@ mod tests {
 
         // The Existed entry should be assigned first_row_id=0
         assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
+            builder.pending_entries[0].tracking.first_row_id,
             Some(0),
             "Existed entry with null first_row_id should be assigned"
         );
         // The Added entry should follow sequentially
-        assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            Some(100)
-        );
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
         assert_eq!(next, 150);
     }
 
@@ -4080,9 +3998,8 @@ mod tests {
             .push(make_data_entry(100, TrackingStatus::Added, None));
 
         // PositionDeletes entry
-        builder
-            .pending_entries
-            .push(ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
+        builder.pending_entries.push(
+            ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
                 .location("pos-deletes.parquet")
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -4094,12 +4011,12 @@ mod tests {
                 })
                 .record_count(50)
                 .file_size_in_bytes(512)
-                .build());
+                .build(),
+        );
 
         // EqualityDeletes entry
-        builder
-            .pending_entries
-            .push(ContentTreeNodeEntryBuilder::new(DataContentType::EqualityDeletes)
+        builder.pending_entries.push(
+            ContentTreeNodeEntryBuilder::new(DataContentType::EqualityDeletes)
                 .location("eq-deletes.parquet")
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -4111,7 +4028,8 @@ mod tests {
                 })
                 .record_count(25)
                 .file_size_in_bytes(256)
-                .build());
+                .build(),
+        );
 
         // Another data entry after the deletes
         builder
@@ -4121,35 +4039,19 @@ mod tests {
         let next = builder.assign_first_row_ids(0);
 
         // Data entry gets assigned
-        assert_eq!(
-            builder.pending_entries[0]
-                .tracking
-                .first_row_id,
-            Some(0)
-        );
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
         // PositionDeletes: no first_row_id assignment
         assert_eq!(
-            builder.pending_entries[1]
-                .tracking
-                .first_row_id,
-            None,
+            builder.pending_entries[1].tracking.first_row_id, None,
             "PositionDeletes should not get first_row_id"
         );
         // EqualityDeletes: no first_row_id assignment
         assert_eq!(
-            builder.pending_entries[2]
-                .tracking
-                .first_row_id,
-            None,
+            builder.pending_entries[2].tracking.first_row_id, None,
             "EqualityDeletes should not get first_row_id"
         );
         // Next data entry picks up where the first left off (deletes don't consume IDs)
-        assert_eq!(
-            builder.pending_entries[3]
-                .tracking
-                .first_row_id,
-            Some(100)
-        );
+        assert_eq!(builder.pending_entries[3].tracking.first_row_id, Some(100));
         assert_eq!(next, 175);
     }
 }

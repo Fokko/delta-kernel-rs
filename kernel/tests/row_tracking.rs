@@ -897,9 +897,7 @@ async fn verify_batch_commit_hwm(
 ) -> DeltaResult<()> {
     let store = object_store::local::LocalFileSystem::new();
     let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
-    let commit = store
-        .get(&Path::from_url_path(commit_url.path())?)
-        .await?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
     let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
         .into_iter::<Value>()
         .try_collect()?;
@@ -907,12 +905,12 @@ async fn verify_batch_commit_hwm(
     let row_tracking_configs: Vec<_> = parsed_actions
         .iter()
         .filter_map(|action| {
-            action.get("domainMetadata").and_then(|meta| {
-                match meta.get("domain")?.as_str()? {
+            action
+                .get("domainMetadata")
+                .and_then(|meta| match meta.get("domain")?.as_str()? {
                     "delta.rowTracking" => Some(meta.get("configuration")?.as_str()?),
                     _ => None,
-                }
-            })
+                })
         })
         .collect();
 
@@ -991,7 +989,8 @@ async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn st
 
 /// Two consecutive batch commits correctly advance the row ID high water mark across commits.
 #[tokio::test]
-async fn test_batch_commit_row_tracking_consecutive_commits() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_batch_commit_row_tracking_consecutive_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // First commit: create table with 2 files (10 + 20 = 30 records)
@@ -1056,7 +1055,8 @@ async fn test_batch_commit_row_tracking_consecutive_commits() -> Result<(), Box<
 /// Multiple leaves in a single batch commit get sequentially assigned first_row_ids,
 /// with each leaf picking up where the previous one left off.
 #[tokio::test]
-async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn std::error::Error>>
+{
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
@@ -1114,7 +1114,8 @@ async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn 
 
 /// A batch commit with multiple files per leaf assigns first_row_ids correctly within each leaf.
 #[tokio::test]
-async fn test_batch_commit_row_tracking_multiple_files_per_leaf() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_batch_commit_row_tracking_multiple_files_per_leaf(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
@@ -1201,9 +1202,7 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
     // The no-op commit should only contain a commitInfo action (same as the non-batch path)
     let store = object_store::local::LocalFileSystem::new();
     let commit_url = table_url.join("_delta_log/00000000000000000001.json")?;
-    let commit = store
-        .get(&Path::from_url_path(commit_url.path())?)
-        .await?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
     let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
         .into_iter::<Value>()
         .try_collect()?;
@@ -1223,8 +1222,8 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
 /// equals Iceberg's next-row-id, and consecutive commits produce contiguous
 /// ID spaces with no gaps or overlaps.
 #[tokio::test]
-async fn test_batch_commit_hwm_is_next_row_id_minus_one(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn std::error::Error>>
+{
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Commit 0: 10 + 20 = 30 records
@@ -1263,10 +1262,7 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one(
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
-            create_add_files_metadata(
-                schema,
-                vec![("file3.parquet", 3072, 1_000_002, 15)],
-            )?,
+            create_add_files_metadata(schema, vec![("file3.parquet", 3072, 1_000_002, 15)])?,
         )?;
         batch.add_leaf(leaf.finish(engine.as_ref())?)?;
     }
@@ -1289,20 +1285,14 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one(
         let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf1.add_files(
             engine.as_ref(),
-            create_add_files_metadata(
-                schema,
-                vec![("file4.parquet", 512, 1_000_003, 5)],
-            )?,
+            create_add_files_metadata(schema, vec![("file4.parquet", 512, 1_000_003, 5)])?,
         )?;
         batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
 
         let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf2.add_files(
             engine.as_ref(),
-            create_add_files_metadata(
-                schema,
-                vec![("file5.parquet", 768, 1_000_004, 10)],
-            )?,
+            create_add_files_metadata(schema, vec![("file5.parquet", 768, 1_000_004, 10)])?,
         )?;
         batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
     }

@@ -92,14 +92,8 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
     let entries = root.entries()?;
 
     assert_eq!(entries.len(), 2);
-    assert_eq!(
-        entries[0].tracking.first_row_id,
-        Some(42)
-    );
-    assert_eq!(
-        entries[1].tracking.first_row_id,
-        Some(142)
-    );
+    assert_eq!(entries[0].tracking.first_row_id, Some(42));
+    assert_eq!(entries[1].tracking.first_row_id, Some(142));
 
     Ok(())
 }
@@ -146,19 +140,10 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     let entries = root.entries()?;
 
     assert_eq!(entries.len(), 3);
-    assert_eq!(
-        entries[0].tracking.first_row_id,
-        Some(0)
-    );
+    assert_eq!(entries[0].tracking.first_row_id, Some(0));
     // Deleted entry has null first_row_id
-    assert_eq!(
-        entries[1].tracking.first_row_id,
-        None
-    );
-    assert_eq!(
-        entries[2].tracking.first_row_id,
-        Some(100)
-    );
+    assert_eq!(entries[1].tracking.first_row_id, None);
+    assert_eq!(entries[2].tracking.first_row_id, Some(100));
 
     Ok(())
 }
@@ -204,14 +189,8 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     let entries = root.entries()?;
 
     assert_eq!(entries.len(), 2);
-    assert_eq!(
-        entries[0].tracking.first_row_id,
-        Some(501)
-    );
-    assert_eq!(
-        entries[1].tracking.first_row_id,
-        Some(601)
-    );
+    assert_eq!(entries[0].tracking.first_row_id, Some(501));
+    assert_eq!(entries[1].tracking.first_row_id, Some(601));
 
     Ok(())
 }
@@ -224,8 +203,8 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
     use crate::content_tree::builder::ContentTreeNodeBuilder;
     use crate::content_tree::writer::ContentTreeNodeWriter;
     use crate::content_tree::{
-        absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntryBuilder,
-        DataContentType, ManifestStats, TrackingInfo, TrackingStatus,
+        absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntryBuilder, DataContentType,
+        ManifestStats, TrackingInfo, TrackingStatus,
     };
     use crate::engine::default::DefaultEngineBuilder;
     use object_store::local::LocalFileSystem;
