@@ -417,8 +417,7 @@ impl ContentTreeNodeBuilder {
 
             // Serialize changes_dv if non-empty
             if !cache.changes_dv.is_empty() {
-                entry.tracking.changes_dv =
-                    Some(serialize_roaring_treemap(&cache.changes_dv)?);
+                entry.tracking.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
             }
 
             // Update tracking based on status
@@ -938,14 +937,12 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `file_path` - Optional file path to match against entry locations
     /// * `dv_path` - Optional deletion vector path to match
-    /// * `version` - The version at which this deletion occurs
     /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
     ///
     pub(crate) fn mark_deleted(
         &mut self,
         file_path: Option<&str>,
         dv_path: Option<&str>,
-        _version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
         // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster

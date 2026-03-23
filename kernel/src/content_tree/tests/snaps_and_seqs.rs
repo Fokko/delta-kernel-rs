@@ -306,7 +306,7 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
         test_table_schema(),
         3,
     )?;
-    builder.mark_deleted(Some("file_a.parquet"), None, 3, 3)?;
+    builder.mark_deleted(Some("file_a.parquet"), None, 3)?;
 
     let entries = build_and_read_root(&mut builder, &engine, 3)?;
     assert_eq!(entries.len(), 2);

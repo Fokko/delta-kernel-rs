@@ -627,12 +627,7 @@ impl<S> Transaction<S> {
                     let mut visitor = ScanMetadataRemoveVisitor::new(
                         root_manifest_path.as_deref(),
                         |path, dv_path| {
-                            metadata_builder.mark_deleted(
-                                Some(path),
-                                dv_path,
-                                commit_version,
-                                snapshot_id,
-                            )
+                            metadata_builder.mark_deleted(Some(path), dv_path, snapshot_id)
                         },
                     );
                     for batch in self.remove_files_metadata.iter() {

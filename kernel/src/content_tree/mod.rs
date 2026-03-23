@@ -1487,9 +1487,7 @@ pub(crate) fn metadata_entry_to_scalars(
                 let struct_fields = if let crate::schema::DataType::Struct(st) = field.data_type() {
                     st.fields().cloned().collect::<Vec<_>>()
                 } else {
-                    return Err(crate::Error::generic(
-                        "tracking field should be a struct",
-                    ));
+                    return Err(crate::Error::generic("tracking field should be a struct"));
                 };
                 let values = vec![
                     Scalar::from(ti.status),
@@ -2844,10 +2842,7 @@ mod tests {
         // Compare tracking
         let exp_ti = &expected.tracking;
         let act_ti = &actual.tracking;
-        assert_eq!(
-            exp_ti.status, act_ti.status,
-            "tracking.status mismatch"
-        );
+        assert_eq!(exp_ti.status, act_ti.status, "tracking.status mismatch");
         assert_eq!(
             exp_ti.snapshot_id, act_ti.snapshot_id,
             "tracking.snapshot_id mismatch"
