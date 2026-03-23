@@ -584,7 +584,7 @@ impl<S> Transaction<S> {
 
                     // Add incremental actions from delta log to the metadata builder
                     // TODO: When replaying, we should preserve original sequence_numbers from the
-                    // files' tracking_info instead of using current_version. This would require
+                    // files' tracking instead of using current_version. This would require
                     // extracting sequence_number from the scan data and passing it through.
                     metadata_builder.add_from_scan_row_data(
                         engine_data,

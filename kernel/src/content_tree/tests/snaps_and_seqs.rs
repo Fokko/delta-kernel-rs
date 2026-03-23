@@ -133,7 +133,7 @@ fn find_entry<'a>(entries: &'a [ContentTreeNodeEntry], path: &str) -> &'a Conten
 /// file_a becomes Existed at V2 (was Added at V1), file_b is Added at V2.
 /// `from_content_root` flips Added→Existed for entries from prior versions.
 #[test]
-fn test_two_commits_to_root_tracking_info() -> Result<(), Box<dyn std::error::Error>> {
+fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
     let temp_dir = tempfile::tempdir()?;
     let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -158,26 +158,26 @@ fn test_two_commits_to_root_tracking_info() -> Result<(), Box<dyn std::error::Er
 
     // file_a was Added at V1, but now at V2 it should be Existed
     let a = find_entry(&entries, "file_a.parquet");
-    let a_info = a.tracking_info.as_ref().expect("file_a tracking_info");
-    assert_eq!(a_info.status, TrackingStatus::Existed);
-    assert_eq!(a_info.snapshot_id, Some(1));
-    assert_eq!(a_info.sequence_number, Some(1));
-    assert_eq!(a_info.file_sequence_number, Some(1));
+    let a_tracking = &a.tracking;
+    assert_eq!(a_tracking.status, TrackingStatus::Existed);
+    assert_eq!(a_tracking.snapshot_id, Some(1));
+    assert_eq!(a_tracking.sequence_number, Some(1));
+    assert_eq!(a_tracking.file_sequence_number, Some(1));
 
     // file_b is newly added at V2
     let b = find_entry(&entries, "file_b.parquet");
-    let b_info = b.tracking_info.as_ref().expect("file_b tracking_info");
-    assert_eq!(b_info.status, TrackingStatus::Added);
-    assert_eq!(b_info.snapshot_id, Some(2));
-    assert_eq!(b_info.sequence_number, Some(2));
-    assert_eq!(b_info.file_sequence_number, Some(2));
+    let b_tracking = &b.tracking;
+    assert_eq!(b_tracking.status, TrackingStatus::Added);
+    assert_eq!(b_tracking.snapshot_id, Some(2));
+    assert_eq!(b_tracking.sequence_number, Some(2));
+    assert_eq!(b_tracking.file_sequence_number, Some(2));
 
     // snapshot_ids differ between entries
-    assert_ne!(a_info.snapshot_id, b_info.snapshot_id);
+    assert_ne!(a_tracking.snapshot_id, b_tracking.snapshot_id);
     // sequence_numbers are sequential
     assert_eq!(
-        a_info.sequence_number.unwrap() + 1,
-        b_info.sequence_number.unwrap()
+        a_tracking.sequence_number.unwrap() + 1,
+        b_tracking.sequence_number.unwrap()
     );
 
     Ok(())
@@ -191,7 +191,7 @@ fn test_two_commits_to_root_tracking_info() -> Result<(), Box<dyn std::error::Er
 /// Both entries become Existed at V3 (were Added in prior versions).
 /// The write_leaf produces a CombinedManifest entry.
 #[test]
-fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::error::Error>> {
+fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
     let temp_dir = tempfile::tempdir()?;
     let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -227,10 +227,7 @@ fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::erro
         manifest_entry.content_type,
         DataContentType::CombinedManifest
     );
-    let manifest_info = manifest_entry
-        .tracking_info
-        .as_ref()
-        .expect("manifest tracking_info");
+    let manifest_info = &manifest_entry.tracking;
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
 
@@ -247,25 +244,25 @@ fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::erro
 
     // Both entries were Added in prior versions, now at V3 they should be Existed
     let a = find_entry(&entries, "file_a.parquet");
-    let a_info = a.tracking_info.as_ref().expect("file_a tracking_info");
-    assert_eq!(a_info.status, TrackingStatus::Existed);
-    assert_eq!(a_info.snapshot_id, Some(1));
-    assert_eq!(a_info.sequence_number, Some(1));
-    assert_eq!(a_info.file_sequence_number, Some(1));
+    let a_tracking = &a.tracking;
+    assert_eq!(a_tracking.status, TrackingStatus::Existed);
+    assert_eq!(a_tracking.snapshot_id, Some(1));
+    assert_eq!(a_tracking.sequence_number, Some(1));
+    assert_eq!(a_tracking.file_sequence_number, Some(1));
 
     let b = find_entry(&entries, "file_b.parquet");
-    let b_info = b.tracking_info.as_ref().expect("file_b tracking_info");
-    assert_eq!(b_info.status, TrackingStatus::Existed);
-    assert_eq!(b_info.snapshot_id, Some(2));
-    assert_eq!(b_info.sequence_number, Some(2));
-    assert_eq!(b_info.file_sequence_number, Some(2));
+    let b_tracking = &b.tracking;
+    assert_eq!(b_tracking.status, TrackingStatus::Existed);
+    assert_eq!(b_tracking.snapshot_id, Some(2));
+    assert_eq!(b_tracking.sequence_number, Some(2));
+    assert_eq!(b_tracking.file_sequence_number, Some(2));
 
     // snapshot_ids differ between entries
-    assert_ne!(a_info.snapshot_id, b_info.snapshot_id);
+    assert_ne!(a_tracking.snapshot_id, b_tracking.snapshot_id);
     // sequence_numbers are sequential
     assert_eq!(
-        a_info.sequence_number.unwrap() + 1,
-        b_info.sequence_number.unwrap()
+        a_tracking.sequence_number.unwrap() + 1,
+        b_tracking.sequence_number.unwrap()
     );
 
     Ok(())
@@ -280,7 +277,7 @@ fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::erro
 /// file_sequence_number preserved from original add at V1).
 /// file_b becomes Existed at V3 (was Added at V2).
 #[test]
-fn test_two_commits_delete_first_tracking_info() -> Result<(), Box<dyn std::error::Error>> {
+fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
     let temp_dir = tempfile::tempdir()?;
     let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -315,25 +312,25 @@ fn test_two_commits_delete_first_tracking_info() -> Result<(), Box<dyn std::erro
     assert_eq!(entries.len(), 2);
 
     let a = find_entry(&entries, "file_a.parquet");
-    let a_info = a.tracking_info.as_ref().expect("file_a tracking_info");
-    assert_eq!(a_info.status, TrackingStatus::Deleted);
+    let a_tracking = &a.tracking;
+    assert_eq!(a_tracking.status, TrackingStatus::Deleted);
     // snapshot_id updated to deletion snapshot
-    assert_eq!(a_info.snapshot_id, Some(3));
+    assert_eq!(a_tracking.snapshot_id, Some(3));
     // sequence_number preserved from original add
-    assert_eq!(a_info.sequence_number, Some(1));
+    assert_eq!(a_tracking.sequence_number, Some(1));
     // file_sequence_number preserved from original add
-    assert_eq!(a_info.file_sequence_number, Some(1));
+    assert_eq!(a_tracking.file_sequence_number, Some(1));
 
     // file_b was Added at V2, but now at V3 it should be Existed
     let b = find_entry(&entries, "file_b.parquet");
-    let b_info = b.tracking_info.as_ref().expect("file_b tracking_info");
-    assert_eq!(b_info.status, TrackingStatus::Existed);
-    assert_eq!(b_info.snapshot_id, Some(2));
-    assert_eq!(b_info.sequence_number, Some(2));
-    assert_eq!(b_info.file_sequence_number, Some(2));
+    let b_tracking = &b.tracking;
+    assert_eq!(b_tracking.status, TrackingStatus::Existed);
+    assert_eq!(b_tracking.snapshot_id, Some(2));
+    assert_eq!(b_tracking.sequence_number, Some(2));
+    assert_eq!(b_tracking.file_sequence_number, Some(2));
 
     // snapshot_ids differ between entries
-    assert_ne!(a_info.snapshot_id, b_info.snapshot_id);
+    assert_ne!(a_tracking.snapshot_id, b_tracking.snapshot_id);
 
     Ok(())
 }

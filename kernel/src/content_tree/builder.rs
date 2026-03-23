@@ -340,9 +340,9 @@ impl ContentTreeNodeBuilder {
         let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
-            let entry = if entry.tracking_info.as_ref().is_some_and(|ti| {
-                ti.status == TrackingStatus::Added && ti.sequence_number != Some(new_version as i64)
-            }) {
+            let entry = if entry.tracking.status == TrackingStatus::Added
+                && entry.tracking.sequence_number != Some(new_version as i64)
+            {
                 entry.with_status(TrackingStatus::Existed)
             } else {
                 entry
@@ -370,10 +370,8 @@ impl ContentTreeNodeBuilder {
     /// Serializes dirty DVs back into the pending entries.
     /// Only serializes entries that were modified (dirty flag set).
     /// Should be called before building to ensure DVs are properly persisted.
-    /// Also updates tracking_info with snapshot_id and sequence numbers based on status.
+    /// Also updates tracking with snapshot_id and sequence numbers based on status.
     fn serialize_dvs_to_entries(&mut self, snapshot_id: i64) -> DeltaResult<()> {
-        let version = self.version as i64;
-
         // Iterate over entries and look up in cache
         for entry in &mut self.pending_entries {
             // Only process manifest entries
@@ -404,7 +402,7 @@ impl ContentTreeNodeBuilder {
             if let Some(ref manifest_dv) = cache.manifest_dv {
                 entry.manifest_dv = Some(serialize_roaring_treemap(manifest_dv)?);
 
-                // Update tracking_info status based on DV cardinality
+                // Update tracking status based on DV cardinality
                 // If all active entries are deleted, mark manifest as Deleted
                 if let Some(ref manifest_stats) = entry.manifest_stats {
                     let active_entry_count =
@@ -412,37 +410,21 @@ impl ContentTreeNodeBuilder {
                     let cardinality = manifest_dv.len() as i64;
 
                     if cardinality == active_entry_count {
-                        if let Some(ref mut tracking_info) = entry.tracking_info {
-                            tracking_info.status = TrackingStatus::Deleted;
-                        }
+                        entry.tracking.status = TrackingStatus::Deleted;
                     }
                 }
             }
 
             // Serialize changes_dv if non-empty
             if !cache.changes_dv.is_empty() {
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
-                }
+                entry.tracking.changes_dv =
+                    Some(serialize_roaring_treemap(&cache.changes_dv)?);
             }
 
-            // Initialize or update tracking_info
-            if entry.tracking_info.is_none() {
-                // Initialize tracking_info if not present (new manifest being added)
-                entry.tracking_info = Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(snapshot_id),
-                    sequence_number: Some(version),
-                    file_sequence_number: Some(version),
-                    first_row_id: None,
-                    changes_dv: None,
-                });
-            } else if let Some(ref mut tracking_info) = entry.tracking_info {
-                // Update existing tracking_info based on status
-                // Only update snapshot_id when status is DELETED
-                if tracking_info.status == TrackingStatus::Deleted {
-                    tracking_info.snapshot_id = Some(snapshot_id);
-                }
+            // Update tracking based on status
+            // Only update snapshot_id when status is DELETED
+            if entry.tracking.status == TrackingStatus::Deleted {
+                entry.tracking.snapshot_id = Some(snapshot_id);
             }
         }
 
@@ -716,10 +698,10 @@ impl ContentTreeNodeBuilder {
                 "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
                 "location" => Expression::column(["path"]),
                 "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-                "trackingInfo" => {
+                "tracking" => {
                     if !matches!(field.data_type(), DataType::Struct(_)) {
                         return Err(crate::Error::generic(
-                            "trackingInfo field should be a struct type",
+                            "tracking field should be a struct type",
                         ));
                     }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
@@ -831,9 +813,7 @@ impl ContentTreeNodeBuilder {
                 self.dv_cache.insert(location.clone(), cache);
 
                 // Always clear changes_dv from entries (starts empty for new commit)
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.changes_dv = None;
-                }
+                entry.tracking.changes_dv = None;
             }
         }
 
@@ -965,7 +945,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         file_path: Option<&str>,
         dv_path: Option<&str>,
-        version: Version,
+        _version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
         // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
@@ -981,22 +961,8 @@ impl ContentTreeNodeBuilder {
 
             if matches {
                 // Update the tracking info to mark as deleted
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.status = TrackingStatus::Deleted;
-                    tracking_info.snapshot_id = Some(snapshot_id);
-                    // Don't update the sequence number since you can derive from the snapshot
-                    // when it was deleted
-                } else {
-                    // Create new tracking info if it doesn't exist
-                    entry.tracking_info = Some(TrackingInfo {
-                        status: TrackingStatus::Deleted,
-                        snapshot_id: Some(snapshot_id),
-                        sequence_number: Some(version as i64),
-                        file_sequence_number: Some(version as i64),
-                        first_row_id: None,
-                        changes_dv: None,
-                    });
-                }
+                entry.tracking.status = TrackingStatus::Deleted;
+                entry.tracking.snapshot_id = Some(snapshot_id);
             }
         }
 
@@ -1010,7 +976,7 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_changes_dv` - If true, sets tracking_info.changes_dv (for actual deletions).
+    /// * `set_changes_dv` - If true, sets tracking.changes_dv (for actual deletions).
     ///   If false, only updates manifest_dv (for leaf reorganization).
     ///
     /// # Returns
@@ -1032,7 +998,7 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_changes_dv` - If true, sets tracking_info.changes_dv to track this as an actual deletion.
+    /// * `set_changes_dv` - If true, sets tracking.changes_dv to track this as an actual deletion.
     ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
     fn delete_indices_from_leaf(
         &mut self,
@@ -1068,7 +1034,7 @@ impl ContentTreeNodeBuilder {
             *delta_bitmap |= indices;
         }
 
-        // tracking_info will be updated during write_leaf/build when we're already iterating
+        // tracking will be updated during write_leaf/build when we're already iterating
 
         Ok(())
     }
@@ -1127,24 +1093,22 @@ impl ContentTreeNodeBuilder {
         let mut min_sequence_number = i64::MAX;
 
         for entry in &self.pending_entries {
-            if let Some(ref tracking_info) = entry.tracking_info {
-                if let Some(seq) = tracking_info.sequence_number {
-                    min_sequence_number = min_sequence_number.min(seq);
-                }
+            if let Some(seq) = entry.tracking.sequence_number {
+                min_sequence_number = min_sequence_number.min(seq);
+            }
 
-                match tracking_info.status {
-                    TrackingStatus::Added => {
-                        added_files_count += 1;
-                        added_rows_count += entry.record_count;
-                    }
-                    TrackingStatus::Existed => {
-                        existing_files_count += 1;
-                        existing_rows_count += entry.record_count;
-                    }
-                    TrackingStatus::Deleted => {
-                        deletes_files_count += 1;
-                        delete_rows_count += entry.record_count;
-                    }
+            match entry.tracking.status {
+                TrackingStatus::Added => {
+                    added_files_count += 1;
+                    added_rows_count += entry.record_count;
+                }
+                TrackingStatus::Existed => {
+                    existing_files_count += 1;
+                    existing_rows_count += entry.record_count;
+                }
+                TrackingStatus::Deleted => {
+                    deletes_files_count += 1;
+                    delete_rows_count += entry.record_count;
                 }
             }
         }
@@ -1182,7 +1146,7 @@ impl ContentTreeNodeBuilder {
 
         let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
             .location(manifest_path)
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(snapshot_id),
                 // TODO: Manifest entries in root should have sequence_number and file_sequence_number
@@ -1389,10 +1353,10 @@ impl ContentTreeNodeBuilder {
                 "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
                 "location" => Expression::column(["path"]),
                 "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-                "trackingInfo" => {
+                "tracking" => {
                     if !matches!(field.data_type(), DataType::Struct(_)) {
                         return Err(crate::Error::generic(
-                            "trackingInfo field should be a struct type",
+                            "tracking field should be a struct type",
                         ));
                     }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
@@ -2170,7 +2134,7 @@ mod tests {
         root.entries()
     }
 
-    // TODO: Add tests for all tracking_info columns (status, snapshot_id, sequence_number,
+    // TODO: Add tests for all tracking columns (status, snapshot_id, sequence_number,
     // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
     // build operations for ADDED, DELETED, and EXISTED manifests.
 
@@ -3084,10 +3048,7 @@ mod tests {
             })
             .expect("Leaf manifest should exist");
 
-        assert_eq!(
-            leaf_manifest.tracking_info.as_ref().unwrap().status,
-            TrackingStatus::Deleted
-        );
+        assert_eq!(leaf_manifest.tracking.status, TrackingStatus::Deleted);
 
         Ok(())
     }
@@ -3275,7 +3236,7 @@ mod tests {
         // because all ACTIVE entries (3) have been deleted, even though
         // the total entry count (5) includes 2 already-deleted entries
         assert_eq!(
-            leaf_manifest.tracking_info.as_ref().unwrap().status,
+            leaf_manifest.tracking.status,
             TrackingStatus::Deleted,
             "Manifest should be marked as deleted when all active entries are deleted, \
              even if some entries were already deleted"
@@ -3298,7 +3259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_info_changes_dv_clearing() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_tracking_changes_dv_clearing() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
@@ -3350,9 +3311,7 @@ mod tests {
 
         // Verify changes_dv contains both deletions from this commit (2 and 5)
         let changes_dv_v1 = manifest_v1
-            .tracking_info
-            .as_ref()
-            .unwrap()
+            .tracking
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3395,9 +3354,7 @@ mod tests {
 
         // Verify changes_dv ONLY contains NEW deletions from v2 (3 and 7)
         let changes_dv_v2 = manifest_v2
-            .tracking_info
-            .as_ref()
-            .unwrap()
+            .tracking
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3453,9 +3410,7 @@ mod tests {
 
         // Verify changes_dv ONLY contains NEW deletion from v3 (8)
         let changes_dv_v3 = manifest_v3
-            .tracking_info
-            .as_ref()
-            .unwrap()
+            .tracking
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3521,12 +3476,7 @@ mod tests {
 
         // Verify changes_dv is None since no deletions were made in v4
         assert!(
-            manifest_v4
-                .tracking_info
-                .as_ref()
-                .unwrap()
-                .changes_dv
-                .is_none(),
+            manifest_v4.tracking.changes_dv.is_none(),
             "changes_dv should be None when no deletions are made"
         );
 
@@ -3592,12 +3542,7 @@ mod tests {
 
         // Verify changes_dv is NOT set since this was leaf reorganization, not actual deletion
         assert!(
-            manifest
-                .tracking_info
-                .as_ref()
-                .unwrap()
-                .changes_dv
-                .is_none(),
+            manifest.tracking.changes_dv.is_none(),
             "changes_dv should NOT be set for leaf reorganization (set_changes_dv=false)"
         );
 

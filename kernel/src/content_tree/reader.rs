@@ -54,7 +54,7 @@ fn visit_metadata_entry_at<'a>(
     // 0: content_type
     // 1: location
     // 2: file_format
-    // 3-8: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
+    // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
     // 9-12: dv_info fields (location, offset, size_in_bytes, cardinality)
     // 13: partition_spec_id
     // 14: sort_order_id
@@ -91,8 +91,8 @@ fn visit_metadata_entry_at<'a>(
     let file_format_str: String = getters[2].get(row_index, "file_format")?;
     let file_format = DataFileFormat::from_str(&file_format_str)?;
 
-    // Extract tracking_info fields
-    let tracking_status_int: i32 = getters[3].get(row_index, "tracking_info.status")?;
+    // Extract tracking fields
+    let tracking_status_int: i32 = getters[3].get(row_index, "tracking.status")?;
     let tracking_status = match tracking_status_int {
         0 => TrackingStatus::Existed,
         1 => TrackingStatus::Added,
@@ -106,25 +106,25 @@ fn visit_metadata_entry_at<'a>(
     };
 
     let tracking_snapshot_id: Option<i64> =
-        getters[4].get_opt(row_index, "tracking_info.snapshot_id")?;
+        getters[4].get_opt(row_index, "tracking.snapshot_id")?;
     let tracking_sequence_number: Option<i64> =
-        getters[5].get_opt(row_index, "tracking_info.sequence_number")?;
+        getters[5].get_opt(row_index, "tracking.sequence_number")?;
     let tracking_file_sequence_number: Option<i64> =
-        getters[6].get_opt(row_index, "tracking_info.file_sequence_number")?;
+        getters[6].get_opt(row_index, "tracking.file_sequence_number")?;
     let tracking_first_row_id: Option<i64> =
-        getters[7].get_opt(row_index, "tracking_info.first_row_id")?;
+        getters[7].get_opt(row_index, "tracking.first_row_id")?;
     let tracking_changes_dv: Option<&[u8]> =
-        getters[8].get_opt(row_index, "tracking_info.changes_dv")?;
+        getters[8].get_opt(row_index, "tracking.changes_dv")?;
     let tracking_changes_dv_bytes = tracking_changes_dv.map(Bytes::copy_from_slice);
 
-    let tracking_info = Some(TrackingInfo {
+    let tracking = TrackingInfo {
         status: tracking_status,
         snapshot_id: tracking_snapshot_id,
         sequence_number: tracking_sequence_number,
         file_sequence_number: tracking_file_sequence_number,
         first_row_id: tracking_first_row_id,
         changes_dv: tracking_changes_dv_bytes,
-    });
+    };
 
     // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
     let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;
@@ -190,7 +190,7 @@ fn visit_metadata_entry_at<'a>(
         content_type,
         location,
         file_format,
-        tracking_info,
+        tracking,
         dv_info,
         partition_spec_id,
         sort_order_id,
