@@ -1429,11 +1429,10 @@ impl ContentTreeNodeBuilder {
 
     /// Assigns `first_row_id` to entries that need it, following the spec rules:
     /// - Preserve existing `first_row_id` for entries that already have one
-    /// - Set `None` for deleted entries
     /// - Assign sequential IDs for Data and CombinedManifest entries without `first_row_id`
     ///
     /// `starting_row_id` is the first assignable row ID (high_water_mark + 1).
-    /// Returns the next available row ID after all assignments (new high water mark + 1).
+    /// Returns the next available row ID after all assignments (new high watermark + 1).
     fn assign_first_row_ids(&mut self, starting_row_id: i64) -> i64 {
         let mut cursor = starting_row_id;
 

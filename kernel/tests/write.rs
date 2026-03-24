@@ -2285,20 +2285,26 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // With batch_commit, JSON log should contain: commit_info + contentRoot
+        // With batch_commit, JSON log should contain:
+        // commit_info + domainMetadata (row tracking) + contentRoot
         // No add actions should be in the JSON log
         assert_eq!(
             parsed_actions.len(),
-            2,
-            "Expected commit info and contentRoot actions, got {}. Actions: {:?}",
+            3,
+            "Expected commitInfo, domainMetadata, and contentRoot actions, got {}. Actions: {:?}",
             parsed_actions.len(),
             parsed_actions
         );
         assert!(parsed_actions[0].get("commitInfo").is_some());
         assert!(
-            parsed_actions[1].get("contentRoot").is_some(),
-            "Second action should be contentRoot, but got: {:?}",
+            parsed_actions[1].get("domainMetadata").is_some(),
+            "Second action should be domainMetadata, but got: {:?}",
             parsed_actions[1]
+        );
+        assert!(
+            parsed_actions[2].get("contentRoot").is_some(),
+            "Third action should be contentRoot, but got: {:?}",
+            parsed_actions[2]
         );
 
         // Verify no add actions in JSON log
