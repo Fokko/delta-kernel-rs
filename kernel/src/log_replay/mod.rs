@@ -22,7 +22,7 @@ use tracing::debug;
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData};
+use crate::{DeltaResult, EngineData, Version};
 
 pub(crate) mod deduplicator;
 
@@ -179,6 +179,10 @@ pub(crate) struct ActionsBatch {
     pub actions: Box<dyn EngineData>,
     /// Whether the batch is from a commit log (=true) or a checkpoint/CRC/elsewhere (=false).
     pub is_log_batch: bool,
+    /// The commit version this batch was read from, if known. Set for commit log batches in
+    /// contexts that need per-commit version metadata (e.g. AMT rollup sequence number stamping).
+    /// `None` for checkpoint batches and commit batches in contexts that don't need version info.
+    pub version: Option<Version>,
 }
 
 impl ActionsBatch {
@@ -193,6 +197,26 @@ impl ActionsBatch {
         Self {
             actions,
             is_log_batch,
+            version: None,
+        }
+    }
+
+    /// Creates a new `ActionsBatch` with an explicit commit version. Used in contexts where
+    /// per-batch version metadata is required (e.g. AMT log rollup sequence number stamping).
+    ///
+    /// # Parameters
+    /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
+    /// - `is_log_batch`: Whether the batch is from a commit log (`true`) or checkpoint (`false`).
+    /// - `version`: The commit version this batch was read from.
+    pub(crate) fn new_with_version(
+        actions: Box<dyn EngineData>,
+        is_log_batch: bool,
+        version: Version,
+    ) -> Self {
+        Self {
+            actions,
+            is_log_batch,
+            version: Some(version),
         }
     }
 

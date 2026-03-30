@@ -644,41 +644,56 @@ impl<S> Transaction<S> {
             let current_version = self.read_snapshot.version();
 
             // Load existing metadata and determine the version from which to replay delta log.
-            // `existing_content_root_version` is passed to ContentTreeLogApplier to skip files at
-            // or before the content root; None means replay from the beginning.
+            // When a content root exists and replay is needed, `AmtLogReplayProcessor` handles
+            // both the content root and the log commits together in one pass. `from_content_root`
+            // is only called when no replay is required (content root is already current).
             let (
                 mut metadata_builder,
                 root_manifest_path,
                 replay_from_version,
                 existing_content_root_version,
             ) = if let Some(checkpoint_action) = latest_checkpoint_action {
-                // Load metadata from content root directly into the builder
                 let root_path = checkpoint_action.content_root.path.clone();
                 let content_root_version = checkpoint_action.version;
-                let builder =
-                    crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
-                        engine,
-                        &checkpoint_action.content_root,
+                let replay_from = content_root_version + 1;
+
+                if replay_from <= current_version {
+                    // Replay needed — defer content root loading to AmtLogReplayProcessor below.
+                    let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                         table_root.clone(),
-                        physical_table_schema.clone(),
                         commit_version,
-                    )?;
-                // Replay delta log from the version after the content root
-                (
-                    builder,
-                    Some(root_path),
-                    content_root_version + 1,
-                    Some(content_root_version),
-                )
+                        physical_table_schema.clone(),
+                    );
+                    (
+                        builder,
+                        Some(root_path),
+                        replay_from,
+                        Some(content_root_version),
+                    )
+                } else {
+                    // No replay needed — load content root into builder directly.
+                    let builder =
+                        crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
+                            engine,
+                            &checkpoint_action.content_root,
+                            table_root.clone(),
+                            physical_table_schema.clone(),
+                            commit_version,
+                        )?;
+                    (
+                        builder,
+                        Some(root_path),
+                        replay_from,
+                        Some(content_root_version),
+                    )
+                }
             } else {
                 // No content root found, start with empty metadata
-                // Use commit_version for the new metadata, not the current snapshot version
                 let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                     table_root.clone(),
                     commit_version,
                     physical_table_schema.clone(),
                 );
-                // Replay all delta log commits from the beginning
                 (builder, None, 0u64, None)
             };
 
@@ -698,16 +713,135 @@ impl<S> Transaction<S> {
                 // 3. Calling metadata_builder.delete_from_leaf() for each removed file
                 // This is deferred to future work as it requires a new delta log processor.
             } else if replay_from_version <= current_version {
-                use crate::content_tree::builder::ContentTreeLogApplier;
+                if let Some(content_root_version) = existing_content_root_version {
+                    // AmtLogReplayProcessor: processes log commits descending (newest first),
+                    // then the existing content root as a checkpoint baseline. Uses spec-correct
+                    // (path, dv_location) deduplication so Remove(file, old_dv) and
+                    // Add(file, new_dv) for different logical files never interfere.
+                    use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
+                    use crate::content_tree::builder::AmtLogReplayProcessor;
+                    use crate::content_tree::ContentTreeNode;
+                    use crate::log_replay::ActionsBatch;
+                    use crate::log_replay::LogReplayProcessor as _;
+                    use crate::schema::ToSchema as _;
 
-                let log_segment = self.read_snapshot.log_segment();
-                ContentTreeLogApplier::new(
-                    &mut metadata_builder,
-                    snapshot_id,
-                    log_segment,
-                    existing_content_root_version,
-                )
-                .apply(engine)?;
+                    let add_remove_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+                        StructField::nullable(ADD_NAME, Add::to_schema()),
+                        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+                    ]));
+
+                    let log_segment = self.read_snapshot.log_segment();
+                    // Collect commit files after the content root version, in descending order.
+                    let commit_files: Vec<(Version, FileMeta)> = log_segment
+                        .listed
+                        .ascending_commit_files
+                        .iter()
+                        .filter(|f| f.version > content_root_version)
+                        .rev()
+                        .map(|f| (f.version, f.location.clone()))
+                        .collect();
+
+                    let root_path_str = root_manifest_path
+                        .as_deref()
+                        .ok_or_else(|| Error::generic("AMT replay: missing root_manifest_path"))?;
+                    let content_root_url = table_root.join(root_path_str).map_err(|e| {
+                        Error::generic(format!("Failed to parse content root URL: {}", e))
+                    })?;
+
+                    let mut processor = AmtLogReplayProcessor::new(
+                        snapshot_id,
+                        commit_version,
+                        physical_table_schema.clone(),
+                    );
+
+                    // Process log commits descending (newest first).
+                    for (version, location) in &commit_files {
+                        let iter = engine.json_handler().read_json_files(
+                            std::slice::from_ref(location),
+                            add_remove_schema.clone(),
+                            None,
+                        )?;
+                        for batch in iter {
+                            let entries = processor.process_actions_batch(
+                                ActionsBatch::new_with_version(batch?, true, *version),
+                            )?;
+                            for entry in entries {
+                                metadata_builder.add_entry(entry);
+                            }
+                        }
+                    }
+
+                    // Process content root batches as checkpoint baseline.
+                    let (content_root_iter, _, _) = ContentTreeNode::open_stream(
+                        engine.parquet_handler(),
+                        &content_root_url,
+                        root_path_str.to_owned(),
+                        None,
+                        None,
+                    )?;
+                    for batch in content_root_iter {
+                        let entries =
+                            processor.process_actions_batch(ActionsBatch::new(batch?, false))?;
+                        for entry in entries {
+                            metadata_builder.add_entry(entry);
+                        }
+                    }
+
+                    // Apply accumulated leaf manifest removes post-replay. Only apply
+                    // removes for leaf paths that are in the current content root — removes
+                    // with a data_manifest_path from an older root are already handled by
+                    // (path, dv_location) deduplication in the processor.
+                    let leaf_removes = processor.drain_leaf_removes();
+                    for (leaf_path, bitmap) in leaf_removes {
+                        if metadata_builder.has_leaf_manifest(&leaf_path) {
+                            metadata_builder
+                                .delete_multiple_from_leaf(&leaf_path, &bitmap, true)?;
+                        }
+                    }
+                } else {
+                    // No content root: replay all commits from scratch, newest first.
+                    use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
+                    use crate::content_tree::builder::AmtLogReplayProcessor;
+                    use crate::log_replay::{ActionsBatch, LogReplayProcessor as _};
+                    use crate::schema::ToSchema as _;
+
+                    let add_remove_schema: SchemaRef =
+                        Arc::new(StructType::new_unchecked([
+                            StructField::nullable(ADD_NAME, Add::to_schema()),
+                            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+                        ]));
+
+                    let log_segment = self.read_snapshot.log_segment();
+                    let commit_files: Vec<(Version, FileMeta)> = log_segment
+                        .listed
+                        .ascending_commit_files
+                        .iter()
+                        .rev()
+                        .map(|f| (f.version, f.location.clone()))
+                        .collect();
+
+                    let mut processor = AmtLogReplayProcessor::new(
+                        snapshot_id,
+                        commit_version,
+                        physical_table_schema.clone(),
+                    );
+
+                    for (version, location) in &commit_files {
+                        let iter = engine.json_handler().read_json_files(
+                            std::slice::from_ref(location),
+                            add_remove_schema.clone(),
+                            None,
+                        )?;
+                        for batch in iter {
+                            let entries = processor.process_actions_batch(
+                                ActionsBatch::new_with_version(batch?, true, *version),
+                            )?;
+                            for entry in entries {
+                                metadata_builder.add_entry(entry);
+                            }
+                        }
+                    }
+                }
             }
 
             for add_metadata_result in self.add_files_metadata.iter() {

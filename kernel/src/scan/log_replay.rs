@@ -729,6 +729,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let ActionsBatch {
             actions,
             is_log_batch,
+            version: _,
         } = actions_batch;
         require!(
             !is_log_batch,
@@ -805,6 +806,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let ActionsBatch {
             actions,
             is_log_batch,
+            version: _,
         } = actions_batch;
 
         // Step 1: Apply transform FIRST (outputs stats_parsed and partitionValues_parsed).

@@ -13,8 +13,8 @@ use crate::{DeltaResult, Error};
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
-pub(super) struct ContentTreeNodeEntryVisitor {
-    pub(super) entries: Vec<ContentTreeNodeEntry>,
+pub(crate) struct ContentTreeNodeEntryVisitor {
+    pub(crate) entries: Vec<ContentTreeNodeEntry>,
 }
 
 impl RowVisitor for ContentTreeNodeEntryVisitor {

@@ -86,6 +86,7 @@ mod tests {
             let ActionsBatch {
                 actions,
                 is_log_batch,
+                version: _,
             } = batch;
             assert!(is_log_batch);
 

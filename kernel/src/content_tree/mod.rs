@@ -23,7 +23,7 @@ use url::Url;
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
-use crate::log_replay::ActionsBatch;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::path::ParsedLogPath;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, StructField, StructType};
@@ -1906,6 +1906,12 @@ impl ContentTreeNodeEntry {
     /// Returns the manifest deletion vector bytes, if present.
     pub(crate) fn manifest_dv_bytes(&self) -> Option<&Bytes> {
         self.manifest_info.as_ref().and_then(|mi| mi.dv.as_ref())
+    }
+}
+
+impl HasSelectionVector for Vec<ContentTreeNodeEntry> {
+    fn has_selected_rows(&self) -> bool {
+        !self.is_empty()
     }
 }
 

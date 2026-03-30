@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::{AddVisitor, RemoveVisitor};
-use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
+use crate::actions::Add;
+use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
 use crate::content_tree::stats::{
     aggregate_content_stats, delta_json_stats_to_content_stats, merge_partition_values_into_stats,
 };
@@ -21,9 +22,8 @@ use crate::content_tree::{
     DELTA_STATS_TIGHT_BOUNDS,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::ActionsBatch;
-use crate::log_segment::LogSegment;
-use crate::expressions::StructData;
+use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
+use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
 #[cfg(test)]
@@ -459,16 +459,23 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
     }
 
     /// Add an entry with deduplication.
     ///
+    /// Skips `add` if its path was already added (path-only deduplication). This is a simpler
+    /// deduplication than the spec-correct `(path, dv_location)` keying used by
+    /// [`AmtLogReplayProcessor`] and is appropriate when building a content tree from a flat
+    /// file list where each path appears at most once.
+    ///
     /// # Arguments
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
+    #[allow(dead_code)]
     pub(crate) fn add_with_dedup(
         &mut self,
         add: Add,
@@ -764,6 +771,15 @@ impl ContentTreeNodeBuilder {
         !self.pending_entries.is_empty() || !self.pre_built_data.is_empty()
     }
 
+    /// Returns `true` if the builder has a leaf manifest entry registered at `path`.
+    ///
+    /// Used to distinguish leaf removes that target the current content root (and must be applied
+    /// via [`delete_multiple_from_leaf`](Self::delete_multiple_from_leaf)) from removes that
+    /// reference an older content root (which are already handled by file-key deduplication).
+    pub(crate) fn has_leaf_manifest(&self, path: &str) -> bool {
+        self.dv_cache.contains_key(path)
+    }
+
     /// Remove data file entries by path. Only used when moving values in the root
     /// to the leaves (otherwise mark deleted it should be used.
     ///
@@ -805,59 +821,6 @@ impl ContentTreeNodeBuilder {
         self.dv_cache.remove(dv_identifier);
         self.values_seen.remove(dv_identifier);
         Ok(())
-    }
-
-    /// Removes a `Data` entry for the given path from the root manifest.
-    ///
-    /// Used when applying Remove actions from delta log commits to the root manifest.
-    /// Also removes from `values_seen` so the path can be re-added if a later commit
-    /// re-introduces the same file.
-    ///
-    /// Only removes entries where `content_type` is [`DataContentType::Data`]. Leaf manifest
-    /// references (`CombinedManifest` entries) with the same location string are not affected.
-    ///
-    /// # Arguments
-    /// * `path` - The data file path to remove
-    pub(crate) fn remove_by_path(&mut self, path: &str) -> DeltaResult<()> {
-        self.pending_entries.retain(|entry| {
-            !(entry.location.as_deref() == Some(path)
-                && entry.content_type == DataContentType::Data)
-        });
-        self.dv_cache.remove(path);
-        self.values_seen.remove(path);
-        Ok(())
-    }
-
-    /// Removes a file entry from the root or marks it deleted in its leaf manifest.
-    ///
-    /// When `data_manifest_path` and `data_manifest_position` are both `Some`, the file lives
-    /// inside a leaf manifest (referenced via a `CombinedManifest` root entry). In that case the
-    /// row at `data_manifest_position` is marked deleted in the leaf's manifest DV via
-    /// [`delete_multiple_from_leaf`](Self::delete_multiple_from_leaf). Otherwise the file is
-    /// removed directly from the root's pending `Data` entries via
-    /// [`remove_by_path`](Self::remove_by_path).
-    ///
-    /// # Arguments
-    /// * `path` - The data file path (used for the root-entry case)
-    /// * `data_manifest_path` - Relative path to the leaf manifest containing the file, if any
-    /// * `data_manifest_position` - Row index of the file within the leaf manifest, if any
-    pub(crate) fn remove(
-        &mut self,
-        path: &str,
-        data_manifest_path: Option<&str>,
-        data_manifest_position: Option<i64>,
-    ) -> DeltaResult<()> {
-        // Only treat data_manifest_path as a leaf if it is actually registered in the DV cache.
-        // Root manifest Data entries also carry data_manifest_path (pointing to the root itself),
-        // but the root is not in the DV cache, so those fall through to remove_by_path.
-        if let (Some(leaf_path), Some(pos)) = (data_manifest_path, data_manifest_position) {
-            if self.dv_cache.contains_key(leaf_path) {
-                let mut indices = roaring::RoaringTreemap::new();
-                indices.insert(pos as u64);
-                return self.delete_multiple_from_leaf(leaf_path, &indices, true);
-            }
-        }
-        self.remove_by_path(path)
     }
 
     /// Clears all data file and DV entries from the root manifest.
@@ -1756,121 +1719,220 @@ impl RowVisitor for DecodedDvVisitor {
     }
 }
 
-/// Applies delta log Add and Remove actions from ascending commit files onto a
-/// [`ContentTreeNodeBuilder`], rolling up the incremental changes into the new root manifest.
-///
-/// Commits are processed in **ascending** version order (oldest first). Remove actions within each
-/// commit are applied before Add actions so that a remove-then-re-add pair (e.g. a DV update)
-/// correctly replaces the old entry before the re-add is recorded.
-///
-/// This type implements [`LogReplayProcessor`] with `Output = ()` because the builder state
-/// mutation is the effect — no per-batch output needs to be returned to the caller.
-pub(crate) struct ContentTreeLogApplier<'a> {
-    builder: &'a mut ContentTreeNodeBuilder,
-    snapshot_id: i64,
-    log_segment: &'a LogSegment,
-    /// Replay only commit files strictly after this version. `None` replays from the beginning.
-    content_root_version: Option<Version>,
-    /// Version of the commit file currently being processed. Set by [`apply`](Self::apply) before
-    /// each call to [`process_actions_batch`](Self::process_actions_batch).
-    current_version: Option<Version>,
+/// A leaf manifest row that was removed by a delta log `Remove` action and must be applied as
+/// a deletion vector update after the replay loop.
+struct LeafRemove {
+    leaf_path: String,
+    position: i64,
 }
 
-impl<'a> ContentTreeLogApplier<'a> {
-    /// Creates a new applier.
+/// Log replay processor for AMT rollup that produces [`ContentTreeNodeEntry`] values directly.
+///
+/// Processes delta log commits in **descending** order (newest first) followed by the existing
+/// content root (as a "checkpoint" batch) to build the complete set of entries for a new content
+/// root. Uses spec-correct `(path, dv_location)` deduplication: first-seen wins, so the newest
+/// action for each logical file is authoritative.
+///
+/// - Log batches (`is_log_batch = true`): `Remove` actions mark the file key as seen (suppressing
+///   the content root entry); `Add` actions that are not yet seen mark the key as seen and emit a
+///   new [`ContentTreeNodeEntry`].
+/// - Content root batches (`is_log_batch = false`): entries whose `(path, dv_location)` key was
+///   NOT seen in a prior log batch are emitted unchanged; seen entries are suppressed.
+///
+/// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
+/// accumulated in [`leaf_removes`](Self::drain_leaf_removes) for a post-replay pass that applies
+/// them via [`ContentTreeNodeBuilder::delete_multiple_from_leaf`].
+pub(crate) struct AmtLogReplayProcessor {
+    snapshot_id: i64,
+    /// Version of the new commit being built. Used to stamp `sequence_number` on emitted entries.
+    batch_commit_version: Version,
+    table_schema: Schema,
+    seen_file_keys: HashSet<FileActionKey>,
+    leaf_removes: Vec<LeafRemove>,
+}
+
+impl AmtLogReplayProcessor {
+    /// Creates a new processor.
     ///
     /// # Parameters
-    /// - `builder`: The content-tree builder to apply actions onto.
-    /// - `snapshot_id`: The snapshot ID written into tracking info for each new or updated entry.
-    /// - `log_segment`: The snapshot's log segment. Only commit files strictly after
-    ///   `content_root_version` are replayed; the already-loaded file list is filtered in memory.
-    /// - `content_root_version`: The version of the existing content root. Only commit files
-    ///   strictly after this version are replayed. Pass `None` to replay from the beginning.
+    /// - `snapshot_id`: Snapshot ID written into tracking info for each emitted entry.
+    /// - `batch_commit_version`: The new commit version being built. Used for sequence number
+    ///   stamping and status determination (`Added` vs `Existed`).
+    /// - `table_schema`: Physical table schema with PARQUET:field_id metadata. Used for stats
+    ///   conversion when building entries from `Add` actions.
     pub(crate) fn new(
-        builder: &'a mut ContentTreeNodeBuilder,
         snapshot_id: i64,
-        log_segment: &'a LogSegment,
-        content_root_version: Option<Version>,
+        batch_commit_version: Version,
+        table_schema: Schema,
     ) -> Self {
         Self {
-            builder,
             snapshot_id,
-            log_segment,
-            content_root_version,
-            current_version: None,
+            batch_commit_version,
+            table_schema,
+            seen_file_keys: HashSet::new(),
+            leaf_removes: Vec::new(),
         }
     }
 
-    /// Replays Add and Remove actions from commit files since the content root version onto the
-    /// builder, in ascending version order.
+    /// Processes a log batch (`is_log_batch = true`).
     ///
-    /// Filters the snapshot's already-loaded [`LogSegment`] in memory to the commits strictly
-    /// after `content_root_version`; no additional storage listing is performed.
-    pub(crate) fn apply(&mut self, engine: &dyn Engine) -> DeltaResult<()> {
-        static ADD_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([
-                StructField::nullable(ADD_NAME, Add::to_schema()),
-                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-            ]))
-        });
+    /// Remove actions mark the file key as seen. Add actions that are first-seen emit a new
+    /// [`ContentTreeNodeEntry`] with tracking stamped from the batch version.
+    fn process_log_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let version = batch
+            .version
+            .ok_or_else(|| Error::generic("AmtLogReplayProcessor: log batch is missing version"))?;
 
-        let content_root_version = self.content_root_version;
-        // Collect eagerly so neither `self.log_segment` nor the closure borrow `self` across
-        // the loop body, which calls `&mut self` via `process_actions_batch`.
-        let commit_files: Vec<_> = self
-            .log_segment
-            .listed
-            .ascending_commit_files
-            .iter()
-            .filter(|f| content_root_version.is_none_or(|v| f.version > v))
-            .map(|f| (f.version, f.location.clone()))
-            .collect();
-
-        for (version, location) in commit_files {
-            self.current_version = Some(version);
-            let iter = engine.json_handler().read_json_files(
-                std::slice::from_ref(&location),
-                ADD_REMOVE_SCHEMA.clone(),
-                None,
-            )?;
-            for batch in iter {
-                self.process_actions_batch(ActionsBatch::new(batch?, true))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ContentTreeLogApplier<'_> {
-    /// Applies a single batch of Add and Remove actions to the builder.
-    ///
-    /// Removes are applied before adds so that a remove-then-re-add pair (e.g. a DV update)
-    /// within the same commit correctly clears the builder's deduplication state before the
-    /// subsequent add is recorded.
-    fn process_actions_batch(&mut self, batch: ActionsBatch) -> DeltaResult<()> {
-        let version = self
-            .current_version
-            .ok_or_else(|| Error::generic("ContentTreeLogApplier: current_version not set"))?;
         let mut add_visitor = AddVisitor::default();
         let mut remove_visitor = RemoveVisitor::default();
         add_visitor.visit_rows_of(batch.actions.as_ref())?;
         remove_visitor.visit_rows_of(batch.actions.as_ref())?;
 
-        // Apply removes before adds so that a remove-then-re-add pair (e.g. a DV update) within
-        // the same commit correctly clears `values_seen`, allowing the subsequent add to proceed.
+        // Process removes: mark (path, dv_loc) as seen so the corresponding content root entry
+        // is suppressed. Collect leaf removes for post-replay processing.
         for remove in remove_visitor.removes {
-            self.builder.remove(
-                &remove.path,
-                remove.data_manifest_path.as_deref(),
-                remove.data_manifest_position,
-            )?;
+            let dv_loc = remove
+                .deletion_vector
+                .as_ref()
+                .map(extract_deletion_vector_content)
+                .transpose()?
+                .map(|dv| dv.location);
+            self.seen_file_keys
+                .insert(FileActionKey::new(remove.path.clone(), dv_loc));
+
+            if let (Some(leaf_path), Some(pos)) =
+                (remove.data_manifest_path, remove.data_manifest_position)
+            {
+                self.leaf_removes.push(LeafRemove {
+                    leaf_path,
+                    position: pos,
+                });
+            }
         }
+
+        let mut entries = Vec::new();
+
+        // Process adds: emit entries for files not yet seen (first-seen = newest wins).
         for add in add_visitor.adds {
-            self.builder.add(add, version, self.snapshot_id)?;
+            let dv_content = add
+                .deletion_vector
+                .as_ref()
+                .map(extract_deletion_vector_content)
+                .transpose()?;
+            let dv_loc = dv_content.as_ref().map(|dv| dv.location.clone());
+            let key = FileActionKey::new(add.path.clone(), dv_loc);
+
+            if self.seen_file_keys.contains(&key) {
+                continue;
+            }
+            self.seen_file_keys.insert(key);
+
+            let content_stats = delta_json_stats_to_content_stats(
+                add.stats.as_deref(),
+                &self.table_schema,
+                add.deletion_vector.is_some().then_some(false),
+            )?;
+            let record_count = add
+                .stats
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Stats>(s).ok())
+                .map(|s| s.num_records as i64)
+                .unwrap_or(0);
+            let content_stats = merge_partition_values_into_stats(
+                content_stats,
+                &add.partition_values,
+                &self.table_schema,
+                Some(record_count),
+            )?;
+
+            let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(add.path)
+                .with_tracking(version, self.batch_commit_version, self.snapshot_id)
+                .dv_info_opt(dv_content)
+                .record_count(record_count)
+                .file_size_in_bytes(add.size)
+                .content_stats_opt(content_stats)
+                .build();
+            entries.push(entry);
         }
-        Ok(())
+
+        Ok(entries)
+    }
+
+    /// Processes a content root batch (`is_log_batch = false`).
+    ///
+    /// Emits entries whose `(path, dv_location)` key was not seen in a prior log batch.
+    /// Entries at a version earlier than `batch_commit_version` that are still `Added` are
+    /// downgraded to `Existed`.
+    fn process_content_root_batch(
+        &mut self,
+        batch: ActionsBatch,
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let mut visitor = ContentTreeNodeEntryVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+
+        let mut entries = Vec::new();
+        for entry in visitor.entries {
+            let path = match &entry.location {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let dv_loc = entry.dv_info.as_ref().map(|d| d.location.clone());
+            let key = FileActionKey::new(path, dv_loc);
+
+            if self.seen_file_keys.contains(&key) {
+                // Superseded by a log action — skip.
+                continue;
+            }
+
+            // Downgrade Added -> Existed for entries that were written before the current commit.
+            let entry = if entry.tracking.status == TrackingStatus::Added
+                && entry.tracking.sequence_number != Some(self.batch_commit_version as i64)
+            {
+                entry.with_status(TrackingStatus::Existed)
+            } else {
+                entry
+            };
+
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    /// Consumes the processor and returns leaf manifest removals grouped by leaf path.
+    ///
+    /// The caller must apply these removals via
+    /// [`ContentTreeNodeBuilder::delete_multiple_from_leaf`] after populating the builder with
+    /// the emitted entries.
+    pub(crate) fn drain_leaf_removes(self) -> HashMap<String, roaring::RoaringTreemap> {
+        let mut result: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        for lr in self.leaf_removes {
+            result
+                .entry(lr.leaf_path)
+                .or_default()
+                .insert(lr.position as u64);
+        }
+        result
     }
 }
+
+impl LogReplayProcessor for AmtLogReplayProcessor {
+    type Output = Vec<ContentTreeNodeEntry>;
+
+    fn process_actions_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        if batch.is_log_batch {
+            self.process_log_batch(batch)
+        } else {
+            self.process_content_root_batch(batch)
+        }
+    }
+
+    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
+        None
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3728,77 +3790,6 @@ mod tests {
             TrackingStatus::Existed,
             "file from an earlier version must have Existed status"
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_remove_then_add_replaces_existing_entry() -> Result<(), Box<dyn std::error::Error>> {
-        use tempfile::tempdir;
-        let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
-
-        // Add file1 at version 2 (initial entry, e.g. from root manifest).
-        builder.add(make_test_add("file1.parquet"), 2, 100)?;
-        assert_eq!(builder.pending_entries.len(), 1);
-
-        // Simulate a delta log commit at v3: Remove then re-Add (e.g. a DV update).
-        builder.remove_by_path("file1.parquet")?;
-        builder.add(make_test_add("file1.parquet"), 3, 100)?;
-
-        // Still one entry, and its sequence_number is 3 (the later commit version).
-        assert_eq!(builder.pending_entries.len(), 1);
-        let entry = &builder.pending_entries[0];
-        let ti = &entry.tracking;
-        assert_eq!(
-            ti.sequence_number,
-            Some(3),
-            "entry must be stamped with the commit version of the re-add"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_remove_by_path_removes_data_entry() -> Result<(), Box<dyn std::error::Error>> {
-        use tempfile::tempdir;
-        let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
-
-        builder.add(make_test_add("file1.parquet"), 2, 100)?;
-        builder.add(make_test_add("file2.parquet"), 3, 100)?;
-        assert_eq!(builder.pending_entries.len(), 2);
-
-        builder.remove_by_path("file1.parquet")?;
-        assert_eq!(builder.pending_entries.len(), 1);
-        assert_eq!(
-            builder.pending_entries[0].location.as_deref(),
-            Some("file2.parquet")
-        );
-
-        // Path removed from values_seen, so it can be re-added.
-        builder.add(make_test_add("file1.parquet"), 4, 100)?;
-        assert_eq!(builder.pending_entries.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_remove_by_path_noop_for_nonexistent() -> Result<(), Box<dyn std::error::Error>> {
-        use tempfile::tempdir;
-        let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
-        builder.add(make_test_add("file1.parquet"), 2, 100)?;
-
-        // Removing a non-existent path is a no-op.
-        builder.remove_by_path("nonexistent.parquet")?;
-        assert_eq!(builder.pending_entries.len(), 1);
 
         Ok(())
     }
