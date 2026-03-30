@@ -16,8 +16,9 @@ use crate::DeltaResult;
 
 /// Verifies that add file statistics contain required columns.
 ///
-/// For each required column, validates that `nullCount`, `minValues`, and `maxValues`
-/// entries are present (non-null) in every add file's statistics.
+/// For each required column, validates that `nullCount` is present (non-null) and that
+/// `minValues` and `maxValues` are present unless the column is all-null
+/// (`nullCount == numRecords`).
 pub(crate) struct StatsVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
@@ -45,7 +46,12 @@ impl StatsVerifier {
     }
 
     /// Verify a single required column has nullCount, minValues, and maxValues stats in
-    /// every file. Extracts all three stat columns in a single `visit_rows` call per batch.
+    /// every file.
+    ///
+    /// Uses a single `visit_rows` pass with all 5 columns. If that fails with `MissingColumn`
+    /// (meaning the minValues/maxValues struct is absent because all stats columns are all-null),
+    /// falls back to a 3-column pass on [path, numRecords, nullCount] and treats any file where
+    /// `nullCount != numRecords` as missing min/max.
     fn verify_column(
         &self,
         add_files: &[Box<dyn crate::EngineData>],
@@ -73,7 +79,28 @@ impl StatsVerifier {
                 missing_min: &mut missing_min,
                 missing_max: &mut missing_max,
             };
-            batch.visit_rows(&column_names, &mut visitor)?;
+            match batch.visit_rows(&column_names, &mut visitor) {
+                Ok(()) => {}
+                // minValues/maxValues struct absent: verify all files are all-null.
+                // collect_stats omits the struct when no stats columns have non-null values.
+                Err(Error::MissingColumn(_)) => {
+                    let null_only_cols = vec![
+                        ColumnName::new(["path"]),
+                        ColumnName::new(["stats", "numRecords"]),
+                        build_stat_path(column, "nullCount"),
+                    ];
+                    let mut non_all_null: Vec<String> = Vec::new();
+                    let mut null_only = NullCountOnlyVisitor {
+                        missing_null_count: &mut missing_null_count,
+                        non_all_null: &mut non_all_null,
+                    };
+                    batch.visit_rows(&null_only_cols, &mut null_only)?;
+                    // Any non-all-null file is missing min/max stats.
+                    missing_min.extend_from_slice(&non_all_null);
+                    missing_max.extend(non_all_null);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         if !missing_null_count.is_empty() {
@@ -252,6 +279,50 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
             }
         }
 
+        Ok(())
+    }
+}
+
+// Static type array for the 3-column null-count-only pass: [path, numRecords, nullCount].
+static NULL_COUNT_ONLY_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    let names = vec![column_name!("path"), column_name!("nr"), column_name!("nc")];
+    let types = vec![DataType::STRING, DataType::LONG, DataType::LONG];
+    (names, types).into()
+});
+
+/// Fallback visitor used when minValues/maxValues struct is absent from the batch.
+/// Checks path/numRecords/nullCount (3 getters) and collects file paths that are not all-null
+/// (i.e. files that would require non-absent min/max stats).
+struct NullCountOnlyVisitor<'a> {
+    missing_null_count: &'a mut Vec<String>,
+    non_all_null: &'a mut Vec<String>,
+}
+
+impl RowVisitor for NullCountOnlyVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        NULL_COUNT_ONLY_TYPES.as_ref()
+    }
+
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 3,
+            Error::internal_error(format!(
+                "Expected 3 getters for null-count-only validation, got {}",
+                getters.len()
+            ))
+        );
+        for row_idx in 0..row_count {
+            let path: String = getters[0].get(row_idx, "path")?;
+            let num_records = getters[1].get_long(row_idx, "numRecords")?;
+            let null_count = getters[2].get_long(row_idx, "nullCount")?;
+            if null_count.is_none() {
+                self.missing_null_count.push(path.clone());
+            }
+            let all_null = matches!((num_records, null_count), (Some(nr), Some(nc)) if nr == nc);
+            if !all_null {
+                self.non_all_null.push(path);
+            }
+        }
         Ok(())
     }
 }
@@ -618,16 +689,13 @@ mod tests {
         verifier.verify(&[engine_data]).unwrap();
     }
 
-    /// Round-trip test: collect_stats produces stats that pass verification, including for
-    /// all-null columns where min/max should be null but the column field must still exist.
-    #[rstest]
-    #[case::non_null_values(Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef)]
-    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
-    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
-    fn test_collected_stats_pass_verification(#[case] values: ArrayRef) {
+    /// Round-trip test: collect_stats produces stats that pass verification for non-null data.
+    #[test]
+    fn test_collected_stats_pass_verification() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), Some(2), Some(3)]));
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "col",
-            values.data_type().clone(),
+            ArrowDataType::Int64,
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
@@ -652,5 +720,41 @@ mod tests {
 
         let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
         verifier.verify(&[engine_data]).unwrap();
+    }
+
+    /// Verify collect_stats produces correct stats shape for all-null and empty batches.
+    /// These cases omit the column from minValues/maxValues entirely.
+    #[rstest]
+    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
+    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
+    fn test_collected_stats_shape_for_all_null_and_empty(#[case] values: ArrayRef) {
+        let num_rows = values.len();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "col",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
+
+        // numRecords should match row count
+        let num_records = stats
+            .column_by_name("numRecords")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(num_records.value(0), num_rows as i64);
+
+        // All-null/empty columns are omitted from minValues/maxValues entirely
+        assert!(
+            stats.column_by_name("minValues").is_none(),
+            "minValues should be absent when all stats columns are all-null"
+        );
+        assert!(
+            stats.column_by_name("maxValues").is_none(),
+            "maxValues should be absent when all stats columns are all-null"
+        );
     }
 }

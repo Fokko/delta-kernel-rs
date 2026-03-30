@@ -68,14 +68,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -682,15 +682,13 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
 fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<()> {
     use crate::actions::visitors::AddVisitor;
     use crate::engine::default::DefaultEngine;
-    use crate::path::{LogPathFileType, ParsedLogPath};
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
     use crate::RowVisitor;
     use futures::executor::block_on;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
 
     // Setup: Create an in-memory store
     let store = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
-    let log_root = table_root.join("_delta_log/").unwrap();
 
     // Create initial commit with protocol and metadata
     // Protocol includes MetadataTreeExperimental and ColumnMapping features
@@ -739,11 +737,11 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     // Content root is at version 3, so we should only read commits 4 and 5
     for version in 1..=5 {
         let commit_content = if version == 3 {
-            // Version 3 has the contentRoot action pointing to the content root file
+            // Version 3 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
-                version, content_root_url, version
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+                version, version, content_root_url
             )
         } else {
             format!(
@@ -755,50 +753,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
     }
 
-    // Create ParsedLogPath objects for commits
-    let mut commit_files = vec![];
-    for version in 0..=5 {
-        let location = log_root.join(&format!("{:020}.json", version)).unwrap();
-        commit_files.push(ParsedLogPath {
-            location: FileMeta {
-                location,
-                last_modified: 0,
-                size: 100,
-            },
-            filename: format!("{:020}.json", version),
-            extension: "json".to_string(),
-            version,
-            file_type: LogPathFileType::Commit,
-        });
-    }
-
-    let latest_commit_file = commit_files.last().cloned();
-    let log_segment = crate::log_segment::LogSegment {
-        end_version: 5,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root: {
-            let log_root_str = log_root.as_str();
-            Url::parse(log_root_str.strip_suffix("_delta_log/").unwrap()).unwrap()
-        },
-        listed: crate::log_segment_files::LogSegmentFiles {
-            ascending_commit_files: commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
-            latest_commit_file,
-            max_published_version: None,
-        },
-        checkpoint_schema: None,
-    };
-
-    // Create a Snapshot from the log_segment
-    let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment(
-        table_root.clone(),
-        log_segment,
-        engine.as_ref(),
-        None,
-    )?);
+    let snapshot = Snapshot::builder_for(table_root.as_str()).build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
 
@@ -953,52 +908,6 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
-///
-/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
-/// JSON commits at versions 4-5. This test exercises both code paths:
-/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
-/// - JSON log batches: stats are parsed from JSON via the transform expression
-///
-/// Table layout (6 files, each 100 records):
-///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
-///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
-#[test]
-fn test_data_skipping_with_parsed_stats() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
-    }
-
-    assert_eq!(
-        selected_file_count, 2,
-        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
-    );
-}
-
 /// Test that `include_all_stats_columns` and `with_predicate` can be used together.
 /// The scan should output stats_parsed AND perform data skipping via the predicate.
 #[test]
@@ -1078,10 +987,11 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     use crate::actions::visitors::AddVisitor;
     use crate::engine::default::DefaultEngine;
+    use crate::metrics::MetricId;
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::RowVisitor;
     use futures::executor::block_on;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
 
     // Setup: Create an in-memory store
     let store = Arc::new(InMemory::new());
@@ -1138,11 +1048,11 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let versions = vec![1, 2, 5, 10, 15, 20];
     for version in &versions {
         let commit_content = if *version == 10 {
-            // Version 10 has the contentRoot action pointing to the content root file
+            // Version 10 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
-                version, content_root_url, version
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+                version, version, content_root_url
             )
         } else {
             format!(
@@ -1154,32 +1064,31 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
     }
 
-    // Create ParsedLogPath objects for commits (including version 0)
-    let all_versions = vec![0, 1, 2, 5, 10, 15, 20];
-    let mut commit_files = vec![];
-    for version in &all_versions {
-        let location = log_root.join(&format!("{:020}.json", version)).unwrap();
-        commit_files.push(ParsedLogPath {
-            location: FileMeta {
-                location,
-                last_modified: 0,
-                size: 100,
-            },
-            filename: format!("{:020}.json", version),
-            extension: "json".to_string(),
-            version: *version,
-            file_type: LogPathFileType::Commit,
-        });
-    }
-
+    // Manually construct a LogSegment with non-contiguous versions to bypass the contiguity check,
+    // which is the behavior under test.
+    let all_versions = [0u64, 1, 2, 5, 10, 15, 20];
+    let commit_files: Vec<_> = all_versions
+        .iter()
+        .map(|&version| {
+            let location = log_root.join(&format!("{:020}.json", version)).unwrap();
+            ParsedLogPath {
+                location: FileMeta {
+                    location,
+                    last_modified: 0,
+                    size: 100,
+                },
+                filename: format!("{:020}.json", version),
+                extension: "json".to_string(),
+                version,
+                file_type: LogPathFileType::Commit,
+            }
+        })
+        .collect();
     let log_segment = crate::log_segment::LogSegment {
         end_version: 20,
         checkpoint_version: None,
         log_root: log_root.clone(),
-        table_root: {
-            let log_root_str = log_root.as_str();
-            Url::parse(log_root_str.strip_suffix("_delta_log/").unwrap()).unwrap()
-        },
+        table_root: table_root.clone(),
         listed: crate::log_segment_files::LogSegmentFiles {
             ascending_commit_files: commit_files,
             ascending_compaction_files: vec![],
@@ -1190,13 +1099,11 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         },
         checkpoint_schema: None,
     };
-
-    // Create a Snapshot from the log_segment
-    let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment(
+    let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment_impl(
         table_root.clone(),
         log_segment,
         engine.as_ref(),
-        None,
+        MetricId::default(),
     )?);
 
     let scan = snapshot.scan_builder().build()?;

@@ -298,23 +298,39 @@ impl CheckpointWriter {
             .table_configuration()
             .build_partition_values_parsed_schema();
 
-        // The read schema and output schema differ because the transform needs access to
-        // both stats formats as input, but may only write one format as output.
+        // Two read schemas are needed because the Arrow JSON reader does not support
+        // Binary-typed columns, and partition columns may have Binary type.
         //
-        // read_schema: Always includes both `stats` and `stats_parsed` fields in the Add
-        // action, so COALESCE expressions can read from either source. For commit files,
-        // `stats_parsed` doesn't exist and is read as nulls. For partitioned tables,
-        // `partitionValues_parsed` is also included.
+        // commit_read_schema: Excludes `partitionValues_parsed` to avoid Binary column
+        //   errors when reading JSON commit files.
+        // checkpoint_read_schema: Includes `partitionValues_parsed` (for partitioned tables)
+        //   so existing values in checkpoint parquet files are read and available to the
+        //   transform. Both schemas always include `stats_parsed` so COALESCE expressions can
+        //   read from either source (commit files read it as null).
         //
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema = build_checkpoint_read_schema(base_schema, &stats_schema)?;
+        let commit_read_schema = build_checkpoint_read_schema(base_schema, &stats_schema, None)?;
+        let checkpoint_read_schema =
+            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
 
-        // Read actions from log segment
-        let actions =
-            self.snapshot
-                .log_segment()
-                .read_actions(engine, read_schema.clone(), None)?;
+        // Read actions from log segment using separate schemas for commits vs checkpoints
+        let actions = self
+            .snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                commit_read_schema,
+                checkpoint_read_schema.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )?
+            .actions;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
@@ -335,7 +351,7 @@ impl CheckpointWriter {
         let transform_expr =
             build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            read_schema,
+            checkpoint_read_schema,
             transform_expr,
             output_schema.clone().into(),
         )?;

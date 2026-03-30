@@ -31,6 +31,7 @@ fn try_create_from_parquet(
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let reader_options = reader_options();
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+
     let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;

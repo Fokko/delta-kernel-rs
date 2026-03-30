@@ -17,7 +17,7 @@
 //! This module provides common functionality for working with Delta table files,
 //! including cleanup and copy operations used by benchmarking tools.
 
-use object_store::ObjectStore;
+use delta_kernel::object_store::ObjectStore;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use url::Url;
@@ -85,7 +85,7 @@ pub async fn remove_all_table_files(
     let list_prefix = if path_prefix.is_empty() {
         None
     } else {
-        Some(object_store::path::Path::from(
+        Some(delta_kernel::object_store::path::Path::from(
             path_prefix.trim_end_matches('/'),
         ))
     };
@@ -185,8 +185,10 @@ mod tests {
         let table_path = temp_dir.path().join("test_table");
         std::fs::create_dir_all(&table_path).unwrap();
 
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&table_path).unwrap());
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            delta_kernel::object_store::local::LocalFileSystem::new_with_prefix(&table_path)
+                .unwrap(),
+        );
         let table_url = url::Url::from_directory_path(&table_path).unwrap();
 
         let stats = remove_all_table_files(&store, &table_url, "")
@@ -214,8 +216,10 @@ mod tests {
         .unwrap();
         std::fs::write(table_path.join("data-file.parquet"), "data").unwrap();
 
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&table_path).unwrap());
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            delta_kernel::object_store::local::LocalFileSystem::new_with_prefix(&table_path)
+                .unwrap(),
+        );
         let table_url = url::Url::from_directory_path(&table_path).unwrap();
 
         let stats = remove_all_table_files(&store, &table_url, "")

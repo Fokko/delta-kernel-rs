@@ -1,7 +1,7 @@
-//! Integration tests for batch commits with content trees during table creation.
+//! Integration tests for manifest commits with content trees during table creation.
 //!
 //! These tests verify that a `create_table` transaction can be combined with
-//! `with_batch_commit` and leaf writers so that the initial commit (version 0)
+//! `with_manifest_commit` and leaf writers so that the initial commit (version 0)
 //! creates the table and builds a content tree with leaf manifests in one step.
 
 use std::collections::HashSet;
@@ -18,7 +18,7 @@ use test_utils::{collect_file_paths, create_add_files_metadata, test_table_setup
 /// combined with two leaf writers commits at version 0, produces a content root, and
 /// makes all written files visible via a subsequent scan with no duplicates.
 #[tokio::test]
-async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_create_table_manifest_commit_with_leaves() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
@@ -35,9 +35,9 @@ async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std:
     let add_files_schema = txn.add_files_schema();
 
     {
-        let batch = txn.with_batch_commit();
+        let mc = txn.with_manifest_commit();
 
-        let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
+        let mut leaf1 = mc.new_leaf_node_writer(engine.as_ref())?;
         leaf1.add_files(
             engine.as_ref(),
             create_add_files_metadata(
@@ -48,9 +48,9 @@ async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std:
                 ],
             )?,
         )?;
-        batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
+        mc.add_leaf(leaf1.finish(engine.as_ref())?)?;
 
-        let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
+        let mut leaf2 = mc.new_leaf_node_writer(engine.as_ref())?;
         leaf2.add_files(
             engine.as_ref(),
             create_add_files_metadata(
@@ -61,7 +61,7 @@ async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std:
                 ],
             )?,
         )?;
-        batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
+        mc.add_leaf(leaf2.finish(engine.as_ref())?)?;
     }
 
     let committed = match txn.commit(engine.as_ref())? {
@@ -74,8 +74,8 @@ async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std:
         Snapshot::builder_for(delta_kernel::try_parse_uri(&table_path)?).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
     assert!(
-        snapshot.content_root().is_some(),
-        "Batch commit should produce a content root"
+        snapshot.checkpoint_action().is_some(),
+        "Manifest commit should produce a content root"
     );
 
     let paths = collect_file_paths(snapshot, engine.as_ref())?;

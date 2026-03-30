@@ -18,6 +18,11 @@ use itertools::Itertools;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use rstest::rstest;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
+use delta_kernel::transaction::CommitResult;
+
+use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 

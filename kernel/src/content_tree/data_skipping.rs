@@ -3,14 +3,15 @@
 //! This module provides filtering capabilities that apply predicates to manifest entries
 //! during parquet reading phase, before ContentTreeNodeEntry materialization.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
-use crate::expressions::PredicateRef;
+use crate::expressions::{Expression, PredicateRef};
 use crate::kernel_predicates::KernelPredicateEvaluator;
 use crate::scan::data_skipping::DataSkippingPredicateCreator;
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{
     DeltaResult, EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
     RowVisitor as _,
@@ -85,42 +86,50 @@ impl ManifestDataSkippingFilter {
             })
             .ok()?;
 
-        // Use the provided stats_schema (already validated and built from table configuration)
-        let stats_schema = Arc::new(stats_schema.clone());
+        // Wrap the flat stats expression and schema in a `stats_parsed` field to match
+        // the column references emitted by DataSkippingPredicateCreator (e.g.
+        // `stats_parsed.minValues.id`).
+        let flat_stats_schema = Arc::new(stats_schema.clone());
+        let wrapped_expr = Arc::new(Expression::struct_from([transform_expr]));
+        let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new((*flat_stats_schema).clone())),
+        )]));
 
-        // Create evaluator for the transform expression
+        // Create evaluator for the transform expression: manifest batch -> { stats_parsed: { ... } }
         let transform_evaluator = evaluation_handler
             .new_expression_evaluator(
                 manifest_batch_schema.clone(),
-                transform_expr,
-                DataType::Struct(Box::new((*stats_schema).clone())),
+                wrapped_expr,
+                DataType::Struct(Box::new((*wrapped_schema).clone())),
             )
             .inspect_err(|e| error!("Failed to create transform evaluator: {e}"))
             .ok()?;
 
         // Step 2: Rewrite predicate for data skipping
-        let data_skipping_pred = DataSkippingPredicateCreator.eval_sql_where(predicate)?;
+        let data_skipping_pred =
+            DataSkippingPredicateCreator::new(&HashSet::new()).eval_sql_where(predicate)?;
         debug!("Data skipping predicate: {:#?}", data_skipping_pred);
 
         // Create evaluator for the data skipping predicate
         let skipping_evaluator = evaluation_handler
-            .new_predicate_evaluator(stats_schema.clone(), Arc::new(data_skipping_pred))
+            .new_predicate_evaluator(wrapped_schema.clone(), Arc::new(data_skipping_pred))
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
         // Step 3: Create filter predicate: DISTINCT(output, false)
         // This converts the boolean predicate result to a selection vector
-        use crate::expressions::{column_expr, Expression};
+        use crate::expressions::column_expr;
         let filter_pred = Arc::new(column_expr!("output").distinct(Expression::literal(false)));
 
         let filter_evaluator = evaluation_handler
-            .new_predicate_evaluator(stats_schema.clone(), filter_pred)
+            .new_predicate_evaluator(wrapped_schema.clone(), filter_pred)
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
         Some(Self {
             transform_evaluator,
-            _stats_schema: stats_schema,
+            _stats_schema: wrapped_schema,
             skipping_evaluator,
             filter_evaluator,
         })

@@ -100,7 +100,7 @@ enum Scenario {
         #[arg(short = 'b', long, default_value_t = 20000)]
         batch_size: usize,
 
-        /// Bulk mode: true = batch commit, false = commit each batch
+        /// Bulk mode: true = manifest commit, false = commit each batch
         #[arg(short = 'm', default_value_t = false)]
         bulk_mode: bool,
     },

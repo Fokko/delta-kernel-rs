@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
 use itertools::Itertools as _;
-use object_store::DynObjectStore;
 use url::Url;
 
 use delta_kernel_derive::internal_api;
@@ -25,6 +24,7 @@ use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
+use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
@@ -108,7 +108,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
 /// # use std::sync::Arc;
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-/// # use object_store::local::LocalFileSystem;
+/// # use delta_kernel::object_store::local::LocalFileSystem;
 /// // Build a DefaultEngine with default executor
 /// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
 ///     .build();
@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use crate::metrics::MetricEvent;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     #[derive(Debug)]
     struct TestMetricsReporter;

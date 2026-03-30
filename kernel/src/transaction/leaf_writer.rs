@@ -12,7 +12,7 @@ use url::Url;
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
 ///
-/// This is an opaque type - use it by passing to [`crate::transaction::BatchState::add_leaf`].
+/// This is an opaque type - use it by passing to [`crate::transaction::ManifestCommitState::add_leaf`].
 #[derive(Debug)]
 pub struct LeafNodeWriterResult {
     /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries are deleted.
@@ -253,7 +253,7 @@ impl LeafNodeWriter {
 
     /// Buffer net new files for writing to data manifest.
     ///
-    /// This method is designed for batch commit scenarios where the data contains simple
+    /// This method is designed for manifest commit scenarios where the data contains simple
     /// write metadata (path, partitionValues, size, modificationTime, stats) rather than
     /// full Add actions.
     ///
@@ -368,7 +368,7 @@ mod tests {
     /// Helper to create a test engine, table root URL, and schema
     fn test_setup() -> (Arc<dyn Engine>, Url, SchemaRef) {
         use crate::engine::default::DefaultEngineBuilder;
-        use object_store::local::LocalFileSystem;
+        use crate::object_store::local::LocalFileSystem;
 
         let temp_path = tempfile::tempdir().unwrap().keep();
         // Use LocalFileSystem::new() (no prefix) so that absolute URLs passed to write_parquet_file

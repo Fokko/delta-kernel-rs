@@ -4,14 +4,16 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_content_root_schema,
+    as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+     get_log_checkpoint_action_schema,
+     CheckpointAction,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
@@ -22,7 +24,7 @@ use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
@@ -34,19 +36,19 @@ use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    RowVisitor, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
-pub mod batch_state;
 mod content_tree;
 pub mod leaf_writer;
+pub mod manifest_commit_state;
 
 use content_tree::ScanMetadataRemoveVisitor;
 
 // Re-export types needed for public API
-pub use batch_state::BatchState;
 pub use leaf_writer::LeafNodeWriterResult;
+pub use manifest_commit_state::ManifestCommitState;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -63,6 +65,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
@@ -209,6 +212,7 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -239,9 +243,9 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
-    // Batch (content-tree) commit state. `Some` when the caller has opted in via
-    // `with_batch_commit()`. `None` for standard incremental commits.
-    batch_state: Option<BatchState>,
+    // Manifest commit state. `Some` when the caller has opted in via
+    // `with_manifest_commit()`. `None` for log commits.
+    manifest_commit_state: Option<ManifestCommitState>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -357,27 +361,26 @@ impl<S> Transaction<S> {
         );
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
-        let commit_info_action =
-            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let commit_info_action = self.generate_commit_info(engine, commit_info);
 
         // Step 3: Get commit version for actions
         let commit_version = self.get_commit_version();
 
         // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
-        // TODO: In batch commit mode, DV updates should be recorded in the content tree rather
+        // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
         // than written to the delta log (same issue as removes). This requires:
-        // 1. Processing dv_matched_files in the batch commit block of generate_log_actions
+        // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions
         //    to update the content tree with new DV descriptors.
         // 2. Suppressing dv_update_actions from the log (similar to how remove_actions are
-        //    suppressed when batch_commit is active).
-        // 3. Including !self.dv_matched_files.is_empty() in is_batch_commit_active()'s
+        //    suppressed when manifest_commit is active).
+        // 3. Including !self.dv_matched_files.is_empty() in is_manifest_commit()'s
         //    has_work_to_do check.
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 5: Generate remove actions for the delta log (skipped in batch commit mode, where
+        // Step 5: Generate remove actions for the delta log (skipped in manifest commit mode, where
         // removes are recorded in the content tree instead).
-        let batch_commit = self.is_batch_commit_active();
-        let remove_actions = if batch_commit {
+        let manifest_commit = self.is_manifest_commit();
+        let remove_actions = if manifest_commit {
             None
         } else {
             Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
@@ -445,7 +448,7 @@ impl<S> Transaction<S> {
     }
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
-    /// domain metadata, and add actions (or content root for batch commits).
+    /// domain metadata, and add actions (or checkpoint action for manifest commits).
     fn generate_log_actions(
         &self,
         engine: &dyn Engine,
@@ -494,8 +497,8 @@ impl<S> Transaction<S> {
                 .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
         );
 
-        // Handle batch commit - either write to metadata tree or include in JSON log
-        if self.is_batch_commit_active() {
+        // Handle manifest commit - either write to metadata tree or include in JSON log
+        if self.is_manifest_commit() {
             // Content metadata trees require column mapping mode to be ID for stable field IDs
             let column_mapping_mode = self
                 .read_snapshot
@@ -504,51 +507,48 @@ impl<S> Transaction<S> {
             require!(
                 column_mapping_mode == crate::table_features::ColumnMappingMode::Id,
                 Error::generic(format!(
-                    "Content metadata trees (batch_commit mode) require column mapping mode 'id', found '{:?}'",
+                    "Content metadata trees (manifest_commit mode) require column mapping mode 'id', found '{:?}'",
                     column_mapping_mode
                 ))
             );
 
-            // Get the cached content root from the snapshot (no I/O needed)
-            let latest_content_root = self
-                .read_snapshot
-                .content_root()
-                .map(|cr| (cr.clone(), cr.version));
+            // Get the cached checkpoint action from the snapshot (no I/O needed)
+            let latest_checkpoint_action = self.read_snapshot.checkpoint_action().cloned();
 
-            // Removes in batch mode require an existing content root so that every file
+            // Removes in manifest commit mode require an existing checkpoint action so that every file
             // carries a data_manifest_path and data_manifest_position (row ID). Without
-            // a root the scan metadata lacks those fields and we cannot locate entries.
-            // TODO: revisit whether removes should be supported for the first batch commit
+            // a checkpoint action the scan metadata lacks those fields and we cannot locate entries.
+            // TODO: revisit whether removes should be supported for the first manifest commit
             // (e.g. by treating files with no manifest path as root deletions by path).
-            if latest_content_root.is_none() && !self.remove_files_metadata.is_empty() {
+            if latest_checkpoint_action.is_none() && !self.remove_files_metadata.is_empty() {
                 return Err(Error::invalid_transaction_state(
-                    "remove_files is not supported in batch commit mode without an existing content root",
+                    "remove_files is not supported in manifest commit mode without an existing checkpoint action",
                 ));
             }
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
-            let physical_table_schema = table_schema.make_physical(column_mapping_mode);
+            let physical_table_schema = table_schema.make_physical(column_mapping_mode)?;
             let table_root = self.read_snapshot.table_root().clone();
             let current_version = self.read_snapshot.version();
 
             // Load existing metadata and determine the version from which to replay delta log
             let (mut metadata_builder, root_manifest_path, replay_from_version) =
-                if let Some((content_root_action, content_root_version)) = latest_content_root {
+                if let Some(checkpoint_action) = latest_checkpoint_action {
                     // Load metadata from content root directly into the builder
-                    let root_path = content_root_action.path.clone();
+                    let root_path = checkpoint_action.content_root.path.clone();
                     let builder =
                         crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
                             engine,
-                            &content_root_action,
+                            &checkpoint_action.content_root,
                             table_root.clone(),
                             physical_table_schema.clone(),
                             commit_version,
                         )?;
-                    // Replay delta log from the version after the content root
-                    (builder, Some(root_path), content_root_version + 1)
+                    // Replay delta log from the version after the checkpoint action
+                    (builder, Some(root_path), checkpoint_action.version + 1)
                 } else {
-                    // No content root found, start with empty metadata
+                    // No checkpoint action found, start with empty metadata
                     // Use commit_version for the new metadata, not the current snapshot version
                     let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                         table_root.clone(),
@@ -561,12 +561,16 @@ impl<S> Transaction<S> {
 
             // If root was released to client control, clear all root data and DV entries
             // The client will add them back via leaf manifests
-            if self.batch_state.as_ref().is_some_and(|b| b.root_released) {
+            if self
+                .manifest_commit_state
+                .as_ref()
+                .is_some_and(|b| b.root_released)
+            {
                 metadata_builder.clear_root_data_and_dv_entries();
 
                 // TODO: Process incremental removes from delta log and mark them as DELETED
                 // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the content root version
+                // 1. Scanning delta log for Remove actions since the checkpoint action version
                 // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
                 // 3. Calling metadata_builder.delete_from_leaf() for each removed file
                 // This is deferred to future work as it requires a new delta log processor.
@@ -615,13 +619,13 @@ impl<S> Transaction<S> {
                 )?;
             }
 
-            if let Some(b) = &self.batch_state {
+            if let Some(b) = &self.manifest_commit_state {
                 b.apply_to_builder(&mut metadata_builder)?;
             }
 
-            // In batch mode, process ALL remove actions and mark entries as DELETED in the ContentRoot
-            // The ContentRoot manages all file state, so any removes should be reflected there
-            // This applies whether we loaded from an existing ContentRoot or built from snapshot
+            // In manifest commit mode, process ALL remove actions and mark entries as DELETED in the content tree.
+            // The content tree manages all file state, so any removes should be reflected there.
+            // This applies whether we loaded from an existing checkpoint action or built from snapshot.
             if !self.remove_files_metadata.is_empty() {
                 let leaf_deletions = {
                     let mut visitor = ScanMetadataRemoveVisitor::new(
@@ -679,21 +683,23 @@ impl<S> Transaction<S> {
                 self.read_snapshot.table_root(),
             )?;
 
-            // The content root represents the state at the new commit version.
+            // The checkpoint action represents the state at the new commit version.
             // wrapping_add handles the CREATE TABLE case where read_snapshot.version()
             // is PRE_COMMIT_VERSION (u64::MAX), which wraps to 0 (the first commit).
             let new_commit_version = self.read_snapshot.version().wrapping_add(1);
-            let content_root_action = ContentRoot {
-                path,
-                size_in_bytes,
+            let checkpoint_action = CheckpointAction {
                 version: new_commit_version,
+                content_root: ContentRoot {
+                    path,
+                    size_in_bytes,
+                },
             };
 
-            // Use the log schema to wrap ContentRoot in a "contentRoot" field
-            let content_root_data =
-                content_root_action.into_engine_data(get_log_content_root_schema().clone(), engine);
+            // Use the log schema to wrap CheckpointAction in a "checkpoint" field
+            let checkpoint_data = checkpoint_action
+                .into_engine_data(get_log_checkpoint_action_schema().clone(), engine);
 
-            actions_vec.push(content_root_data.map(FilteredEngineData::with_all_rows_selected))
+            actions_vec.push(checkpoint_data.map(FilteredEngineData::with_all_rows_selected))
         } else {
             // Normal mode: add actions go in the JSON log
             // Remove actions are added separately in the commit method
@@ -719,21 +725,21 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Initialize batch (content-tree) commit mode and return a mutable reference to the
-    /// [`BatchState`].
+    /// Initialize manifest commit mode and return a mutable reference to the
+    /// [`ManifestCommitState`].
     ///
-    /// Calling this method opts the transaction into the batch commit path: on
+    /// Calling this method opts the transaction into the manifest commit path: on
     /// [`Transaction::commit`], add/remove actions are recorded in the metadata content tree
     /// rather than written to the delta log directly.
     ///
-    /// Any incremental actions accumulated since the last batch commit will automatically be added
+    /// Any incremental actions accumulated since the last manifest commit will automatically be added
     /// to the tree root on commit.
     ///
     /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
-    /// The returned `&mut BatchState` provides tree-manipulation methods
-    /// ([`BatchState::release_root_and_delta_actions`], [`BatchState::new_leaf_node_writer`],
-    /// [`BatchState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
+    /// The returned `&mut ManifestCommitState` provides tree-manipulation methods
+    /// ([`ManifestCommitState::release_root_and_delta_actions`], [`ManifestCommitState::new_leaf_node_writer`],
+    /// [`ManifestCommitState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
     /// other `&mut Transaction` methods.
     ///
     /// # Example
@@ -743,19 +749,19 @@ impl<S> Transaction<S> {
     ///     .with_data_change(true);
     ///
     /// {
-    ///     let batch = txn.with_batch_commit();
-    ///     let scan = batch.release_root_and_delta_actions()?;
+    ///     let mc = txn.with_manifest_commit();
+    ///     let scan = mc.release_root_and_delta_actions()?;
     ///     // ...process scan...
-    ///     let mut leaf = batch.new_leaf_node_writer(engine)?;
+    ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
     ///     leaf.add_files(engine, metadata)?;
-    ///     batch.add_leaf(leaf.finish(engine)?)?;
-    /// } // batch borrow released
+    ///     mc.add_leaf(leaf.finish(engine)?)?;
+    /// } // mc borrow released
     ///
     /// txn.commit(engine)?;
     /// ```
-    pub fn with_batch_commit(&mut self) -> &mut BatchState {
-        self.batch_state.get_or_insert_with(|| {
-            BatchState::new(
+    pub fn with_manifest_commit(&mut self) -> &mut ManifestCommitState {
+        self.manifest_commit_state.get_or_insert_with(|| {
+            ManifestCommitState::new(
                 self.read_snapshot.version().wrapping_add(1),
                 self.snapshot_id,
                 self.read_snapshot.clone(),
@@ -774,6 +780,26 @@ impl<S> Transaction<S> {
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
+    /// this function simply allows engines to add their own data into that action if they wish.
+    /// Note that the following fields in `engine_commit_info` will be overridden by kernel if they are set (meaning you should not set them):
+    /// - timestamp
+    /// - inCommitTimestamp
+    /// - operation
+    /// - operationParameters
+    /// - kernelVersion
+    /// - isBlindAppend
+    /// - engineInfo
+    /// - txnId
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
         self
     }
 
@@ -848,31 +874,32 @@ impl<S> Transaction<S> {
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table.
+    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
+    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
+    /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         let has_ict = self
             .read_snapshot
             .table_configuration()
-            .is_feature_supported(&TableFeature::InCommitTimestamp);
+            .is_feature_enabled(&TableFeature::InCommitTimestamp);
 
-        if has_ict && !self.is_create_table() {
-            Ok(self
-                .read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                }))
-        } else if has_ict && self.is_create_table() {
-            // ICT is enabled but this is a create-table transaction - not yet supported
-            Err(Error::unsupported(
-                "InCommitTimestamp is not yet supported for create table",
-            ))
-        } else {
-            Ok(None)
+        if !has_ict {
+            return Ok(None);
         }
+
+        if self.is_create_table() {
+            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
+            return Ok(Some(self.commit_timestamp));
+        }
+
+        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
+        // must be the larger of:
+        // - The time at which the writer attempted the commit
+        // - One millisecond later than the previous commit's inCommitTimestamp
+        Ok(self
+            .read_snapshot
+            .get_in_commit_timestamp(engine)?
+            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
@@ -883,29 +910,28 @@ impl<S> Transaction<S> {
         self.read_snapshot.version().wrapping_add(1)
     }
 
-    /// Returns true if this commit will be handled as a batch commit (content tree update).
+    /// Returns true if this commit will be handled as a manifest commit (content tree update).
     /// When true, add/remove actions are recorded in the content tree rather than the delta log.
-    /// Returns `true` if `with_batch_commit()` has been called on this transaction.
-    fn is_batch_transaction(&self) -> bool {
-        self.batch_state.is_some()
+    /// Returns `true` if `with_manifest_commit()` has been called on this transaction.
+    fn has_manifest_commit_state(&self) -> bool {
+        self.manifest_commit_state.is_some()
     }
 
-    ///
-    /// Batch commit is active when:
-    /// - The caller explicitly opted in via `with_batch_commit()` and the
+    /// Manifest commit is active when:
+    /// - The caller explicitly opted in via `with_manifest_commit()` and the
     ///   `metadataTree-experimental` writer feature is present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
-    fn is_batch_commit_active(&self) -> bool {
+    fn is_manifest_commit(&self) -> bool {
         let table_config = self.read_snapshot.table_configuration();
         let protocol = table_config.protocol();
-        let explicitly_requested = self.is_batch_transaction()
+        let explicitly_requested = self.has_manifest_commit_state()
             && protocol
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
         let iceberg_native_v4 = protocol
             .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
-        let can_batch_commit = explicitly_requested || iceberg_native_v4;
+        let can_manifest_commit = explicitly_requested || iceberg_native_v4;
         let leaf_manifests_empty = self
-            .batch_state
+            .manifest_commit_state
             .as_ref()
             .is_none_or(|b| b.leaf_manifests.is_empty());
         let has_work_to_do = !self.add_files_metadata.is_empty()
@@ -913,11 +939,11 @@ impl<S> Transaction<S> {
             || !leaf_manifests_empty
             || self
                 .read_snapshot
-                .content_root()
-                .map_or(self.read_snapshot.version() > 0, |cr| {
-                    cr.version < self.read_snapshot.version()
+                .checkpoint_action()
+                .map_or(self.read_snapshot.version() > 0, |ca| {
+                    ca.version < self.read_snapshot.version()
                 });
-        can_batch_commit && has_work_to_do
+        can_manifest_commit && has_work_to_do
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
@@ -1061,7 +1087,13 @@ impl<S> Transaction<S> {
             .filter(|f| {
                 materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
             })
-            .map(|f| f.make_physical(column_mapping_mode));
+            .map(|f| {
+                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
+                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
+                    warn!("make_physical failed: {e}");
+                    f.clone()
+                })
+            });
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
@@ -1303,6 +1335,7 @@ impl<S> Transaction<S> {
             metadata: is_create
                 .then(|| self.read_snapshot.table_configuration().metadata().clone()),
             domain_metadata_changes: dm_changes,
+            set_transaction_changes: self.set_transactions.clone(),
             in_commit_timestamp,
             operation: self.operation.clone(),
             has_missing_file_size: false, // writes always have sizes
@@ -1359,10 +1392,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = NullableStatsTransform
-            .transform_struct(get_log_remove_schema())
-            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
-            .into_owned();
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references
@@ -1422,7 +1452,7 @@ impl<S> Transaction<S> {
         let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             expr.clone(),
-            target_schema.clone().into(),
+            target_schema.into(),
         )?);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
@@ -1652,6 +1682,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::CommitInfo;
     use crate::arrow::array::{
         ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
@@ -1665,6 +1696,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
     use crate::schema::MapType;
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::ColumnMappingMode;
@@ -1709,7 +1741,9 @@ mod tests {
     /// Returns the physical schema for test tables with column mapping enabled.
     /// Use this when creating ContentTreeNodeBuilder instances in tests.
     fn test_table_physical_schema() -> StructType {
-        test_table_schema().make_physical(crate::table_features::ColumnMappingMode::Id)
+        test_table_schema()
+            .make_physical(crate::table_features::ColumnMappingMode::Id)
+            .expect("make_physical should succeed")
     }
 
     impl Transaction {
@@ -1831,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_with_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1844,15 +1878,15 @@ mod tests {
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
-        // Verify batch state is initialized
-        assert!(txn.is_batch_transaction());
+        // Verify manifest commit state is initialized
+        assert!(txn.has_manifest_commit_state());
         Ok(())
     }
 
     #[test]
-    fn test_with_batch_commit_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_with_manifest_commit_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1866,19 +1900,19 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
 
-        // First call creates batch state; mutate it to confirm state is preserved
-        txn.with_batch_commit().root_released = true;
+        // First call creates manifest commit state; mutate it to confirm state is preserved
+        txn.with_manifest_commit().root_released = true;
 
-        // Second call must return the same BatchState without reinitializing it
+        // Second call must return the same ManifestCommitState without reinitializing it
         assert!(
-            txn.with_batch_commit().root_released,
-            "second call to with_batch_commit should preserve existing state"
+            txn.with_manifest_commit().root_released,
+            "second call to with_manifest_commit should preserve existing state"
         );
         Ok(())
     }
 
     #[test]
-    fn test_batch_commit_default_false() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_manifest_commit_default_false() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1888,9 +1922,9 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        // Verify batch state defaults to None
+        // Verify manifest commit state defaults to None
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        assert!(txn.batch_state.is_none());
+        assert!(txn.manifest_commit_state.is_none());
         Ok(())
     }
 
@@ -2217,7 +2251,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
@@ -2288,7 +2322,7 @@ mod tests {
     ///
     /// # Arguments
     /// * `table_root` - The table root URL
-    /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for batch_commit/content metadata trees)
+    /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for manifest_commit/content metadata trees)
     fn create_initial_table(table_root: &Url, enable_column_mapping: bool) -> DeltaResult<()> {
         use serde_json::json;
         use std::fs::{create_dir_all, write};
@@ -2383,8 +2417,8 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to write a ContentRoot action to a specific version
-    fn write_content_root_action(
+    /// Helper to write a checkpoint action to a specific version
+    fn write_checkpoint_action(
         table_root: &Url,
         content_root_path: &str,
         version: u64,
@@ -2392,15 +2426,17 @@ mod tests {
         use serde_json::json;
         use std::fs::write;
 
-        let content_root = json!({
-            "contentRoot": {
-                "path": content_root_path,
-                "sizeInBytes": 0,
-                "version": version
+        let checkpoint_action = json!({
+            "checkpoint": {
+                "version": version,
+                "contentRoot": {
+                    "path": content_root_path,
+                    "sizeInBytes": 0
+                }
             }
         });
 
-        let data = serde_json::to_vec(&content_root)?;
+        let data = serde_json::to_vec(&checkpoint_action)?;
 
         let delta_log_path = table_root
             .join("_delta_log/")?
@@ -2410,7 +2446,7 @@ mod tests {
         let file_name = format!("{:020}.json", version);
         let file_path = delta_log_path.join(file_name);
         write(&file_path, data)
-            .map_err(|e| Error::generic(format!("Failed to write ContentRoot: {e}")))?;
+            .map_err(|e| Error::generic(format!("Failed to write checkpoint action: {e}")))?;
 
         Ok(())
     }
@@ -2460,7 +2496,7 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        // Enable column mapping for batch_commit mode (content metadata trees)
+        // Enable column mapping for manifest_commit mode (content metadata trees)
         create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
@@ -2481,13 +2517,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        // Step 3: Write checkpoint action (v1)
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2499,7 +2535,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         // Remove file at row index 2 within the scan batch
         // With batched EngineData creation, all files are now in a single batch
@@ -2530,7 +2566,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2544,11 +2580,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: remove actions must NOT appear in the delta log when using batch commit.
-    /// In batch commit mode, removes are recorded in the content tree (manifest DV), so writing
+    /// Regression test: remove actions must NOT appear in the delta log when using manifest commit.
+    /// In manifest commit mode, removes are recorded in the content tree (manifest DV), so writing
     /// them to the log as well would cause double-counting on replay.
     #[test]
-    fn test_batch_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_manifest_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::content_tree::writer::ContentTreeNodeWriter;
@@ -2563,7 +2599,7 @@ mod tests {
         // Step 1: Create initial table (v0)
         create_initial_table(&table_root, true)?;
 
-        // Step 2: Build a leaf manifest with 5 data files and write a content root (v1)
+        // Step 2: Build a leaf manifest with 5 data files and write a checkpoint action (v1)
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
@@ -2578,9 +2614,9 @@ mod tests {
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
-        // Step 3: Batch-commit a remove (v2)
+        // Step 3: Manifest-commit a remove (v2)
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let scan = snapshot.clone().scan_builder().build()?;
 
@@ -2588,7 +2624,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
         if let Some(res) = scan_metadata_iter.next() {
@@ -2619,7 +2655,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(line)?;
             assert!(
                 json.get("remove").is_none(),
-                "batch commit should not write remove actions to the delta log, but found: {line}"
+                "manifest commit should not write remove actions to the delta log, but found: {line}"
             );
         }
 
@@ -2673,7 +2709,7 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        // Enable column mapping for batch_commit mode (content metadata trees)
+        // Enable column mapping for manifest_commit mode (content metadata trees)
         create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with TWO leaf manifests:
@@ -2721,13 +2757,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        // Step 3: Write checkpoint action (v1)
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2739,7 +2775,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         // Remove file at row index 2 (file-2.parquet which has a DV)
         // With batched EngineData creation, all files are now in a single batch
@@ -2770,7 +2806,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2792,7 +2828,7 @@ mod tests {
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
         use crate::content_tree::ContentTreeNode;
 
-        // Read the ContentRoot action from version 2 to get the new manifest path
+        // Read the checkpoint action from version 2 to get the new manifest path
         let delta_log_path = table_root
             .join("_delta_log/")?
             .to_file_path()
@@ -2801,20 +2837,21 @@ mod tests {
         let v2_log_content = std::fs::read_to_string(&v2_log_file)
             .map_err(|e| Error::generic(format!("Failed to read v2 log: {e}")))?;
 
-        // Parse the ContentRoot action to get the manifest path
+        // Parse the checkpoint action to get the manifest path
         let content_root_path: String = v2_log_content
             .lines()
             .find_map(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
                     .ok()
                     .and_then(|v| {
-                        v.get("contentRoot")?
+                        v.get("checkpoint")?
+                            .get("contentRoot")?
                             .get("path")?
                             .as_str()
                             .map(String::from)
                     })
             })
-            .ok_or_else(|| Error::generic("No ContentRoot found in v2"))?;
+            .ok_or_else(|| Error::generic("No checkpoint action found in v2"))?;
 
         // Read the root manifest (path is now relative, so join with table root)
         let root_manifest_url = table_root
@@ -2939,7 +2976,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        // Step 1: Create initial table (v0) with Protocol + Metadata for content root support
+        // Step 1: Create initial table (v0) with Protocol + Metadata for checkpoint action support
         // Create a table with metadataTree-experimental feature and column mapping
         use serde_json::json;
         use std::fs::{create_dir_all, write};
@@ -3016,24 +3053,24 @@ mod tests {
         write(&file_path, data)
             .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
 
-        // Step 2: Create snapshot and transaction in batch_commit mode
+        // Step 2: Create snapshot and transaction in manifest_commit mode
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("CREATE_CONTENT_ROOT".to_string());
 
-        // Step 3-4: Initialize batch state and create scan + leaf writers
+        // Step 3-4: Initialize manifest commit state and create scan + leaf writers
         let scan;
         let mut leaf1;
         let mut leaf2;
         {
-            let batch = txn.with_batch_commit();
+            let mc = txn.with_manifest_commit();
             // Step 3: Release root and delta actions
-            scan = batch.release_root_and_delta_actions()?;
+            scan = mc.release_root_and_delta_actions()?;
             // Step 4: Create leaf writers
-            leaf1 = batch.new_leaf_node_writer(&engine)?;
-            leaf2 = batch.new_leaf_node_writer(&engine)?;
+            leaf1 = mc.new_leaf_node_writer(&engine)?;
+            leaf2 = mc.new_leaf_node_writer(&engine)?;
         }
 
         // Helper to create add metadata for testing
@@ -3143,11 +3180,11 @@ mod tests {
             create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
         leaf2.add_files(&engine, leaf2_metadata)?;
 
-        // Step 5: Finish leaf writers and add to batch
+        // Step 5: Finish leaf writers and add to manifest commit
         {
-            let batch = txn.with_batch_commit();
-            batch.add_leaf(leaf1.finish(&engine)?)?;
-            batch.add_leaf(leaf2.finish(&engine)?)?;
+            let mc = txn.with_manifest_commit();
+            mc.add_leaf(leaf1.finish(&engine)?)?;
+            mc.add_leaf(leaf2.finish(&engine)?)?;
         }
 
         // Exhaust the scan (required before commit)
@@ -3205,26 +3242,29 @@ mod tests {
             "Root manifest at version 1 should exist: 00000000000000000001.content.parquet"
         );
 
-        // Step 9: Validate that the ContentRoot action points to the correct root manifest
+        // Step 9: Validate that the checkpoint action points to the correct root manifest
         use serde_json::Value;
         use std::fs::read_to_string;
 
         let commit_1_path = delta_log_path.join("00000000000000000001.json");
         let commit_content = read_to_string(&commit_1_path)?;
 
-        // Parse each line as JSON and find the contentRoot action
-        let mut found_content_root = false;
+        // Parse each line as JSON and find the checkpoint action
+        let mut found_checkpoint_action = false;
         for line in commit_content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let action: Value = serde_json::from_str(line)?;
-            if let Some(content_root) = action.get("contentRoot") {
+            if let Some(checkpoint) = action.get("checkpoint") {
+                let content_root = checkpoint
+                    .get("contentRoot")
+                    .expect("checkpoint should have contentRoot");
                 if let Some(path) = content_root.get("path").and_then(|p| p.as_str()) {
                     // The path should reference the version 1 root manifest
                     assert!(
                         path.contains("00000000000000000001.content.parquet"),
-                        "ContentRoot action should reference version 1 root manifest, got: {}",
+                        "Checkpoint action should reference version 1 root manifest, got: {}",
                         path
                     );
 
@@ -3232,7 +3272,7 @@ mod tests {
                     let reported_size = content_root
                         .get("sizeInBytes")
                         .and_then(|s| s.as_u64())
-                        .expect("ContentRoot sizeInBytes should be present");
+                        .expect("checkpoint contentRoot sizeInBytes should be present");
                     let manifest_file = table_root
                         .join(path)
                         .expect("should join path")
@@ -3244,22 +3284,22 @@ mod tests {
                         .len();
                     assert!(
                         reported_size > 0,
-                        "ContentRoot sizeInBytes should be non-zero"
+                        "Checkpoint contentRoot sizeInBytes should be non-zero"
                     );
                     assert_eq!(
                         reported_size, disk_size,
-                        "ContentRoot sizeInBytes should match actual file size"
+                        "Checkpoint contentRoot sizeInBytes should match actual file size"
                     );
 
-                    found_content_root = true;
+                    found_checkpoint_action = true;
                     break;
                 }
             }
         }
 
         assert!(
-            found_content_root,
-            "ContentRoot action should exist in version 1 commit"
+            found_checkpoint_action,
+            "Checkpoint action should exist in version 1 commit"
         );
 
         Ok(())
@@ -3667,8 +3707,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass for all-null clustering columns, got: {:?}",
-            result
+            "Stats validation should pass for all-null clustering columns, got: {result:?}",
         );
     }
 
@@ -3743,9 +3782,9 @@ mod tests {
         );
     }
 
-    /// Test that icebergNativeV4 forces batch commit without explicit with_batch_commit()
+    /// Test that icebergNativeV4 forces manifest commit without explicit with_manifest_commit()
     #[test]
-    fn test_iceberg_native_v4_forces_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_iceberg_native_v4_forces_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
         use crate::expressions::{MapData, Scalar};
         use tempfile::tempdir;
@@ -3821,16 +3860,16 @@ mod tests {
         let file_path = delta_log_path.join("00000000000000000000.json");
         write(&file_path, data)?;
 
-        // Create a transaction without calling with_batch_commit()
+        // Create a transaction without calling with_manifest_commit()
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("test".to_string());
 
-        assert!(txn.batch_state.is_none());
+        assert!(txn.manifest_commit_state.is_none());
         assert!(
-            !txn.is_batch_commit_active(),
-            "batch commit should not be active without work to do"
+            !txn.is_manifest_commit(),
+            "manifest commit should not be active without work to do"
         );
 
         // Add a dummy file to trigger has_work_to_do
@@ -3854,8 +3893,8 @@ mod tests {
         txn.add_files(add_data);
 
         assert!(
-            txn.is_batch_commit_active(),
-            "icebergNativeV4 should force batch commit even without with_batch_commit()"
+            txn.is_manifest_commit(),
+            "icebergNativeV4 should force manifest commit even without with_manifest_commit()"
         );
 
         Ok(())

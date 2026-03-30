@@ -136,7 +136,7 @@ pub async fn create_engine_with_uc_credentials(
         ("session_token", &creds.session_token),
     ];
 
-    let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+    let (store, path) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
 
     // Use multi-threaded executor for better parallel IO performance
     let executor = Arc::new(

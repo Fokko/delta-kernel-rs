@@ -43,6 +43,7 @@ impl RowVisitor for MetadataVisitor {
 #[derive(Default)]
 pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
 }
 
 /// A single non-nullable BOOL column
@@ -61,8 +62,11 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
         }
         Ok(())
     }
@@ -700,22 +704,22 @@ impl RowVisitor for InCommitTimestampVisitor {
     }
 }
 
-/// Visitor to extract ContentRoot actions from log batches.
+/// Visitor to extract checkpoint actions from log batches.
 ///
-/// ContentRoot actions point to a metadata tree that contains all file actions (adds/removes)
-/// up to and including the version where the content root was created. When we encounter a
-/// content root during log replay, we should use the metadata tree for file actions instead
-/// of continuing to replay older commits for those actions.
+/// Checkpoint actions embed V4 metadata tree state in a Delta log entry, pointing to a root
+/// manifest that contains all file actions (adds/removes) up to and including the checkpoint
+/// version. When we encounter a checkpoint action during log replay, we should use the metadata
+/// tree for file actions instead of continuing to replay older commits for those actions.
 #[derive(Default)]
 #[internal_api]
-pub(crate) struct ContentRootVisitor {
-    pub(crate) content_root: Option<ContentRoot>,
+pub(crate) struct CheckpointActionVisitor {
+    pub(crate) checkpoint: Option<CheckpointAction>,
 }
 
-impl RowVisitor for ContentRootVisitor {
+impl RowVisitor for CheckpointActionVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| ContentRoot::to_schema().leaves(CONTENT_ROOT_NAME));
+            LazyLock::new(|| CheckpointAction::to_schema().leaves(CHECKPOINT_ACTION_NAME));
         NAMES_AND_TYPES.as_ref()
     }
 
@@ -723,13 +727,13 @@ impl RowVisitor for ContentRootVisitor {
         require!(
             getters.len() == 3,
             Error::internal_error(format!(
-                "Wrong number of ContentRootVisitor getters: {}",
+                "Wrong number of CheckpointActionVisitor getters: {}",
                 getters.len()
             ))
         );
         for i in 0..row_count {
-            if let Some(content_root) = visit_content_root_at(i, getters)? {
-                self.content_root = Some(content_root);
+            if let Some(checkpoint) = visit_checkpoint_action_at(i, getters)? {
+                self.checkpoint = Some(checkpoint);
                 break;
             }
         }
@@ -737,33 +741,43 @@ impl RowVisitor for ContentRootVisitor {
     }
 }
 
+/// Extract a [`CheckpointAction`] from getters at the given row index.
+///
+/// Getter layout (derived from `CheckpointAction::to_schema`):
+///   \[0\] version
+///   \[1\] contentRoot.path
+///   \[2\] contentRoot.sizeInBytes
 #[internal_api]
-pub(crate) fn visit_content_root_at<'a>(
+pub(crate) fn visit_checkpoint_action_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<ContentRoot>> {
+) -> DeltaResult<Option<CheckpointAction>> {
     require!(
         getters.len() == 3,
         Error::InternalError(format!(
-            "Wrong number of ContentRoot getters: {}",
+            "Wrong number of CheckpointAction getters: {}",
             getters.len()
         ))
     );
 
-    // Chain if let when using Rust 2024 or later
-    let Some(path): Option<&str> = getters[0].get_opt(row_index, "contentRoot.path")? else {
+    let Some(version): Option<i64> = getters[0].get_opt(row_index, "checkpoint.version")? else {
         return Ok(None);
     };
-    let Some(size_in_bytes): Option<i64> =
-        getters[1].get_opt(row_index, "contentRoot.size_in_bytes")?
+    let Some(path): Option<&str> = getters[1].get_opt(row_index, "checkpoint.contentRoot.path")?
     else {
         return Ok(None);
     };
-    let version: i64 = getters[2].get(row_index, "contentRoot.version")?;
-    Ok(Some(ContentRoot {
-        path: path.into(),
-        size_in_bytes: size_in_bytes as u64,
+    let Some(size_in_bytes): Option<i64> =
+        getters[2].get_opt(row_index, "checkpoint.contentRoot.sizeInBytes")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CheckpointAction {
         version: version as u64,
+        content_root: ContentRoot {
+            path: path.into(),
+            size_in_bytes: size_in_bytes as u64,
+        },
     }))
 }
 
@@ -771,7 +785,10 @@ pub(crate) fn visit_content_root_at<'a>(
 mod tests {
     use super::*;
 
-    use crate::arrow::array::StringArray;
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
@@ -1390,31 +1407,31 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_content_root() {
+    fn test_parse_checkpoint_action() {
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177}}"#,
-            r#"{"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345,"version":3}}"#,
+            r#"{"checkpoint":{"version":3,"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345}}}"#,
             r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut visitor = ContentRootVisitor::default();
+        let mut visitor = CheckpointActionVisitor::default();
         visitor.visit_rows_of(batch.as_ref()).unwrap();
 
-        let content_root = visitor
-            .content_root
-            .expect("Should have found content root");
+        let checkpoint = visitor
+            .checkpoint
+            .expect("Should have found checkpoint action");
         assert_eq!(
-            content_root.path,
+            checkpoint.content_root.path,
             "_delta_log/00000000000000000003.content.parquet"
         );
-        assert_eq!(content_root.size_in_bytes, 12345);
-        assert_eq!(content_root.version, 3);
+        assert_eq!(checkpoint.content_root.size_in_bytes, 12345);
+        assert_eq!(checkpoint.version, 3);
     }
 
     #[test]
-    fn test_parse_content_root_not_present() {
+    fn test_parse_checkpoint_action_not_present() {
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177}}"#,
             r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
@@ -1422,33 +1439,58 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut visitor = ContentRootVisitor::default();
+        let mut visitor = CheckpointActionVisitor::default();
         visitor.visit_rows_of(batch.as_ref()).unwrap();
 
         assert!(
-            visitor.content_root.is_none(),
-            "Should not have found content root"
+            visitor.checkpoint.is_none(),
+            "Should not have found checkpoint action"
         );
     }
 
     #[test]
-    fn test_parse_content_root_multiple_takes_first() {
-        // Although multiple content roots shouldn't happen in practice, test that we take the first one
+    fn test_parse_checkpoint_action_multiple_takes_first() {
+        // Although multiple checkpoint actions shouldn't happen in practice, test that we take the first one
         let json_strings: StringArray = vec![
-            r#"{"contentRoot":{"path":"first.parquet","sizeInBytes":100,"version":1}}"#,
-            r#"{"contentRoot":{"path":"second.parquet","sizeInBytes":200,"version":2}}"#,
+            r#"{"checkpoint":{"version":1,"contentRoot":{"path":"first.parquet","sizeInBytes":100}}}"#,
+            r#"{"checkpoint":{"version":2,"contentRoot":{"path":"second.parquet","sizeInBytes":200}}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut visitor = ContentRootVisitor::default();
+        let mut visitor = CheckpointActionVisitor::default();
         visitor.visit_rows_of(batch.as_ref()).unwrap();
 
-        let content_root = visitor
-            .content_root
-            .expect("Should have found content root");
-        assert_eq!(content_root.path, "first.parquet");
-        assert_eq!(content_root.size_in_bytes, 100);
-        assert_eq!(content_root.version, 1);
+        let checkpoint = visitor
+            .checkpoint
+            .expect("Should have found checkpoint action");
+        assert_eq!(checkpoint.content_root.path, "first.parquet");
+        assert_eq!(checkpoint.content_root.size_in_bytes, 100);
+        assert_eq!(checkpoint.version, 1);
+    }
+
+    // Helper to create a boolean batch for SelectionVectorVisitor tests
+    fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
+        let array = BooleanArray::from(values);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_batch(vec![], 0, "empty batch should have no filtered rows")]
+    #[case::all_selected(vec![true, true, true, true], 0, "all selected should have no filtered rows")]
+    #[case::all_filtered(vec![false, false, false, false, false], 5, "all filtered should count all rows")]
+    #[case::mixed_selection(vec![true, false, true, false, false, true], 3, "mixed selection should count false values")]
+    fn selection_vector_visitor_counter_accuracy(
+        #[case] input: Vec<bool>,
+        #[case] expected_filtered: u64,
+        #[case] _description: &str,
+    ) {
+        let batch = create_boolean_batch(input.clone());
+        let mut visitor = SelectionVectorVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.selection_vector, input);
+        assert_eq!(visitor.num_filtered, expected_filtered);
     }
 }

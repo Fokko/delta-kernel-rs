@@ -1,6 +1,8 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::Add;
-use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
+use crate::content_tree::stats::{
+    aggregate_content_stats, delta_json_stats_to_content_stats, merge_partition_values_into_stats,
+};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
@@ -546,6 +548,17 @@ impl ContentTreeNodeBuilder {
             add.deletion_vector.is_some().then_some(false),
         )?;
 
+        // Merge partition values into content_stats. Delta JSON stats only cover data columns;
+        // partition column values live in add.partitionValues and need to be recorded as
+        // constant-value statistics in the AMT content_stats.
+        let record_count = extract_record_count_from_stats(content_stats.as_ref());
+        let content_stats = merge_partition_values_into_stats(
+            content_stats,
+            &add.partition_values,
+            &self.table_schema,
+            Some(record_count),
+        )?;
+
         self.add_file(
             add.path,
             add.size,
@@ -566,6 +579,11 @@ impl ContentTreeNodeBuilder {
     /// the full stats are passed through and record counts are extracted. When stats
     /// are not in AMT format (e.g., empty or unconverted), content_stats is set to null
     /// and record_count defaults to 0.
+    ///
+    /// TODO: Partition values from the `partitionValues` column are not yet merged into
+    /// `content_stats` in this columnar path. The row-by-row `add()` path handles this via
+    /// `merge_partition_values_into_stats`. Supporting this here requires building expressions
+    /// that parse partition map entries into typed AMT stats structs.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for expression evaluation
@@ -2451,6 +2469,180 @@ mod tests {
             builder.pending_entries[0].content_stats.is_some(),
             "pending entry should have content_stats"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_merges_partition_values_into_content_stats(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::Add;
+        use crate::content_tree::stats::stats_schema;
+        use crate::expressions::Scalar;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
+
+        let table_schema = crate::schema::StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+            StructField::new("category", DataType::STRING, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-category".to_string()),
+                ),
+            ]),
+            StructField::new("year", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(3),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(3),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-year".to_string()),
+                ),
+            ]),
+        ]);
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+
+        let add = Add {
+            path: "category=A/year=2024/part-00000.parquet".to_string(),
+            partition_values: HashMap::from([
+                ("category".to_string(), "A".to_string()),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            size: 1024,
+            modification_time: 1587968586000,
+            data_change: true,
+            stats: Some(
+                r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#
+                    .to_string(),
+            ),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+        };
+
+        builder.add(add, 1, 1)?;
+
+        assert_eq!(builder.pending_entries.len(), 1);
+        let content_stats = builder.pending_entries[0]
+            .content_stats
+            .as_ref()
+            .expect("should have content_stats");
+
+        // All three columns (data + 2 partition) should be in content_stats
+        assert_eq!(
+            content_stats.fields().len(),
+            3,
+            "should have stats for id, category, year"
+        );
+
+        // Build expected partition stats using the same schema infrastructure.
+        // category (string, nullable): field_id=2 -> stats base 10400
+        // year (integer, non-nullable): field_id=3 -> stats base 10600
+        let full_stats_schema = stats_schema(&table_schema)?;
+
+        let category_stats_field = full_stats_schema
+            .field("category")
+            .expect("stats schema should have category");
+        let DataType::Struct(category_inner) = category_stats_field.data_type() else {
+            panic!("category stats should be a struct");
+        };
+        let expected_category = StructData::try_new(
+            category_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(100),               // value_count
+                Scalar::Long(0),                 // null_value_count (not null)
+                Scalar::Null(DataType::INTEGER), // avg_value_size (string has this but no value)
+                Scalar::Null(DataType::INTEGER), // max_value_size
+                Scalar::String("A".to_string()), // lower_bound
+                Scalar::String("A".to_string()), // upper_bound
+                Scalar::Boolean(true),           // exact_bounds
+            ],
+        )?;
+
+        let year_stats_field = full_stats_schema
+            .field("year")
+            .expect("stats schema should have year");
+        let DataType::Struct(year_inner) = year_stats_field.data_type() else {
+            panic!("year stats should be a struct");
+        };
+        let expected_year = StructData::try_new(
+            year_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(100),     // value_count
+                Scalar::Integer(2024), // lower_bound
+                Scalar::Integer(2024), // upper_bound
+                Scalar::Boolean(true), // exact_bounds
+            ],
+        )?;
+
+        // Compare partition column stats by StructData equality
+        let category_value = content_stats
+            .fields()
+            .iter()
+            .position(|f| f.name() == "category")
+            .map(|idx| &content_stats.values()[idx]);
+        assert_eq!(
+            category_value,
+            Some(&Scalar::Struct(expected_category)),
+            "category partition stats mismatch"
+        );
+
+        let year_value = content_stats
+            .fields()
+            .iter()
+            .position(|f| f.name() == "year")
+            .map(|idx| &content_stats.values()[idx]);
+        assert_eq!(
+            year_value,
+            Some(&Scalar::Struct(expected_year)),
+            "year partition stats mismatch"
+        );
+
+        // Verify outer field metadata: stats schema fields carry correct PARQUET:field_id
+        let category_field = content_stats
+            .fields()
+            .iter()
+            .find(|f| f.name() == "category")
+            .unwrap();
+        let year_field = content_stats
+            .fields()
+            .iter()
+            .find(|f| f.name() == "year")
+            .unwrap();
+        assert_eq!(category_field, category_stats_field);
+        assert_eq!(year_field, year_stats_field);
 
         Ok(())
     }

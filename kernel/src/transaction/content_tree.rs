@@ -1,4 +1,4 @@
-//! Utilities for updating the content tree during batch commits.
+//! Utilities for updating the content tree during manifest commits.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -10,7 +10,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::schema::DataType;
 use crate::{DeltaResult, Error, RowVisitor};
 
-// Columns needed to process scan metadata for remove actions (batch commit path only).
+// Columns needed to process scan metadata for remove actions (manifest commit path only).
 // Indices: path=0, dv_path_or_inline=1, data_manifest_path=2, data_manifest_position=3
 pub(super) static REMOVE_SCAN_COLUMNS: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
     LazyLock::new(|| {
@@ -97,7 +97,7 @@ impl<'a, F: FnMut(&str, Option<&str>) -> DeltaResult<()>> RowVisitor
                     (self.on_root_deletion)(&path, dv_path.as_deref())?;
                 }
                 _ => {
-                    // data_manifest_path is absent: either this is the first batch commit
+                    // data_manifest_path is absent: either this is the first manifest commit
                     // and the file was added then removed in the same transaction, or the
                     // remove cancels a file not yet written to any leaf. Nothing to do.
                 }

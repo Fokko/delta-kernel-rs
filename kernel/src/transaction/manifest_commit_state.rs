@@ -11,25 +11,25 @@ use crate::{DeltaResult, Engine, Version};
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 
-/// State for a batch (content-tree) commit.
+/// State for a manifest commit (content-tree update).
 ///
-/// Obtained by calling [`crate::transaction::Transaction::with_batch_commit`]. Holds all
+/// Obtained by calling [`crate::transaction::Transaction::with_manifest_commit`]. Holds all
 /// tree-manipulation state and exposes tree-focused methods for partition-aware compaction
 /// workflows. `Transaction` retains access to all normal builder and commit methods while
 /// this struct exists.
 ///
 /// # Lifetime
 ///
-/// `BatchState` holds a mutable reference into the owning `Transaction` (via
-/// `Option<BatchState>` stored inside it). Drop `BatchState` before calling
+/// `ManifestCommitState` holds a mutable reference into the owning `Transaction` (via
+/// `Option<ManifestCommitState>` stored inside it). Drop `ManifestCommitState` before calling
 /// [`crate::transaction::Transaction::commit`] or any other `&mut Transaction` method.
-pub struct BatchState {
+pub struct ManifestCommitState {
     // Snapshot info copied from Transaction at construction (SnapshotRef is Arc, clone is cheap).
     pub(super) version_to_write: Version,
     pub(super) snapshot_id: i64,
     pub(super) read_snapshot: SnapshotRef,
 
-    // Batch-specific state, moved out of Transaction.
+    // Manifest-commit-specific state, moved out of Transaction.
     pub(super) aggregated_manifest_dvs: HashMap<String, roaring::RoaringTreemap>,
     pub(super) aggregated_unreconciled: HashSet<String>,
     pub(super) aggregated_root_dv_actions: HashSet<String>,
@@ -42,14 +42,14 @@ pub struct BatchState {
     pub(super) row_id_cursor: Option<i64>,
 }
 
-impl BatchState {
-    /// Create a new `BatchState` from copied snapshot fields.
+impl ManifestCommitState {
+    /// Create a new `ManifestCommitState` from copied snapshot fields.
     pub(super) fn new(
         version_to_write: Version,
         snapshot_id: i64,
         read_snapshot: SnapshotRef,
     ) -> Self {
-        BatchState {
+        ManifestCommitState {
             version_to_write,
             snapshot_id,
             read_snapshot,
@@ -91,7 +91,7 @@ impl BatchState {
     /// Returns an error if called more than once per transaction.
     ///
     /// [`Scan`]: crate::scan::Scan
-    /// [`new_leaf_node_writer`]: BatchState::new_leaf_node_writer
+    /// [`new_leaf_node_writer`]: ManifestCommitState::new_leaf_node_writer
     pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
         if self.root_released {
             return Err(Error::generic(
@@ -154,7 +154,7 @@ impl BatchState {
             self.read_snapshot
                 .schema()
                 .as_ref()
-                .make_physical(column_mapping_mode),
+                .make_physical(column_mapping_mode)?,
         );
 
         // Lazily initialize the row_id_cursor from the snapshot HWM on first use.
@@ -188,15 +188,15 @@ impl BatchState {
     /// # Returns
     ///
     /// * `Ok(Some(Url))` - The URL of the root manifest.
-    /// * `Ok(None)` - No content root exists yet.
+    /// * `Ok(None)` - No checkpoint action exists yet.
     /// * `Err` - Error constructing the URL.
     pub fn root_manifest_url(&self, _engine: &dyn Engine) -> DeltaResult<Option<Url>> {
-        let content_root = self.read_snapshot.content_root();
+        let checkpoint_action = self.read_snapshot.checkpoint_action();
         let table_root = self.read_snapshot.table_root();
-        Ok(content_root.and_then(|cr| table_root.join(&cr.path).ok()))
+        Ok(checkpoint_action.and_then(|ca| table_root.join(&ca.content_root.path).ok()))
     }
 
-    /// Incorporate leaf writer results into this batch.
+    /// Incorporate leaf writer results into this manifest commit.
     ///
     /// - Detects duplicate unreconciled files across leaves (returns an error if found).
     /// - Unions manifest deletion vectors (roaring bitmaps) across leaves.
@@ -234,7 +234,7 @@ impl BatchState {
         Ok(())
     }
 
-    /// Applies all accumulated batch state to a [`crate::content_tree::builder::ContentTreeNodeBuilder`].
+    /// Applies all accumulated manifest commit state to a [`crate::content_tree::builder::ContentTreeNodeBuilder`].
     ///
     /// Called during commit to incorporate leaf manifests and deletions into the content tree
     /// before it is written out.

@@ -8,12 +8,11 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, ContentRoot, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
-    COMMIT_INFO_NAME, CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, CheckpointAction, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
+    CHECKPOINT_ACTION_NAME, COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-
-use crate::expressions::{column_expr, column_name, ColumnName, Expression};
+use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -74,9 +73,12 @@ pub(crate) fn table_changes_action_iter(
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                stats_schema,
-                get_log_add_schema().clone(),
+                Some(&stats_schema),
                 stats_expr,
+                None, // no partition columns for table changes (partition_expr unused)
+                column_expr_ref!("partitionValues_parsed"),
+                get_log_add_schema().clone(),
+                None, // Table changes doesn't use metrics yet
             )
         })
         .map(Arc::new);
@@ -223,10 +225,10 @@ impl LogReplayScanner {
             let has_metadata_update = metadata_opt.is_some();
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let has_protocol_update = protocol_opt.is_some();
-            let content_root_opt = ContentRoot::try_new_from_data(actions.as_ref())?;
-            // TODO: disable content root if reader feature is disabled. We should look into validating
-            // that content root version is after the feature option was enabled but that may be too
-            // expensive here.
+            let checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
+            // TODO: disable checkpoint action if reader feature is disabled. We should look into
+            // validating that checkpoint action version is after the feature option was enabled but
+            // that may be too expensive here.
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
@@ -245,7 +247,7 @@ impl LogReplayScanner {
                     table_configuration,
                     metadata_opt,
                     protocol_opt,
-                    content_root_opt,
+                    checkpoint_action_opt,
                     commit_file.version,
                 )?;
 
@@ -397,7 +399,7 @@ impl PreparePhaseVisitor<'_> {
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
             StructField::nullable(METADATA_NAME, Metadata::to_schema()),
             StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-            StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()),
+            StructField::nullable(CHECKPOINT_ACTION_NAME, CheckpointAction::to_schema()),
             StructField::nullable(
                 COMMIT_INFO_NAME,
                 StructType::new_unchecked([StructField::new(

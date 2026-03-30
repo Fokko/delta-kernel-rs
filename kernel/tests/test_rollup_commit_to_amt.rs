@@ -1,10 +1,10 @@
 //! Test root manifest filtering by writing a delta commit file with stats,
-//! then doing a batch commit to convert those stats to content_stats.
+//! then doing a manifest commit to convert those stats to content_stats.
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::Snapshot;
-use object_store::ObjectStore;
 use std::sync::Arc;
 use test_utils::{create_table, engine_store_setup};
 
@@ -26,10 +26,10 @@ fn create_test_schema_with_field_ids() -> Arc<StructType> {
 }
 
 #[tokio::test]
-async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_manifest_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (store, engine, table_url) = engine_store_setup("no_op_batch_commit", None);
+    let (store, engine, table_url) = engine_store_setup("no_op_manifest_commit", None);
     let engine = Arc::new(engine);
     let schema = create_test_schema_with_field_ids();
 
@@ -48,40 +48,42 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
     // Write version 1 with an Add action (similar to first test)
     let commit_json = r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":100},\"nullCount\":{\"id\":0}}"}}
 "#;
-    let commit_path =
-        object_store::path::Path::from(format!("no_op_batch_commit/_delta_log/{:020}.json", 1));
+    let commit_path = delta_kernel::object_store::path::Path::from(format!(
+        "no_op_manifest_commit/_delta_log/{:020}.json",
+        1
+    ));
     store
         .put(&commit_path, commit_json.as_bytes().to_vec().into())
         .await?;
 
-    // Batch commit to create content root
+    // Manifest commit to create content root
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     println!(
-        "Snapshot version before first batch commit: {}",
+        "Snapshot version before first manifest commit: {}",
         snapshot.version()
     );
 
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    txn.with_batch_commit();
+    txn.with_manifest_commit();
     let _first_commit_result = txn.commit(engine.as_ref())?;
 
     // Verify content root was created
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(
-        snapshot.content_root().is_some(),
-        "Content root should exist after first batch commit"
+        snapshot.checkpoint_action().is_some(),
+        "Content root should exist after first manifest commit"
     );
-    let content_root_version = snapshot.content_root().unwrap().version();
+    let content_root_version = snapshot.checkpoint_action().unwrap().version();
     println!(
-        "After first batch commit - snapshot version: {}, content root version: {}",
+        "After first manifest commit - snapshot version: {}, content root version: {}",
         snapshot.version(),
         content_root_version
     );
 
-    // Now call batch commit again with no new data
+    // Now call manifest commit again with no new data
     // This should be a no-op since content_root.version == snapshot.version
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    txn.with_batch_commit();
+    txn.with_manifest_commit();
     let result = txn.commit(engine.as_ref())?;
 
     let new_commit_version =
@@ -91,16 +93,16 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
             panic!("Expected committed transaction");
         };
     println!(
-        "Second batch commit created version: {}",
+        "Second manifest commit created version: {}",
         new_commit_version
     );
 
     // Check the new snapshot - content root version should not have changed
     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let new_content_root_version = new_snapshot.content_root().map(|cr| cr.version());
+    let new_content_root_version = new_snapshot.checkpoint_action().map(|cr| cr.version());
 
     println!(
-        "After second batch commit - snapshot version: {}, content root version: {:?}",
+        "After second manifest commit - snapshot version: {}, content root version: {:?}",
         new_snapshot.version(),
         new_content_root_version
     );

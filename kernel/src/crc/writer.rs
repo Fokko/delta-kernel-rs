@@ -32,7 +32,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use object_store::memory::InMemory;
+    use crate::object_store::memory::InMemory;
 
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
@@ -193,8 +193,7 @@ mod tests {
             let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
             assert!(
                 matches!(result, Err(Error::ChecksumWriteUnsupported(_))),
-                "should reject {:?} with ChecksumWriteUnsupported",
-                invalid_validity
+                "should reject {invalid_validity:?} with ChecksumWriteUnsupported"
             );
         }
     }

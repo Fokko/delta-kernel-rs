@@ -14,21 +14,22 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{ContentRoot, Metadata, Protocol};
+use crate::actions::{CheckpointAction, Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
+use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
+use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
@@ -39,6 +40,7 @@ use tracing::warn;
 /// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
@@ -87,7 +89,7 @@ pub(crate) struct TableConfiguration {
     /// Physical schema: field names are the physical column names (same as logical when
     /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
     physical_schema: SchemaRef,
-    content_root: Option<ContentRoot>,
+    checkpoint_action: Option<CheckpointAction>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -118,7 +120,7 @@ impl TableConfiguration {
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
-        content_root: Option<ContentRoot>,
+        checkpoint_action: Option<CheckpointAction>,
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
@@ -126,17 +128,14 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = match column_mapping_mode {
-            ColumnMappingMode::None => logical_schema.clone(),
-            _ => Arc::new(logical_schema.make_physical(column_mapping_mode)),
-        };
+        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
 
         let table_config = Self {
             logical_schema,
             physical_schema,
             metadata,
             protocol,
-            content_root,
+            checkpoint_action,
             table_properties,
             column_mapping_mode,
             table_root,
@@ -155,11 +154,11 @@ impl TableConfiguration {
         table_configuration: &Self,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-        new_content_root: Option<ContentRoot>,
+        new_checkpoint_action: Option<CheckpointAction>,
         new_version: Version,
     ) -> DeltaResult<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
-        if new_metadata.is_none() && new_protocol.is_none() && new_content_root.is_none() {
+        if new_metadata.is_none() && new_protocol.is_none() && new_checkpoint_action.is_none() {
             return Ok(Self {
                 version: new_version,
                 ..table_configuration.clone()
@@ -172,7 +171,7 @@ impl TableConfiguration {
         Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
-            new_content_root.or(table_configuration.content_root.clone()),
+            new_checkpoint_action.or(table_configuration.checkpoint_action.clone()),
             table_configuration.table_root.clone(),
             new_version,
         )
@@ -461,13 +460,13 @@ impl TableConfiguration {
         self.version
     }
 
-    /// The [`ContentRoot`] of this table at this version, if present.
+    /// The [`CheckpointAction`] of this table at this version, if present.
     ///
-    /// Returns `None` if this table has never written a ContentRoot action.
-    /// Once a ContentRoot is written, it is cached for the lifetime of this snapshot.
+    /// Returns `None` if this table has never written a checkpoint action.
+    /// Once a checkpoint action is written, it is cached for the lifetime of this snapshot.
     #[internal_api]
-    pub(crate) fn content_root(&self) -> Option<&ContentRoot> {
-        self.content_root.as_ref()
+    pub(crate) fn checkpoint_action(&self) -> Option<&CheckpointAction> {
+        self.checkpoint_action.as_ref()
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
@@ -600,6 +599,13 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+        require!(
+            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_reader_version()
+            ))
+        );
         // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
         if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
@@ -618,6 +624,14 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        // Version check: kernel supports writer versions MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
+        require!(
+            self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_writer_version()
+            ))
+        );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
@@ -634,7 +648,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -940,6 +954,32 @@ mod test {
             TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case(-1, 2, Operation::Scan)]
+    #[case(1, -1, Operation::Write)]
+    fn reject_protocol_version_below_minimum(
+        #[case] rv: i32,
+        #[case] wv: i32,
+        #[case] op: Operation,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(table_config.ensure_operation_supported(op), &expected);
     }
 
     #[test]
@@ -1851,7 +1891,7 @@ mod test {
 
         // Verify that make_physical on the same schema DOES produce ParquetFieldId (sanity check)
         let data_schema = schema_with_column_mapping();
-        let physical_data = data_schema.make_physical(ColumnMappingMode::Id);
+        let physical_data = data_schema.make_physical(ColumnMappingMode::Id).unwrap();
         let data_field = physical_data.field("phys_col_a").unwrap();
         assert!(
             matches!(

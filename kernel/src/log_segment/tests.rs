@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use rstest::rstest;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
-    SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -17,10 +17,12 @@ use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
+use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
@@ -31,8 +33,8 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::utils::test_utils::string_array_to_engine_data;
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, JsonHandler, PredicateRef,
-    RowVisitor, StorageHandler,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, JsonHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler,
 };
 use test_utils::{
     compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
@@ -111,7 +113,7 @@ fn test_replay_for_metadata() {
     // 5. txn (physically missing P&M columns)
     //
     // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
-    // now also looks for ContentRoot in addition to P&M, so it doesn't terminate early.
+    // now also looks for checkpoint action in addition to P&M, so it doesn't terminate early.
     //
     // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
     //
@@ -1190,7 +1192,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1265,7 +1267,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1335,7 +1337,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1393,7 +1395,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1489,7 +1491,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -3238,6 +3240,161 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     ));
 }
 
+#[test]
+fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
+    // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("ts_ntz_col", DataType::LONG),
+    ]);
+
+    // Stats schema expects Timestamp and TimestampNtz types
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("ts_ntz_col", DataType::TIMESTAMP_NTZ),
+    ]);
+
+    // Long -> Timestamp/TimestampNtz reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_timestamp_to_long_rejected() {
+    // Checkpoint has Timestamp-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "ts_col",
+            DataType::TIMESTAMP,
+        )]);
+
+    // Stats schema expects Long -- narrowing should be rejected
+    let stats_schema = create_stats_schema(vec![StructField::nullable("ts_col", DataType::LONG)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_integer_to_date() {
+    // Checkpoint stores date stats as Int32 (no DATE logical annotation)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::INTEGER,
+        )]);
+
+    // Stats schema expects Date type
+    let stats_schema = create_stats_schema(vec![StructField::nullable("date_col", DataType::DATE)]);
+
+    // Integer -> Date reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
+    // Checkpoint has Date-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::DATE,
+        )]);
+
+    // Stats schema expects Integer -- narrowing should be rejected
+    let stats_schema =
+        create_stats_schema(vec![StructField::nullable("date_col", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+// Type widening + checkpoint reinterpretation interaction scenarios.
+// Verifies that schema evolution doesn't create false-positive type matches.
+#[rstest]
+// Standard widening: Integer -> Long in old checkpoint after column was widened
+#[case::widening_integer_to_long(DataType::INTEGER, DataType::LONG, true)]
+// Checkpoint reinterpretation: Int32 without DATE annotation -> Date
+#[case::reinterpret_integer_to_date(DataType::INTEGER, DataType::DATE, true)]
+// Checkpoint reinterpretation: Int64 without TIMESTAMP annotation -> Timestamp
+#[case::reinterpret_long_to_timestamp(DataType::LONG, DataType::TIMESTAMP, true)]
+// Compound: checkpoint dropped Date annotation (Int32) + column widened to Timestamp.
+// Integer -> Timestamp is neither a widening nor reinterpretation rule.
+#[case::reinterpret_plus_widen_integer_to_timestamp(DataType::INTEGER, DataType::TIMESTAMP, false)]
+#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(
+    DataType::INTEGER,
+    DataType::TIMESTAMP_NTZ,
+    false
+)]
+// Date -> Timestamp is a valid Delta type widening rule, but kernel's can_widen_to does not
+// currently support it. This test documents the current behavior.
+#[case::date_widened_to_timestamp(DataType::DATE, DataType::TIMESTAMP, false)]
+fn test_stats_parsed_widening_and_reinterpretation_interaction(
+    #[case] checkpoint_type: DataType,
+    #[case] stats_type: DataType,
+    #[case] expected: bool,
+) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "col",
+            checkpoint_type,
+        )]);
+    let stats_schema = create_stats_schema(vec![StructField::nullable("col", stats_type)]);
+
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected
+    );
+}
+
+#[test]
+fn test_stats_parsed_mixed_widening_and_reinterpretation() {
+    // Multiple columns with different compatibility paths should all pass.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("date_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("date_col", DataType::DATE),
+    ]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
+    // One incompatible column (Integer -> Timestamp) rejects the whole schema.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("bad_col", DataType::TIMESTAMP),
+    ]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
 // ============================================================================
 // create_checkpoint_stream: partitionValues_parsed schema augmentation tests
 // ============================================================================
@@ -3345,7 +3502,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
-        None, // content_root
+        None, // checkpoint_action
         None, // data_predicate
         false,
         None, // table_schema
@@ -3414,7 +3571,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
-        None, // content_root
+        None, // checkpoint_action
         None, // data_predicate
         false,
         None, // table_schema
@@ -3683,4 +3840,227 @@ async fn test_new_with_commit_not_end_version_plus_one() {
 
 // ============================================================================
 // get_unpublished_catalog_commits tests
-// ================================
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_unpublished_catalog_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.listed.max_published_version, Some(2));
+    let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    assert_eq!(versions, vec![3, 4]);
+}
+
+// ============================================================================
+// Tests: segment_after_crc / segment_through_crc
+// ============================================================================
+
+fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
+    seg.listed
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect()
+}
+
+fn extract_compaction_ranges(seg: &LogSegment) -> Vec<(u64, u64)> {
+    seg.listed
+        .ascending_compaction_files
+        .iter()
+        .map(|c| match c.file_type {
+            LogPathFileType::CompactedCommit { hi } => (c.version, hi),
+            _ => panic!("expected compaction"),
+        })
+        .collect()
+}
+
+struct CrcPruningCase {
+    commits: &'static [u64],
+    compactions: &'static [(u64, u64)],
+    checkpoint: Option<u64>,
+    crc_version: u64,
+    after_commits: &'static [u64],
+    after_compactions: &'static [(u64, u64)],
+    through_commits: &'static [u64],
+    through_compactions: &'static [(u64, u64)],
+}
+
+#[rstest::rstest]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+#[case::only_deltas_no_checkpoint(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// checkpoint:                |
+// commits:                      x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:              x  x
+#[case::only_deltas_with_checkpoint(CrcPruningCase {
+    commits: &[3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: Some(2),
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:                        [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// after compactions:                  [-----]
+// through commits:     x  x  x  x  x
+#[case::compaction_after_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(5, 7)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[(5, 7)],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:               [-----------]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions:
+#[case::compaction_overlaps_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(2, 6)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:         [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions: [-----]
+#[case::compaction_before_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(0, 2)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[(0, 2)],
+})]
+#[tokio::test]
+async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
+    let seg = create_segment_for(LogSegmentConfig {
+        published_commit_versions: case.commits,
+        compaction_versions: case.compactions,
+        checkpoint_version: case.checkpoint,
+        ..Default::default()
+    })
+    .await;
+
+    let after = seg.segment_after_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&after), case.after_commits);
+    assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
+    assert!(after.checkpoint_version.is_none());
+    assert!(after.listed.checkpoint_parts.is_empty());
+
+    let through = seg.segment_through_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&through), case.through_commits);
+    assert_eq!(
+        extract_compaction_ranges(&through),
+        case.through_compactions
+    );
+    assert_eq!(through.checkpoint_version, case.checkpoint);
+}
+
+#[rstest::rstest]
+#[case::empty_schema(StructType::new_unchecked([]), None)]
+#[case::metadata_field(
+    StructType::new_unchecked([StructField::nullable(
+        METADATA_NAME,
+        StructType::new_unchecked([]),
+    )]),
+    Some(Arc::new(
+        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
+    )),
+)]
+#[case::protocol_field(
+    StructType::new_unchecked([StructField::nullable(
+        PROTOCOL_NAME,
+        StructType::new_unchecked([]),
+    )]),
+    Some(Arc::new(
+        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+    )),
+)]
+#[case::txn_field(
+    StructType::new_unchecked([StructField::nullable(
+        SET_TRANSACTION_NAME,
+        StructType::new_unchecked([]),
+    )]),
+    Some(Arc::new(
+        Expression::column(ColumnName::new([SET_TRANSACTION_NAME, "appId"])).is_not_null(),
+    )),
+)]
+#[case::domain_metadata_field(
+    StructType::new_unchecked([StructField::nullable(
+        DOMAIN_METADATA_NAME,
+        StructType::new_unchecked([]),
+    )]),
+    Some(Arc::new(
+        Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
+    )),
+)]
+#[case::unknown_field_returns_none(
+    StructType::new_unchecked([StructField::nullable(ADD_NAME, StructType::new_unchecked([]))]),
+    None,
+)]
+#[case::multiple_known_fields(
+    StructType::new_unchecked([
+        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
+        StructField::nullable(PROTOCOL_NAME, StructType::new_unchecked([])),
+    ]),
+    Some(Arc::new(Predicate::or(
+        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
+        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+    ))),
+)]
+#[case::known_and_unknown_field_returns_none(
+    StructType::new_unchecked([
+        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
+        StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+    ]),
+    None,
+)]
+fn test_schema_to_is_not_null_predicate(
+    #[case] schema: StructType,
+    #[case] expected: Option<PredicateRef>,
+) {
+    assert_eq!(schema_to_is_not_null_predicate(&schema), expected);
+}

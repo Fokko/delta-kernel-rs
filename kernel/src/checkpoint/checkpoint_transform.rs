@@ -8,14 +8,11 @@
 //!
 //! **Partition values** (controlled by `delta.checkpoint.writeStatsAsStruct`):
 //! - `partitionValues`: String-valued map (always present)
-//! - `partitionValues_parsed`: Native typed struct (only when `writeStatsAsStruct=true`),
-//!   computed from `partitionValues` via `MAP_TO_STRUCT`
+//! - `partitionValues_parsed`: Native typed struct (only when `writeStatsAsStruct=true`)
 //!
-//! For statistics, a COALESCE expression is used to preserve values from both commit files
-//! (which have JSON stats) and checkpoint files (which may have `stats_parsed`). For partition
-//! values, `partitionValues_parsed` is always computed from `partitionValues` via `MAP_TO_STRUCT`
-//! rather than reading from checkpoints, because some partition column types (e.g., `binary`) are
-//! not supported by the Arrow JSON reader and would cause failures when reading commit log files.
+//! This module provides transforms to populate these fields correctly regardless of the
+//! source format (commits vs checkpoints). Statistics use COALESCE expressions; partition
+//! values are always computed fresh via MAP_TO_STRUCT.
 
 use std::sync::{Arc, LazyLock};
 
@@ -55,7 +52,17 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
 ///
 /// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
-/// - `partitionValues_parsed = COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))`
+/// - `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)` (inserted after `partitionValues`)
+///
+/// Checkpoint parquet files may already contain `partitionValues_parsed`, but JSON commit files
+/// never do (the Arrow JSON reader does not support Binary-typed columns that may appear in
+/// partition schemas). Separate read schemas are used for commits and checkpoints, so the
+/// transform must handle both cases: when `partitionValues_parsed` is absent (commits) and
+/// when it is present (checkpoints). It uses an optional drop followed by a fresh MAP_TO_STRUCT
+/// insertion, which is functionally equivalent to COALESCE for this field.
+///
+/// When `writeStatsAsStruct=false` and the table is partitioned, `partitionValues_parsed` is
+/// dropped from checkpoint batches (it is absent from commit batches).
 ///
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
@@ -108,13 +115,26 @@ pub(crate) fn build_checkpoint_transform(
         add_transform = add_transform.with_dropped_field(STATS_PARSED_FIELD);
     }
 
-    // Handle partitionValues_parsed field (only for partitioned tables and writeStatsAsStruct=true).
-    // Insert after partitionValues rather than replacing, since partitionValues_parsed is not
-    // included in the read schema (to avoid issues with JSON-incompatible types such as binary).
-    if partition_schema.is_some() && config.write_stats_as_struct {
-        let pv_parsed_expr = build_partition_values_parsed_expr();
-        add_transform =
-            add_transform.with_inserted_field(Some(PARTITION_VALUES_FIELD), pv_parsed_expr);
+    // Handle partitionValues_parsed field for partitioned tables.
+    // Checkpoint parquet files may contain `partitionValues_parsed`, but JSON commit files
+    // never do (Binary partition columns are unsupported by the Arrow JSON reader). Separate
+    // read schemas handle this difference, so the transform must work for both:
+    // - Commits: `partitionValues_parsed` is absent; drop-if-exists is a no-op; MAP_TO_STRUCT
+    //   computes the value fresh from `partitionValues`.
+    // - Checkpoints: `partitionValues_parsed` is present from parquet; drop-if-exists removes
+    //   it; MAP_TO_STRUCT recomputes it from `partitionValues`.
+    if partition_schema.is_some() {
+        if config.write_stats_as_struct {
+            let pv_parsed_expr = build_partition_values_parsed_expr();
+            add_transform = add_transform
+                .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_FIELD)
+                .with_inserted_field(Some(PARTITION_VALUES_FIELD), pv_parsed_expr);
+        } else {
+            // Drop partitionValues_parsed when present in checkpoint parquet reads.
+            // For commit files it will be absent, so drop-if-exists is a no-op.
+            add_transform =
+                add_transform.with_dropped_field_if_exists(PARTITION_VALUES_PARSED_FIELD);
+        }
     }
 
     // Wrap the nested Add transform in a top-level transform that replaces the Add field
@@ -125,42 +145,57 @@ pub(crate) fn build_checkpoint_transform(
     Arc::new(Expression::transform(outer_transform))
 }
 
-/// Builds a read schema that includes `stats_parsed` in the Add action.
+/// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
+/// in the Add action.
 ///
-/// The read schema must be union-compatible across all log segment files (checkpoints and
-/// JSON commits). This means all reads use the same schema even though commits don't have
-/// `stats_parsed` — that column is read as null from commits. This union-compatible schema
-/// ensures log replay can process checkpoint and commit batches uniformly, and COALESCE
-/// expressions for stats can operate correctly across both sources.
+/// This schema is used for reading checkpoint parquet files. Because the Arrow JSON reader
+/// does not support Binary-typed columns, a separate (narrower) schema without
+/// `partitionValues_parsed` is used for reading JSON commit files. Pass `None` for
+/// `partition_schema` to produce that narrower commit schema, which excludes
+/// `partitionValues_parsed` regardless of the partition schema.
 ///
-/// Note: `partitionValues_parsed` is NOT included in the read schema. It is always computed
-/// from `partitionValues` via `MAP_TO_STRUCT` in the transform expression. This avoids issues
-/// with Arrow's JSON reader, which does not support binary (or other non-JSON-compatible) types
-/// that may appear in partition schemas.
+/// The `stats_parsed` field is always included so that COALESCE expressions can read from
+/// either source. For commit files, `stats_parsed` is absent and is read as nulls.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The `add` field is not found or is not a struct type
-/// - The `stats_parsed` field already exists in the Add schema
+/// - The `stats_parsed` or `partitionValues_parsed` field already exists in the Add schema
 pub(crate) fn build_checkpoint_read_schema(
     base_schema: &StructType,
     stats_schema: &StructType,
+    partition_schema: Option<&StructType>,
 ) -> DeltaResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
-        // Validate field isn't already present
+        // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
             return Err(Error::generic(
                 "stats_parsed field already exists in Add schema",
             ));
         }
-        add_struct.clone().with_field_inserted_after(
+        if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
+            return Err(Error::generic(
+                "partitionValues_parsed field already exists in Add schema",
+            ));
+        }
+        let mut result = add_struct.clone().with_field_inserted_after(
             Some(STATS_FIELD),
             StructField::nullable(
                 STATS_PARSED_FIELD,
                 DataType::Struct(Box::new(stats_schema.clone())),
             ),
-        )
+        )?;
+        if let Some(pv_schema) = partition_schema {
+            result = result.with_field_inserted_after(
+                Some(PARTITION_VALUES_FIELD),
+                StructField::nullable(
+                    PARTITION_VALUES_PARSED_FIELD,
+                    DataType::Struct(Box::new(pv_schema.clone())),
+                ),
+            )?;
+        }
+        Ok(result)
     })
 }
 
@@ -206,21 +241,18 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     ]))
 }
 
-/// Builds expression: `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
+/// Builds expression: `MAP_TO_STRUCT(add.partitionValues)`
 ///
-/// Converts the string-valued `partitionValues` map into a native typed struct. The target
-/// struct type (field names and data types) is determined by the output schema — `MAP_TO_STRUCT`
-/// itself carries no schema, so the expression evaluator uses the expected output type to
-/// parse each string value into the correct native type.
+/// Converts the string-valued `partitionValues` map to a native typed struct. The target
+/// struct type is determined by the output schema — `MAP_TO_STRUCT` carries no schema, so
+/// the expression evaluator uses the expected output type to parse each string value.
+///
+/// Any existing `partitionValues_parsed` value is dropped before this expression is
+/// inserted (via `with_dropped_field_if_exists`), so this always produces a freshly
+/// computed struct from the string-valued map.
 ///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
-///
-/// Note: This always recomputes from `partitionValues` rather than reading any existing
-/// `partitionValues_parsed` from checkpoints. This is necessary because `partitionValues_parsed`
-/// is not included in the read schema (to avoid issues with the Arrow JSON reader, which does
-/// not support binary types in its schema). Since `partitionValues` is always present in both
-/// commit and checkpoint files, `MAP_TO_STRUCT` produces correct results for all partition types.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::map_to_struct(Expression::column([
         ADD_NAME,
@@ -388,7 +420,16 @@ mod tests {
         transform
             .field_transforms
             .get(field)
-            .map(|ft| ft.is_replace && ft.exprs.is_empty())
+            .map(|ft| ft.is_replace && ft.exprs.is_empty() && !ft.optional)
+            .unwrap_or(false)
+    }
+
+    /// Helper to check if a field transform is an optional drop (silently ignored if absent).
+    fn is_optional_drop(transform: &Transform, field: &str) -> bool {
+        transform
+            .field_transforms
+            .get(field)
+            .map(|ft| ft.is_replace && ft.exprs.is_empty() && ft.optional)
             .unwrap_or(false)
     }
 
@@ -520,23 +561,23 @@ mod tests {
 
         let (_, inner) = extract_transforms(&transform_expr);
 
-        // partitionValues_parsed is inserted after partitionValues (not a replacement)
+        // partitionValues_parsed is inserted after partitionValues via MAP_TO_STRUCT
         assert!(
             has_insertion_after(inner, PARTITION_VALUES_FIELD),
             "partitionValues_parsed should be inserted after partitionValues"
         );
-        // partitionValues_parsed itself should not be a field transform (it's not in the read schema)
+        // partitionValues_parsed is optionally dropped to handle checkpoint parquet batches
+        // that already have the field (from a prior checkpoint write)
         assert!(
-            !inner
-                .field_transforms
-                .contains_key(PARTITION_VALUES_PARSED_FIELD),
-            "partitionValues_parsed should not be directly in field_transforms"
+            is_optional_drop(inner, PARTITION_VALUES_PARSED_FIELD),
+            "partitionValues_parsed should have an optional drop transform"
         );
     }
 
     #[test]
     fn test_build_transform_no_partition_values_when_struct_disabled() {
-        // writeStatsAsStruct=false with partitioned table: no partitionValues_parsed transform
+        // writeStatsAsStruct=false with partitioned table: partitionValues_parsed must be
+        // dropped when present (checkpoint parquet files may contain it), but not inserted.
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: false,
@@ -550,17 +591,15 @@ mod tests {
 
         let (_, inner) = extract_transforms(&transform_expr);
 
-        // No partitionValues_parsed transform: it's not in the read schema and not inserted
+        // partitionValues_parsed is optionally dropped (present in checkpoint parquet, absent
+        // from commit JSON files)
         assert!(
-            !inner
-                .field_transforms
-                .contains_key(PARTITION_VALUES_PARSED_FIELD),
-            "partitionValues_parsed should not be in field_transforms when struct disabled"
+            is_optional_drop(inner, PARTITION_VALUES_PARSED_FIELD),
+            "partitionValues_parsed should have an optional drop when write_stats_as_struct=false"
         );
-        // No insertion after partitionValues either
         assert!(
             !has_insertion_after(inner, PARTITION_VALUES_FIELD),
-            "no insertion after partitionValues when writeStatsAsStruct=false"
+            "no insertion after partitionValues when write_stats_as_struct=false"
         );
     }
 

@@ -1,6 +1,6 @@
 //! Tests for AMT (Adaptive Metadata Tree) root manifest + delta log interplay
 //!
-//! These tests verify that when a root manifest exists at version N, subsequent regular (non-batch)
+//! These tests verify that when a root manifest exists at version N, subsequent log
 //! commits at N+1, N+2,... correctly interact with the root manifest during table scans.
 //!
 
@@ -12,20 +12,20 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::TypedGetData;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
-use object_store::ObjectStore;
 use test_utils::{
     collect_file_paths, create_add_files_metadata, create_table, engine_store_setup,
     remove_scan_files_with_selection,
 };
 use url::Url;
 
-/// Test Scenario: Files Added in log commits after an initial batch commit
-/// are subsequently rolled up in next batch commit
+/// Test Scenario: Files Added in log commits after an initial manifest commit
+/// are subsequently rolled up in next manifest commit
 #[tokio::test]
 async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>> {
     let schema = create_test_schema()?;
@@ -33,14 +33,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
     for (table_url, engine, _store) in
         setup_amt_test_tables(schema.clone(), "files_after_root").await?
     {
-        // v1: Batch commit adds file1, file2
+        // v1: Manifest commit adds file1, file2
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let batch = txn.with_batch_commit();
-                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -49,7 +49,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                batch.add_leaf(leaf.finish(&engine)?)?;
+                mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -60,18 +60,18 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             };
         }
 
-        // v2: Batch commit creates root manifest
+        // v2: Manifest commit creates root manifest
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
                     assert_eq!(c.commit_version(), 2);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        new_snapshot.content_root().is_some(),
+                        new_snapshot.checkpoint_action().is_some(),
                         "Root manifest should exist"
                     );
                 }
@@ -80,7 +80,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         }
 
         // Verify v2: Root manifest contains file1, file2
-        // Tests: Root manifest correctly stores files from batch commit
+        // Tests: Root manifest correctly stores files from manifest commit
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let paths = collect_file_paths(snapshot, &engine)?;
@@ -157,28 +157,28 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             );
         }
 
-        // v5: Batch commit creates NEW root (rolling up log) + adds file5
+        // v5: Manifest commit creates NEW root (rolling up log) + adds file5
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 as part of the new root creation
-                let batch = txn.with_batch_commit();
-                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![("file5.parquet", 2048, 1000004, 100)],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                batch.add_leaf(leaf.finish(&engine)?)?;
+                mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
                     assert_eq!(c.commit_version(), 5);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -218,11 +218,11 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
     for (table_url, engine, _store) in
         setup_amt_test_tables(schema.clone(), "file_removal_flat").await?
     {
-        // v1: Batch commit with files DIRECTLY in root (no leaf)
+        // v1: Manifest commit with files DIRECTLY in root (no leaf)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -241,7 +241,7 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 1);
                     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        snapshot_v1.content_root().is_some(),
+                        snapshot_v1.checkpoint_action().is_some(),
                         "v1 should create root manifest"
                     );
                 }
@@ -319,11 +319,11 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
             );
         }
 
-        // v3: Batch commit adds file5 and creates new root
+        // v3: Manifest commit adds file5 and creates new root
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -337,7 +337,7 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 3);
                     let new_snapshot: Arc<Snapshot> =
                         Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -367,7 +367,7 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test File Removal of Leaf Entry in Log rolls up in subsequent batch commit
+/// Test File Removal of Leaf Entry in Log rolls up in subsequent manifest commit
 #[tokio::test]
 #[ignore = "BUG: New root manifest does not roll up Remove actions from delta log in commit 3 - file2 reappears"]
 async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::error::Error>> {
@@ -376,14 +376,14 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
     for (table_url, engine, _store) in
         setup_amt_test_tables(schema.clone(), "file_removal_leaf").await?
     {
-        // v1: Batch commit with 4 files via leaf writer (creates root manifest)
+        // v1: Manifest commit with 4 files via leaf writer (creates root manifest)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let batch = txn.with_batch_commit();
-                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -394,7 +394,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                batch.add_leaf(leaf.finish(&engine)?)?;
+                mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -402,7 +402,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 1);
                     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        snapshot_v1.content_root().is_some(),
+                        snapshot_v1.checkpoint_action().is_some(),
                         "v1 should create root manifest"
                     );
                 }
@@ -482,21 +482,21 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             );
         }
 
-        // v3: Batch commit creates NEW root + adds file5
+        // v3: Manifest commit creates NEW root + adds file5
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 via leaf writer as part of new root creation
-                let batch = txn.with_batch_commit();
-                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![("file5.parquet", 1024, 1000004, 50)],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                batch.add_leaf(leaf.finish(&engine)?)?;
+                mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -504,7 +504,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 3);
                     let new_snapshot: Arc<Snapshot> =
                         Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -534,29 +534,29 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test Scenario: DV Replacement in log rolled up in subsequent batch
+/// Test Scenario: DV Replacement in log rolled up in subsequent manifest commit
 ///
 /// Setup:
-/// - v1: Batch commit adds file to root (no DV)
-/// - v2: Batch commit adds DV to that file
+/// - v1: Manifest commit adds file to root (no DV)
+/// - v2: Manifest commit adds DV to that file
 /// - v3: Regular commit replaces DV via delta log
-/// - v4: Batch commit creates new root
+/// - v4: Manifest commit creates new root
 ///
 /// Expected: v4 should have file with DV from v3 (replacement), not v2 (original)
-/// Actual: v4 has file with NO DV - BUG: batch commit does not roll up DV replacements from delta log
+/// Actual: v4 has file with NO DV - BUG: manifest commit does not roll up DV replacements from delta log
 #[tokio::test]
-#[ignore = "BUG: Batch commit at v4 does not roll up DV replacement from delta log - file has no DV"]
+#[ignore = "BUG: Manifest commit at v4 does not roll up DV replacement from delta log - file has no DV"]
 async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store) in
         setup_amt_test_tables(schema.clone(), "dv_replacement").await?
     {
-        // v1: Batch commit - add file1 to root (no DV)
+        // v1: Manifest commit - add file1 to root (no DV)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -582,13 +582,13 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             assert_sets_equal(&expected, &paths, "v1: Root should contain file1");
         }
 
-        // v2: Batch commit - add DV to file1 in root
+        // v2: Manifest commit - add DV to file1 in root
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .clone()
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             // Scan to get file1
             let scan = snapshot.clone().scan_builder().build()?;
@@ -707,18 +707,18 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        // v4: Batch commit - create new root and verify DV rollup
+        // v4: Manifest commit - create new root and verify DV rollup
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_batch_commit();
+            txn.with_manifest_commit();
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
                     assert_eq!(c.commit_version(), 4);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        new_snapshot.content_root().is_some(),
+                        new_snapshot.checkpoint_action().is_some(),
                         "v4 should create new root manifest"
                     );
                 }
@@ -727,7 +727,7 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Verify v4: file1 present with DV from v3 (NOT v2) rolled up into new root
-        // batch commit should roll up the REPLACED DV from delta log
+        // manifest commit should roll up the REPLACED DV from delta log
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let files_with_dvs = collect_files_with_dvs(snapshot, &engine)?;

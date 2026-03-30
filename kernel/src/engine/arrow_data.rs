@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use itertools::Itertools;
 use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
@@ -15,6 +17,7 @@ use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
+use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine_data::{EngineData, EngineStruct, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::{ArrayData, Scalar, StructData};
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef, StructField};
@@ -398,7 +401,7 @@ impl EngineData for ArrowEngineData {
         // This is used to guide our depth-first extraction. If the list contains any non-leaf,
         // duplicate, or missing column references, the extracted column list will be too
         // short (error out below).
-        let mut column_map = HashMap::new();
+        let mut column_map = HashMap::with_capacity(leaf_columns.len() * 2);
 
         for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
             column_map.insert(column.clone(), ColumnState::AwaitingGetter(data_type));
@@ -446,9 +449,6 @@ impl EngineData for ArrowEngineData {
         schema: SchemaRef,
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        use crate::arrow::array::{make_builder, ArrayBuilder};
-        use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
-
         // Combine existing and new schema fields
         let schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
         let mut combined_fields = self.data.schema().fields().to_vec();
@@ -456,26 +456,10 @@ impl EngineData for ArrowEngineData {
         let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
 
         // Combine existing and new columns
-        // Convert kernel ArrayData to Arrow arrays
         let new_columns: Vec<ArrayRef> = columns
             .into_iter()
-            .map(|array_data| {
-                let elements = array_data.array_elements();
-
-                // Get the element type from the ArrayType
-                let element_type = array_data.array_type().element_type();
-                let arrow_data_type = ArrowDataType::try_from_kernel(element_type)?;
-
-                // Create a builder and append each scalar
-                let mut builder = make_builder(&arrow_data_type, elements.len());
-                for scalar in elements {
-                    scalar.append_to(&mut *builder, 1)?;
-                }
-
-                Ok(builder.finish())
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
+            .map(|array_data| array_data.to_arrow())
+            .try_collect()?;
         let mut combined_columns = self.data.columns().to_vec();
         combined_columns.extend(new_columns);
 

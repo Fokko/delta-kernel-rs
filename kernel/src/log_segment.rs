@@ -4,9 +4,10 @@ use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_commit_schema, get_log_add_schema, schema_contains_file_actions, ContentRoot, Metadata,
-    Protocol, Sidecar, ADD_NAME, CONTENT_ROOT_NAME, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_commit_schema, get_log_add_schema, schema_contains_file_actions, CheckpointAction,
+    ContentRoot, Metadata, Protocol, Sidecar, ADD_NAME, CHECKPOINT_ACTION_NAME,
+    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -47,12 +48,13 @@ mod crc_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod tests_content_root_validation;
+mod tests_checkpoint_action_validation;
 
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[internal_api]
 pub(crate) struct CheckpointReadInfo {
     /// Whether the checkpoint has compatible pre-parsed stats for data skipping.
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
@@ -86,6 +88,7 @@ impl CheckpointReadInfo {
 /// and checkpoint metadata.
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
+#[internal_api]
 pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
@@ -556,14 +559,15 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         data_predicate: Option<PredicateRef>,
-        content_root: Option<&ContentRoot>,
+        checkpoint_action: Option<&CheckpointAction>,
         skip_leaf_manifests: bool,
         table_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // content_root is now passed in from caller (no I/O needed)
-        let content_root_version = content_root.map(|cr| cr.version);
+        // checkpoint_action is now passed in from caller (no I/O needed)
+        let checkpoint_action_version = checkpoint_action.map(|ca| ca.version);
+        let content_root = checkpoint_action.map(|ca| &ca.content_root);
 
         // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
         // checkpoint parquet row groups without any relevant action type can be skipped.
@@ -588,7 +592,7 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commit_stream =
-            CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
+            CommitReader::try_new(engine, self, commit_read_schema, checkpoint_action_version)?;
 
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(actions_with_checkpoint_info.actions),
@@ -623,7 +627,7 @@ impl LogSegment {
             None,
             None,
             None,  // No data predicate for manifest-level skipping
-            None,  // No content root available in this context
+            None,  // No checkpoint action available in this context
             false, // Don't skip leaf manifests by default
             None,  // No table schema available in this context
         )?;
@@ -1166,49 +1170,52 @@ impl LogSegment {
 }
 
 impl LogSegment {
-    /// Validate content root compatibility with protocol and update root enabled state.
+    /// Validate checkpoint action compatibility with protocol and update root enabled state.
     ///
     /// When a protocol is discovered, this checks that if the protocol lacks the
-    /// MetadataTreeExperimental feature, no content root should have been found.
+    /// MetadataTreeExperimental feature, no checkpoint action should have been found.
     /// Updates the root_enabled flag based on the protocol's features.
-    fn validate_content_root_with_protocol(
+    fn validate_checkpoint_action_with_protocol(
         protocol: &Protocol,
-        content_root_opt: &Option<ContentRoot>,
+        checkpoint_action_opt: &Option<CheckpointAction>,
         root_enabled: &mut bool,
     ) -> DeltaResult<()> {
         *root_enabled = protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental);
 
-        // If protocol lacks the feature but we already found a content root, that's invalid
-        if !*root_enabled && content_root_opt.is_some() {
+        // If protocol lacks the feature but we already found a checkpoint action, that's invalid
+        if !*root_enabled && checkpoint_action_opt.is_some() {
             return Err(Error::invalid_protocol(
-                "Found ContentRoot action but protocol does not have MetadataTreeExperimental reader feature enabled"
+                "Found checkpoint action but protocol does not have MetadataTreeExperimental reader feature enabled"
             ));
         }
 
         Ok(())
     }
 
-    /// Read protocol, metadata, and content root from the log segment.
+    /// Read protocol, metadata, and checkpoint action from the log segment.
     ///
     /// If an existing_protocol is provided, it will be used to determine the initial
-    /// content root search state. If the protocol doesn't have the MetadataTreeExperimental
-    /// feature, content root search will be skipped entirely. If no existing_protocol is
+    /// checkpoint action search state. If the protocol doesn't have the MetadataTreeExperimental
+    /// feature, checkpoint action search will be skipped entirely. If no existing_protocol is
     /// provided, the search will start optimistically and adjust once protocol is discovered.
     ///
     /// The `lazy_crc` parameter is used for the CRC-optimized P&M path. Callers that want the
     /// CRC to be cached on a shared [`LazyCrc`] instance (e.g. the snapshot's own `lazy_crc`)
     /// should pass that instance here.
-    pub(crate) fn protocol_and_metadata_and_content_root(
+    pub(crate) fn protocol_and_metadata_and_checkpoint(
         &self,
         engine: &dyn Engine,
         existing_protocol: Option<&Protocol>,
         lazy_crc: &LazyCrc,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<ContentRoot>)> {
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<CheckpointAction>)> {
+        // TODO: When CheckpointAction contains optional P+M, revisit checkpoint discovery to
+        // extract P+M directly from the checkpoint action.
+
         // Try CRC-optimized path for P&M
         let (mut metadata_opt, mut protocol_opt) =
             self.read_protocol_metadata_opt(engine, lazy_crc)?;
 
-        // Determine if content root is enabled based on found or existing protocol
+        // Determine if checkpoint action is enabled based on found or existing protocol
         let effective_protocol = protocol_opt.as_ref().or(existing_protocol);
         let mut root_enabled = match effective_protocol {
             Some(protocol) => protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental),
@@ -1218,15 +1225,15 @@ impl LogSegment {
             }
         };
 
-        // If P&M already found and no ContentRoot needed, return early
+        // If P&M already found and no checkpoint action needed, return early
         if metadata_opt.is_some() && protocol_opt.is_some() && !root_enabled {
             return Ok((metadata_opt, protocol_opt, None));
         }
 
-        // Need to search for ContentRoot (and possibly remaining P&M if not found).
+        // Need to search for checkpoint action (and possibly remaining P&M if not found).
         // Do full replay, skipping P&M search if already populated from CRC.
         let root_enabled_at_start = root_enabled;
-        let mut content_root_opt = None;
+        let mut checkpoint_action_opt = None;
 
         for actions_batch in self.replay_for_pmc(engine)? {
             let actions = actions_batch?.actions;
@@ -1239,37 +1246,37 @@ impl LogSegment {
             if protocol_opt.is_none() {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
                 if let Some(protocol) = protocol_opt.as_ref() {
-                    Self::validate_content_root_with_protocol(
+                    Self::validate_checkpoint_action_with_protocol(
                         protocol,
-                        &content_root_opt,
+                        &checkpoint_action_opt,
                         &mut root_enabled,
                     )?;
                 }
             }
 
-            // Only search for content root if enabled
-            if root_enabled && content_root_opt.is_none() {
-                content_root_opt = ContentRoot::try_new_from_data(actions.as_ref())?;
+            // Only search for checkpoint action if enabled
+            if root_enabled && checkpoint_action_opt.is_none() {
+                checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
             }
 
             // Early termination: stop when we have everything we need
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                // If content root is disabled, we're done (no content root to search for)
+                // If checkpoint action is disabled, we're done
                 if !root_enabled {
                     break;
                 }
 
-                // If content root is enabled:
-                // - If we found content root, we're done
-                // - If content root was just enabled (wasn't enabled at start), we're done
-                //   (feature was just turned on, no content root written yet)
-                // - Otherwise keep searching (content root was enabled at start, should exist)
-                if content_root_opt.is_some() || !root_enabled_at_start {
+                // If checkpoint action is enabled:
+                // - If we found checkpoint action, we're done
+                // - If checkpoint action was just enabled (wasn't enabled at start), we're done
+                //   (feature was just turned on, no checkpoint action written yet)
+                // - Otherwise keep searching (was enabled at start, should exist)
+                if checkpoint_action_opt.is_some() || !root_enabled_at_start {
                     break;
                 }
             }
         }
-        Ok((metadata_opt, protocol_opt, content_root_opt))
+        Ok((metadata_opt, protocol_opt, checkpoint_action_opt))
     }
 
     /// Try to get P&M via CRC-optimized path.
@@ -1381,13 +1388,13 @@ impl LogSegment {
         }
     }
 
-    /// Reads protocol, metadata, and content root actions from the log segment.
+    /// Reads protocol, metadata, and checkpoint actions from the log segment.
     fn replay_for_pmc(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema =
-            get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CONTENT_ROOT_NAME])?;
+            get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
             Some(Arc::new(Predicate::or(
@@ -1395,7 +1402,7 @@ impl LogSegment {
                     Expression::column([METADATA_NAME, "id"]).is_not_null(),
                     Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
                 ),
-                Expression::column([CONTENT_ROOT_NAME, "path"]).is_not_null(),
+                Expression::column([CHECKPOINT_ACTION_NAME, "version"]).is_not_null(),
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints
@@ -1579,10 +1586,12 @@ impl LogSegment {
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    /// Recursively checks if two struct types have compatible field types.
     ///
-    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
-    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// For each field in `needed`, if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
+    ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
@@ -1609,9 +1618,16 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use can_read_as for type compatibility
+                // Non-struct types: use stats-specific rules for primitives and standard
+                // schema rules otherwise.
                 (avail_type, need_type) => {
-                    if avail_type.can_read_as(need_type).is_err() {
+                    let compatible = match (avail_type, need_type) {
+                        (DataType::Primitive(a), DataType::Primitive(b)) => {
+                            a.is_stats_type_compatible_with(b)
+                        }
+                        (a, b) => a.can_read_as(b).is_ok(),
+                    };
+                    if !compatible {
                         debug!(
                             "stats_parsed not compatible: incompatible type for '{}' in {}: \
                              checkpoint has {:?}, stats schema needs {:?}",

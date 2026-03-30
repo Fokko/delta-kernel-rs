@@ -315,15 +315,15 @@ fn verify_stats(
 
 /// Helper to create and add a leaf node with files
 fn add_leaf_with_files(
-    batch: &mut delta_kernel::transaction::BatchState,
+    mc: &mut delta_kernel::transaction::ManifestCommitState,
     engine: &dyn delta_kernel::Engine,
     add_files_schema: &Arc<StructType>,
     files: Vec<TestFileStats<'_>>,
 ) -> DeltaResult<()> {
-    let mut leaf = batch.new_leaf_node_writer(engine)?;
+    let mut leaf = mc.new_leaf_node_writer(engine)?;
     let data = create_add_files_with_stats(add_files_schema, files)?;
     leaf.add_files(engine, data)?;
-    batch.add_leaf(leaf.finish(engine)?)?;
+    mc.add_leaf(leaf.finish(engine)?)?;
     Ok(())
 }
 
@@ -361,7 +361,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     )
     .await?;
 
-    // Create transaction with batch commit
+    // Create transaction with manifest commit
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
@@ -393,9 +393,9 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
 
     // Add files to leaves: leaf1 (files 1-2), leaf2 (file3)
     {
-        let batch = txn.with_batch_commit();
+        let mc = txn.with_manifest_commit();
         add_leaf_with_files(
-            batch,
+            mc,
             engine.as_ref(),
             &add_files_schema,
             vec![
@@ -421,7 +421,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         )?;
 
         add_leaf_with_files(
-            batch,
+            mc,
             engine.as_ref(),
             &add_files_schema,
             vec![TestFileStats {
@@ -494,7 +494,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     ));
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(
-        snapshot.content_root().is_some(),
+        snapshot.checkpoint_action().is_some(),
         "Content root should exist"
     );
 

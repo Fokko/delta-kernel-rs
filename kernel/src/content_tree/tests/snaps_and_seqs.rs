@@ -6,7 +6,7 @@
 //! then read back into a fresh builder via `from_content_root`, mirroring the
 //! production round-trip.
 
-use crate::actions::{Add, ContentRoot};
+use crate::actions::{Add, CheckpointAction, ContentRoot};
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
@@ -57,12 +57,14 @@ fn make_add(path: &str, size: i64) -> Add {
     }
 }
 
-/// Creates a `ContentRoot` from a written manifest path and version.
-fn make_content_root(path: String, version: Version) -> ContentRoot {
-    ContentRoot {
-        path,
-        size_in_bytes: 0,
+/// Creates a [`CheckpointAction`] from a written manifest path and version.
+fn make_checkpoint_action(path: String, version: Version) -> CheckpointAction {
+    CheckpointAction {
         version,
+        content_root: ContentRoot {
+            path,
+            size_in_bytes: 0,
+        },
     }
 }
 
@@ -146,7 +148,7 @@ fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>>
     // V2: read V1 manifest into a fresh builder, add file_b, then read back
     let mut builder = ContentTreeNodeBuilder::from_content_root(
         &engine,
-        &make_content_root(v1_path, 1),
+        &make_checkpoint_action(v1_path, 1).content_root,
         table_root,
         test_table_schema(),
         2,
@@ -204,7 +206,7 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     // V2: read V1 manifest, add file_b, write manifest
     let mut builder = ContentTreeNodeBuilder::from_content_root(
         &engine,
-        &make_content_root(v1_path, 1),
+        &make_checkpoint_action(v1_path, 1).content_root,
         table_root.clone(),
         test_table_schema(),
         2,
@@ -215,7 +217,7 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     // V3: read V2 manifest into a fresh builder
     let mut builder = ContentTreeNodeBuilder::from_content_root(
         &engine,
-        &make_content_root(v2_path, 2),
+        &make_checkpoint_action(v2_path, 2).content_root,
         table_root,
         test_table_schema(),
         3,
@@ -290,7 +292,7 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
     // V2: read V1 manifest, add file_b, write manifest
     let mut builder = ContentTreeNodeBuilder::from_content_root(
         &engine,
-        &make_content_root(v1_path, 1),
+        &make_checkpoint_action(v1_path, 1).content_root,
         table_root.clone(),
         test_table_schema(),
         2,
@@ -301,7 +303,7 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
     // V3: read V2 manifest, delete file_a, read back
     let mut builder = ContentTreeNodeBuilder::from_content_root(
         &engine,
-        &make_content_root(v2_path, 2),
+        &make_checkpoint_action(v2_path, 2).content_root,
         table_root,
         test_table_schema(),
         3,

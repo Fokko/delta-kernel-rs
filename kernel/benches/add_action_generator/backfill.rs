@@ -278,7 +278,7 @@ async fn main() {
         std::fs::create_dir_all(&path).expect("Failed to create table directory");
 
         store = std::sync::Arc::new(
-            object_store::local::LocalFileSystem::new_with_prefix(&path)
+            delta_kernel::object_store::local::LocalFileSystem::new_with_prefix(&path)
                 .expect("Failed to create prefixed file system"),
         );
         println!(
@@ -306,7 +306,7 @@ async fn run(
     args: &Args,
     table_url: url::Url,
     engine: std::sync::Arc<dyn delta_kernel::Engine>,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    store: std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("1. Setting up table structure...");
@@ -386,7 +386,7 @@ async fn run(
 
 async fn generate_commit_0(
     _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    store: &std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: &str,
     enable_metadata_tree: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -531,7 +531,7 @@ async fn generate_commit_0(
     content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
     content.push('\n');
 
-    let commit_path = object_store::path::Path::from(format!(
+    let commit_path = delta_kernel::object_store::path::Path::from(format!(
         "{}_delta_log/00000000000000000000.json",
         path_prefix
     ));
@@ -542,7 +542,7 @@ async fn generate_commit_0(
 
 async fn generate_sidecars(
     _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    store: &std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: &str,
     num_sidecars: usize,
     actions_per_sidecar: usize,
@@ -590,7 +590,7 @@ async fn generate_sidecars(
         let size_in_bytes = file_bytes.len() as i64;
         let modification_time = chrono::Utc::now().timestamp_millis();
 
-        let sidecar_path = object_store::path::Path::from(format!(
+        let sidecar_path = delta_kernel::object_store::path::Path::from(format!(
             "{}_delta_log/_sidecars/{}",
             path_prefix, sidecar_name
         ));
@@ -612,7 +612,7 @@ async fn generate_sidecars(
 
 async fn generate_checkpoint(
     _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    store: &std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: &str,
     sidecars: &[Sidecar],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -627,7 +627,7 @@ async fn generate_checkpoint(
     );
 
     // Read metadata and protocol from commit 0
-    let commit_0_path = object_store::path::Path::from(format!(
+    let commit_0_path = delta_kernel::object_store::path::Path::from(format!(
         "{}_delta_log/00000000000000000000.json",
         path_prefix
     ));
@@ -680,7 +680,7 @@ async fn generate_checkpoint(
         content.push('\n');
     }
 
-    let checkpoint_path = object_store::path::Path::from(format!(
+    let checkpoint_path = delta_kernel::object_store::path::Path::from(format!(
         "{}_delta_log/{}",
         path_prefix, checkpoint_filename
     ));
@@ -702,7 +702,7 @@ async fn generate_checkpoint(
 
 async fn generate_last_checkpoint(
     _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    store: &std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: &str,
     sidecars: &[Sidecar],
     total_actions: i64,
@@ -721,8 +721,10 @@ async fn generate_last_checkpoint(
     };
 
     let json_str = serde_json::to_string_pretty(&last_checkpoint)?;
-    let last_checkpoint_path =
-        object_store::path::Path::from(format!("{}_delta_log/_last_checkpoint", path_prefix));
+    let last_checkpoint_path = delta_kernel::object_store::path::Path::from(format!(
+        "{}_delta_log/_last_checkpoint",
+        path_prefix
+    ));
     store.put(&last_checkpoint_path, json_str.into()).await?;
 
     println!("   Total actions: {}", total_actions);
@@ -742,7 +744,7 @@ struct IncrementalCommitConfig {
 
 async fn generate_incremental_commits(
     _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    store: &std::sync::Arc<dyn delta_kernel::object_store::ObjectStore>,
     path_prefix: &str,
     config: IncrementalCommitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -892,7 +894,7 @@ async fn generate_incremental_commits(
 
         // Write to object store
         let commit_filename = format!("{:020}.json", version);
-        let commit_path = object_store::path::Path::from(format!(
+        let commit_path = delta_kernel::object_store::path::Path::from(format!(
             "{}_delta_log/{}",
             path_prefix, commit_filename
         ));
@@ -922,20 +924,20 @@ async fn generate_content_root(
 
     println!("      ✓ Opened table at version {}", snapshot.version());
 
-    // Create transaction with batch_commit mode
+    // Create transaction with manifest_commit mode
     println!("      Creating transaction...");
 
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot.transaction(committer, engine.as_ref())?;
 
-    println!("      ✓ Transaction created in batch_commit mode");
+    println!("      ✓ Transaction created in manifest_commit mode");
 
     println!("   Step 6b: Scanning existing actions...");
 
     // Release root and delta actions (no predicate needed for counting approach)
     let scan = {
-        let batch = txn.with_batch_commit();
-        batch.release_root_and_delta_actions()?
+        let mc = txn.with_manifest_commit();
+        mc.release_root_and_delta_actions()?
     };
 
     println!("      ✓ Released root and delta actions");
@@ -998,7 +1000,7 @@ fn partition_actions_into_leaves(
     let mut actions_in_current_leaf: usize = 0;
     let mut leaf_count: usize = 0;
 
-    let batch = txn.with_batch_commit();
+    let mc = txn.with_manifest_commit();
 
     // Scan metadata and count actions
     let scan_iter = scan.scan_metadata(engine)?;
@@ -1029,14 +1031,14 @@ fn partition_actions_into_leaves(
         if actions_in_current_leaf > 0 && actions_in_current_leaf + selected_count > batch_size {
             // Finish the current leaf before adding this batch
             let leaf_result = current_leaf_writer.take().unwrap().finish(engine)?;
-            batch.add_leaf(leaf_result)?;
+            mc.add_leaf(leaf_result)?;
             leaf_count += 1;
             actions_in_current_leaf = 0;
         }
 
         // Add this batch to the current (or new) leaf
         if current_leaf_writer.is_none() {
-            current_leaf_writer = Some(batch.new_leaf_node_writer(engine)?);
+            current_leaf_writer = Some(mc.new_leaf_node_writer(engine)?);
         }
 
         let leaf_writer = current_leaf_writer.as_mut().unwrap();
@@ -1046,7 +1048,7 @@ fn partition_actions_into_leaves(
         // If we've reached or exceeded batch_size, finish this leaf
         if actions_in_current_leaf >= batch_size {
             let leaf_result = current_leaf_writer.take().unwrap().finish(engine)?;
-            batch.add_leaf(leaf_result)?;
+            mc.add_leaf(leaf_result)?;
             leaf_count += 1;
             actions_in_current_leaf = 0;
 
@@ -1058,7 +1060,7 @@ fn partition_actions_into_leaves(
 
     // Finish any remaining leaf
     if let Some(writer) = current_leaf_writer {
-        batch.add_leaf(writer.finish(engine)?)?;
+        mc.add_leaf(writer.finish(engine)?)?;
         leaf_count += 1;
     }
 
