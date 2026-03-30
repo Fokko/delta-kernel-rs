@@ -895,7 +895,7 @@ async fn verify_batch_commit_hwm(
     commit_version: u64,
     expected_hwm: i64,
 ) -> DeltaResult<()> {
-    let store = object_store::local::LocalFileSystem::new();
+    let store = delta_kernel::object_store::local::LocalFileSystem::new();
     let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
     let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
     let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
@@ -943,7 +943,7 @@ async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn st
     let add_files_schema = txn.add_files_schema();
 
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
 
         let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf1.add_files(
@@ -997,7 +997,7 @@ async fn test_batch_commit_row_tracking_consecutive_commits(
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let add_files_schema = txn.add_files_schema();
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
@@ -1025,7 +1025,7 @@ async fn test_batch_commit_row_tracking_consecutive_commits(
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let add_files_schema = txn2.add_files_schema();
     {
-        let batch = txn2.with_batch_commit();
+        let batch = txn2.with_manifest_commit();
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
@@ -1063,7 +1063,7 @@ async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn 
     let add_files_schema = txn.add_files_schema();
 
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
 
         // Leaf 1: 5 records
         let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
@@ -1122,7 +1122,7 @@ async fn test_batch_commit_row_tracking_multiple_files_per_leaf(
     let add_files_schema = txn.add_files_schema();
 
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
 
         // Single leaf with 3 files: 10, 20, 30 records
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
@@ -1164,7 +1164,7 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let add_files_schema = txn.add_files_schema();
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
@@ -1193,14 +1193,14 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     {
-        let _batch = txn2.with_batch_commit();
+        let _batch = txn2.with_manifest_commit();
         // Don't add any leaves
     }
     let result = txn2.commit(engine.as_ref())?;
     assert!(matches!(result, CommitResult::CommittedTransaction(_)));
 
     // The no-op commit should only contain a commitInfo action (same as the non-batch path)
-    let store = object_store::local::LocalFileSystem::new();
+    let store = delta_kernel::object_store::local::LocalFileSystem::new();
     let commit_url = table_url.join("_delta_log/00000000000000000001.json")?;
     let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
     let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
@@ -1230,7 +1230,7 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     {
-        let batch = txn.with_batch_commit();
+        let batch = txn.with_manifest_commit();
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
@@ -1258,7 +1258,7 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let schema = txn2.add_files_schema();
     {
-        let batch = txn2.with_batch_commit();
+        let batch = txn2.with_manifest_commit();
         let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
@@ -1280,7 +1280,7 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     let mut txn3 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let schema = txn3.add_files_schema();
     {
-        let batch = txn3.with_batch_commit();
+        let batch = txn3.with_manifest_commit();
 
         let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
         leaf1.add_files(

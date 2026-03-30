@@ -9,11 +9,9 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
-     get_log_checkpoint_action_schema,
-     CheckpointAction,
+    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
+    CommitInfo, ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
@@ -648,17 +646,20 @@ impl<S> Transaction<S> {
             // Determine starting row ID for row tracking in the content tree.
             // Use the batch state's cursor (which was advanced by leaf writes) if available,
             // otherwise read the HWM from the snapshot.
-            let starting_first_row_id =
-                match self.batch_state.as_ref().and_then(|b| b.row_id_cursor) {
-                    Some(c) => c,
-                    None => {
-                        let hwm = RowTrackingDomainMetadata::get_high_water_mark(
-                            &self.read_snapshot,
-                            engine,
-                        )?;
-                        hwm.unwrap_or(-1) + 1
-                    }
-                };
+            let starting_first_row_id = match self
+                .manifest_commit_state
+                .as_ref()
+                .and_then(|b| b.row_id_cursor)
+            {
+                Some(c) => c,
+                None => {
+                    let hwm = RowTrackingDomainMetadata::get_high_water_mark(
+                        &self.read_snapshot,
+                        engine,
+                    )?;
+                    hwm.unwrap_or(-1) + 1
+                }
+            };
 
             let (new_metadata, next_row_id) =
                 metadata_builder.build(engine, snapshot_id, starting_first_row_id)?;

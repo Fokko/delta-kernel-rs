@@ -11,18 +11,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
-
-use itertools::Itertools;
-use object_store::path::Path;
-use object_store::ObjectStore;
-use rstest::rstest;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
@@ -107,7 +101,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
         .with_data_change(true);
 
     if use_batch_commit {
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
     }
 
     let data = RecordBatch::try_new(
@@ -208,7 +202,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
         .with_data_change(true);
 
     if use_batch_commit {
-        txn2.with_batch_commit();
+        txn2.with_manifest_commit();
     }
 
     let scan = snapshot2.scan_builder().build()?;

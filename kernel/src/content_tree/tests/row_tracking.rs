@@ -55,7 +55,7 @@ fn make_data_entry(
 #[test]
 fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
@@ -103,7 +103,7 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
 #[test]
 fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
@@ -153,7 +153,7 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
 #[test]
 fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
@@ -207,7 +207,7 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
         ManifestStats, TrackingInfo, TrackingStatus,
     };
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
@@ -306,7 +306,7 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
 #[test]
 fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());

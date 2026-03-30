@@ -2400,6 +2400,8 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             parsed_actions.len(),
             3,
             "Expected commitInfo, domainMetadata, and contentRoot actions, got {}. Actions: {:?}",
+            parsed_actions.len(),
+            parsed_actions,
         );
         assert!(parsed_actions[0].get("commitInfo").is_some());
         assert!(
