@@ -24,6 +24,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::expressions::StructData;
+use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -125,41 +126,6 @@ pub(crate) fn extract_deletion_vector_content(
         size_in_bytes: dv.size_in_bytes as i64 + 8,
         cardinality: dv.cardinality,
     })
-}
-
-/// Extracts record_count from content_stats by finding the first column's value_count.
-///
-/// In the content_stats format, each column has a stats struct containing value_count,
-/// which represents the number of records in the file. This value is the same for all
-/// columns in a properly formed stats struct.
-///
-/// # Arguments
-/// * `content_stats` - Optional reference to the content_stats StructData
-///
-/// # Returns
-/// The record count (value_count from the first column's stats), or 0 if not available.
-fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
-    use crate::expressions::Scalar;
-
-    let Some(stats) = content_stats else {
-        return 0;
-    };
-
-    // Iterate through the columns to find the first one with value_count
-    for value in stats.values() {
-        if let Scalar::Struct(column_stats) = value {
-            // Look for value_count field in the column's stats struct
-            for (field, field_value) in column_stats.fields().iter().zip(column_stats.values()) {
-                if field.name() == crate::content_tree::VALUE_COUNT {
-                    if let Scalar::Long(count) = field_value {
-                        return *count;
-                    }
-                }
-            }
-        }
-    }
-
-    0
 }
 
 /// Cache for DV bitmaps with lazy deserialization
@@ -493,59 +459,28 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    /// Add a data file entry, deduplicating by file path.
-    ///
-    /// Accepts pre-computed content_stats directly as a [`StructData`], avoiding the need
-    /// to serialize/deserialize JSON stats.
-    ///
-    /// # Arguments
-    /// * `path` - The file path (relative to table root)
-    /// * `size` - The file size in bytes
-    /// * `content_stats` - Optional content_stats as StructData
-    /// * `version` - The version to use for tracking info
-    /// * `snapshot_id` - The snapshot ID for tracking info
-    /// * `dv_info` - Optional deletion vector info
-    pub(crate) fn add_file(
-        &mut self,
-        path: String,
-        size: i64,
-        content_stats: Option<StructData>,
-        version: Version,
-        snapshot_id: i64,
-        dv_info: Option<DvInfo>,
-    ) -> DeltaResult<()> {
-        // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(path.clone()) {
-            // Already seen this file path - skip it
-            return Ok(());
-        }
-
-        // Extract record_count from the content_stats (from any column's value_count)
-        let record_count = extract_record_count_from_stats(content_stats.as_ref());
-
-        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-            .location(path)
-            .with_tracking(version, self.version, snapshot_id)
-            .dv_info_opt(dv_info)
-            .record_count(record_count)
-            .file_size_in_bytes(size)
-            .content_stats_opt(content_stats)
-            .build();
-
-        self.pending_entries.push(data_file_entry);
-        Ok(())
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
+        self.add_with_dedup(add, version, snapshot_id)
     }
 
-    /// Add an entry from an [`Add`] action, deduplicating by file path.
-    ///
-    /// Extracts deletion vector content, parses and converts stats from the `Add` action,
-    /// then delegates to [`add_file`](Self::add_file).
+    /// Add an entry with deduplication.
     ///
     /// # Arguments
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
+    pub(crate) fn add_with_dedup(
+        &mut self,
+        add: Add,
+        version: Version,
+        snapshot_id: i64,
+    ) -> DeltaResult<()> {
+        // Check for duplicates and skip if already seen
+        if !self.values_seen.insert(add.path.clone()) {
+            // Already seen this file path - skip it
+            return Ok(());
+        }
+
         // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
@@ -565,7 +500,12 @@ impl ContentTreeNodeBuilder {
         // Merge partition values into content_stats. Delta JSON stats only cover data columns;
         // partition column values live in add.partitionValues and need to be recorded as
         // constant-value statistics in the AMT content_stats.
-        let record_count = extract_record_count_from_stats(content_stats.as_ref());
+        let record_count = add
+            .stats
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Stats>(s).ok())
+            .map(|s| s.num_records as i64)
+            .unwrap_or(0);
         let content_stats = merge_partition_values_into_stats(
             content_stats,
             &add.partition_values,
@@ -573,14 +513,16 @@ impl ContentTreeNodeBuilder {
             Some(record_count),
         )?;
 
-        self.add_file(
-            add.path,
-            add.size,
-            content_stats,
-            version,
-            snapshot_id,
-            dv_content,
-        )
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(add.path)
+            .with_tracking(version, self.version, snapshot_id)
+            .dv_info_opt(dv_content)
+            .record_count(record_count)
+            .file_size_in_bytes(add.size)
+            .content_stats_opt(content_stats)
+            .build();
+        self.pending_entries.push(entry);
+        Ok(())
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
@@ -779,40 +721,6 @@ impl ContentTreeNodeBuilder {
         };
 
         Ok((transformed, aggregates))
-    }
-
-    /// Adds file metadata from scan row format `EngineData` to the metadata.
-    ///
-    /// This method is designed for scenarios where the data comes from a scan operation
-    /// and has the scan row schema format (path, size, modificationTime, stats at top level,
-    /// with fileConstantValues.partitionValues nested).
-    ///
-    /// # Arguments
-    /// * `engine_data` - The engine data containing scan row records to extract and add
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error visiting the engine data
-    pub(crate) fn add_from_scan_row_data(
-        &mut self,
-        engine_data: &dyn EngineData,
-        version: Version,
-        snapshot_id: i64,
-    ) -> Result<(), crate::Error> {
-        let mut visitor = ScanRowToAddVisitor {
-            adds: vec![],
-            selection_vector: vec![],
-            row_offset: 0,
-        };
-        visitor.visit_rows_of(engine_data)?;
-
-        for add in visitor.adds {
-            self.add(add, version, snapshot_id)?;
-        }
-
-        Ok(())
     }
 
     /// Adds a raw ContentTreeNodeEntry to the builder.
@@ -1848,148 +1756,15 @@ impl RowVisitor for DecodedDvVisitor {
     }
 }
 
-/// Visitor that extracts Add-like data from scan row schema.
+/// Applies delta log Add and Remove actions from ascending commit files onto a
+/// [`ContentTreeNodeBuilder`], rolling up the incremental changes into the new root manifest.
 ///
-/// The scan row schema has a different structure than the log Add action schema:
-/// - path (direct, not nested under "add")
-/// - size (direct)
-/// - modificationTime (direct)
-/// - stats (direct)
-/// - fileConstantValues.partitionValues (nested)
-/// - deletionVector (nested)
+/// Commits are processed in **ascending** version order (oldest first). Remove actions within each
+/// commit are applied before Add actions so that a remove-then-re-add pair (e.g. a DV update)
+/// correctly replaces the old entry before the re-add is recorded.
 ///
-/// This visitor extracts these fields and constructs Add structs.
-#[derive(Default)]
-struct ScanRowToAddVisitor {
-    pub adds: Vec<Add>,
-    /// Selection vector controlling which rows to process. Empty means all rows selected.
-    selection_vector: Vec<bool>,
-    /// Running row offset across multiple `visit()` calls (for multi-batch inputs).
-    row_offset: usize,
-}
-
-impl RowVisitor for ScanRowToAddVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType};
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("path"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats"),
-                column_name!("deletionVector.storageType"),
-                column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("deletionVector.offset"),
-                column_name!("deletionVector.sizeInBytes"),
-                column_name!("deletionVector.cardinality"),
-                column_name!("fileConstantValues.partitionValues"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::STRING,  // deletionVector.storageType
-                DataType::STRING,  // deletionVector.pathOrInlineDv
-                DataType::INTEGER, // deletionVector.offset
-                DataType::INTEGER, // deletionVector.sizeInBytes
-                DataType::LONG,    // deletionVector.cardinality
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::STRING,
-                DataType::LONG,
-            ];
-            (names, types).into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        use crate::actions::deletion_vector::{
-            DeletionVectorDescriptor, DeletionVectorStorageType,
-        };
-
-        for i in 0..row_count {
-            let global_i = self.row_offset + i;
-            if global_i < self.selection_vector.len() && !self.selection_vector[global_i] {
-                continue;
-            }
-
-            if let Some(path) = getters[0].get_opt(i, "scanRow.path")? {
-                let size: i64 = getters[1].get(i, "scanRow.size")?;
-                let modification_time: i64 = getters[2].get(i, "scanRow.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(i, "scanRow.stats")?;
-
-                let storage_type_str_opt: Option<String> =
-                    getters[4].get_opt(i, "scanRow.deletionVector.storageType")?;
-                let deletion_vector = if let Some(storage_type_str) = storage_type_str_opt {
-                    let storage_type: DeletionVectorStorageType = storage_type_str.parse()?;
-                    let path_or_inline_dv: String =
-                        getters[5].get(i, "scanRow.deletionVector.pathOrInlineDv")?;
-                    let offset: Option<i32> =
-                        getters[6].get_opt(i, "scanRow.deletionVector.offset")?;
-                    let size_in_bytes: i32 =
-                        getters[7].get(i, "scanRow.deletionVector.sizeInBytes")?;
-                    let cardinality: i64 =
-                        getters[8].get(i, "scanRow.deletionVector.cardinality")?;
-
-                    Some(DeletionVectorDescriptor {
-                        storage_type,
-                        path_or_inline_dv,
-                        offset,
-                        size_in_bytes,
-                        cardinality,
-                    })
-                } else {
-                    None
-                };
-
-                let partition_values: HashMap<String, String> = getters[9]
-                    .get_opt(i, "scanRow.fileConstantValues.partitionValues")?
-                    .unwrap_or_default();
-
-                let data_manifest_path: Option<String> =
-                    getters[10].get_opt(i, "scanRow.fileConstantValues.dataManifestPath")?;
-                let data_manifest_position: Option<i64> =
-                    getters[11].get_opt(i, "scanRow.fileConstantValues.dataManifestPosition")?;
-
-                let add = Add {
-                    path,
-                    partition_values,
-                    size,
-                    modification_time,
-                    data_change: true,
-                    stats,
-                    tags: None,
-                    deletion_vector,
-                    base_row_id: None,
-                    default_row_commit_version: None,
-                    clustering_provider: None,
-                    data_manifest_path,
-                    data_manifest_position,
-                };
-                self.adds.push(add);
-            }
-        }
-        self.row_offset += row_count;
-        Ok(())
-    }
-}
-
-/// Replays Add and Remove actions from delta log commit files onto a [`ContentTreeNodeBuilder`].
-///
-/// Used during AMT batch commits to incorporate incremental changes (commits strictly after the
-/// existing content root version) into the new root manifest.
-///
-/// Commit files are processed in ascending version order so that `sequence_number` is stamped
-/// with the actual commit version of each file's last change. Removes are applied before Adds
-/// within each commit so that a remove-then-re-add pair (e.g. a DV update) correctly clears the
-/// deduplication state before the new entry is recorded.
+/// This type implements [`LogReplayProcessor`] with `Output = ()` because the builder state
+/// mutation is the effect — no per-batch output needs to be returned to the caller.
 pub(crate) struct ContentTreeLogApplier<'a> {
     builder: &'a mut ContentTreeNodeBuilder,
     snapshot_id: i64,
@@ -3909,6 +3684,7 @@ mod tests {
         Ok(())
     }
 
+    /// Helper that creates a minimal Add action for unit tests.
     fn make_test_add(path: &str) -> Add {
         Add {
             path: path.to_string(),
