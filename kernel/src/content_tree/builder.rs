@@ -468,7 +468,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// Skips `add` if its path was already added (path-only deduplication). This is a simpler
     /// deduplication than the spec-correct `(path, dv_location)` keying used by
-    /// [`AmtLogReplayProcessor`] and is appropriate when building a content tree from a flat
+    /// [`ContentRootRebuildProcessor`] and is appropriate when building a content tree from a flat
     /// file list where each path appears at most once.
     ///
     /// # Arguments
@@ -1742,7 +1742,7 @@ struct LeafRemove {
 /// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
 /// accumulated in [`leaf_removes`](Self::drain_leaf_removes) for a post-replay pass that applies
 /// them via [`ContentTreeNodeBuilder::delete_multiple_from_leaf`].
-pub(crate) struct AmtLogReplayProcessor {
+pub(crate) struct ContentRootRebuildProcessor {
     snapshot_id: i64,
     /// Version of the new commit being built. Used to stamp `sequence_number` on emitted entries.
     batch_commit_version: Version,
@@ -1751,7 +1751,7 @@ pub(crate) struct AmtLogReplayProcessor {
     leaf_removes: Vec<LeafRemove>,
 }
 
-impl AmtLogReplayProcessor {
+impl ContentRootRebuildProcessor {
     /// Creates a new processor.
     ///
     /// # Parameters
@@ -1779,9 +1779,9 @@ impl AmtLogReplayProcessor {
     /// Remove actions mark the file key as seen. Add actions that are first-seen emit a new
     /// [`ContentTreeNodeEntry`] with tracking stamped from the batch version.
     fn process_log_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let version = batch
-            .version
-            .ok_or_else(|| Error::generic("AmtLogReplayProcessor: log batch is missing version"))?;
+        let version = batch.version.ok_or_else(|| {
+            Error::generic("ContentRootRebuildProcessor: log batch is missing version")
+        })?;
 
         let mut add_visitor = AddVisitor::default();
         let mut remove_visitor = RemoveVisitor::default();
@@ -1900,14 +1900,14 @@ impl AmtLogReplayProcessor {
         Ok(entries)
     }
 
-    /// Consumes the processor and returns leaf manifest removals grouped by leaf path.
+    /// Drains accumulated leaf manifest removals, grouped by leaf path.
     ///
     /// The caller must apply these removals via
     /// [`ContentTreeNodeBuilder::delete_multiple_from_leaf`] after populating the builder with
     /// the emitted entries.
-    pub(crate) fn drain_leaf_removes(self) -> HashMap<String, roaring::RoaringTreemap> {
+    pub(crate) fn drain_leaf_removes(&mut self) -> HashMap<String, roaring::RoaringTreemap> {
         let mut result: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-        for lr in self.leaf_removes {
+        for lr in self.leaf_removes.drain(..) {
             result
                 .entry(lr.leaf_path)
                 .or_default()
@@ -1917,7 +1917,7 @@ impl AmtLogReplayProcessor {
     }
 }
 
-impl LogReplayProcessor for AmtLogReplayProcessor {
+impl LogReplayProcessor for ContentRootRebuildProcessor {
     type Output = Vec<ContentTreeNodeEntry>;
 
     fn process_actions_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Self::Output> {
@@ -1932,7 +1932,6 @@ impl LogReplayProcessor for AmtLogReplayProcessor {
         None
     }
 }
-
 
 #[cfg(test)]
 mod tests {
