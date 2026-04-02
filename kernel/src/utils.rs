@@ -121,7 +121,7 @@ pub(crate) mod test_utils {
     use url::Url;
 
     use crate::actions::{
-        get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
+        get_all_actions_schema, Add, Cdc, CheckpointAction, CommitInfo, Metadata, Protocol, Remove,
     };
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -153,6 +153,8 @@ pub(crate) mod test_utils {
         #[allow(unused)]
         #[serde(rename = "commitInfo")]
         CommitInfo(CommitInfo),
+        #[serde(rename = "checkpoint")]
+        Checkpoint(CheckpointAction),
     }
 
     use crate::schema::{

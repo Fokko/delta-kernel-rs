@@ -221,14 +221,19 @@ impl LogReplayScanner {
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
-            let metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            let has_metadata_update = metadata_opt.is_some();
-            let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            let has_protocol_update = protocol_opt.is_some();
+            let mut metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            let mut protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
             // TODO: disable checkpoint action if reader feature is disabled. We should look into
-            // validating that checkpoint action version is after the feature option was enabled but
-            // that may be too expensive here.
+            // validating that checkpoint action version is after the feature option was enabled
+            // but that may be too expensive here.
+
+            // Extract nested P+M from checkpoint action if top-level ones were not found.
+            if let Some(ref ca) = checkpoint_action_opt {
+                ca.fill_missing_pm(&mut protocol_opt, &mut metadata_opt);
+            }
+            let has_metadata_update = metadata_opt.is_some();
+            let has_protocol_update = protocol_opt.is_some();
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;

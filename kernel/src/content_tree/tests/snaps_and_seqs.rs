@@ -6,7 +6,7 @@
 //! then read back into a fresh builder via `from_content_root`, mirroring the
 //! production round-trip.
 
-use crate::actions::{Add, CheckpointAction, ContentRoot};
+use crate::actions::{Add, CheckpointAction, ContentRoot, Metadata, Protocol};
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
@@ -65,6 +65,16 @@ fn make_checkpoint_action(path: String, version: Version) -> CheckpointAction {
             path,
             size_in_bytes: 0,
         },
+        protocol: Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap(),
+        meta_data: Metadata::try_new(
+            None,
+            None,
+            std::sync::Arc::new(crate::schema::StructType::new_unchecked([])),
+            vec![],
+            0,
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
     }
 }
 

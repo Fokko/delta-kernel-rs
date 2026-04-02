@@ -684,16 +684,24 @@ impl<S> Transaction<S> {
                 self.read_snapshot.table_root(),
             )?;
 
-            // The checkpoint action represents the state at the new commit version.
+            // Invariant: the checkpoint action's nested P+M must reflect the table state
+            // at checkpoint.version. Currently checkpoint.version == commit_version, and
+            // manifest commits have no API to change P+M, so read_snapshot P+M (at N-1)
+            // equals commit P+M (at N). When P+M mutation is added to manifest commits,
+            // the resolved (post-mutation) P+M must be used here instead.
+            //
             // wrapping_add handles the CREATE TABLE case where read_snapshot.version()
             // is PRE_COMMIT_VERSION (u64::MAX), which wraps to 0 (the first commit).
             let new_commit_version = self.read_snapshot.version().wrapping_add(1);
+            let table_config = self.read_snapshot.table_configuration();
             let checkpoint_action = CheckpointAction {
                 version: new_commit_version,
                 content_root: ContentRoot {
                     path,
                     size_in_bytes,
                 },
+                protocol: table_config.protocol().clone(),
+                meta_data: table_config.metadata().clone(),
             };
 
             // Use the log schema to wrap CheckpointAction in a "checkpoint" field
@@ -1682,10 +1690,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
-        ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+        ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        StructArray,
     };
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
@@ -1693,13 +1702,16 @@ mod tests {
     };
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
+    use crate::content_tree::builder::ContentTreeNodeBuilder;
+    use crate::content_tree::writer::ContentTreeNodeWriter;
+    use crate::content_tree::{ContentTreeNode, DataContentType};
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::{MapData, Scalar};
     use crate::object_store::local::LocalFileSystem;
-    use crate::schema::MapType;
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, MapType, MetadataValue};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
@@ -1708,8 +1720,12 @@ mod tests {
     };
     use crate::EvaluationHandler;
     use crate::Snapshot;
+    use roaring::RoaringTreemap;
     use rstest::rstest;
+    use serde_json::{json, Value};
+    use std::fs::{create_dir_all, read_dir, read_to_string, write};
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     /// Helper function to create a logical test table schema with column mapping metadata.
     /// This returns the logical schema (with delta.columnMapping.* metadata).
@@ -1804,9 +1820,6 @@ mod tests {
 
     /// Creates a test deletion vector descriptor with default values (the DV might not exist on disk)
     fn create_test_dv_descriptor(path_suffix: &str) -> DeletionVectorDescriptor {
-        use crate::actions::deletion_vector::{
-            DeletionVectorDescriptor, DeletionVectorStorageType,
-        };
         DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: format!("dv_{path_suffix}"),
@@ -2325,10 +2338,6 @@ mod tests {
     /// * `table_root` - The table root URL
     /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for manifest_commit/content metadata trees)
     fn create_initial_table(table_root: &Url, enable_column_mapping: bool) -> DeltaResult<()> {
-        use serde_json::json;
-        use std::fs::{create_dir_all, write};
-        use uuid::Uuid;
-
         let table_id = Uuid::new_v4().to_string();
 
         // Schema with or without column mapping metadata
@@ -2418,14 +2427,35 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to write a checkpoint action to a specific version
+    /// Helper to write a checkpoint action to a specific version.
+    ///
+    /// Reads the v0 commit to extract the real protocol and metadata so the checkpoint
+    /// action's nested P+M match the table's actual state.
     fn write_checkpoint_action(
         table_root: &Url,
         content_root_path: &str,
         version: u64,
     ) -> DeltaResult<()> {
-        use serde_json::json;
-        use std::fs::write;
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        // Read v0 commit to extract the real protocol and metadata JSON
+        let v0_content = read_to_string(delta_log_path.join("00000000000000000000.json"))
+            .map_err(|e| Error::generic(format!("Failed to read v0 commit: {e}")))?;
+
+        let mut protocol_json = None;
+        let mut metadata_json = None;
+        for line in v0_content.lines() {
+            let parsed: Value = serde_json::from_str(line)?;
+            if let Some(p) = parsed.get("protocol") {
+                protocol_json = Some(p.clone());
+            }
+            if let Some(m) = parsed.get("metaData") {
+                metadata_json = Some(m.clone());
+            }
+        }
 
         let checkpoint_action = json!({
             "checkpoint": {
@@ -2433,17 +2463,13 @@ mod tests {
                 "contentRoot": {
                     "path": content_root_path,
                     "sizeInBytes": 0
-                }
+                },
+                "protocol": protocol_json.expect("v0 commit must have protocol"),
+                "metaData": metadata_json.expect("v0 commit must have metadata"),
             }
         });
 
         let data = serde_json::to_vec(&checkpoint_action)?;
-
-        let delta_log_path = table_root
-            .join("_delta_log/")?
-            .to_file_path()
-            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
-
         let file_name = format!("{:020}.json", version);
         let file_path = delta_log_path.join(file_name);
         write(&file_path, data)
@@ -2483,14 +2509,8 @@ mod tests {
     /// by verifying through the Scan API that files are removed
     #[test]
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::committer::FileSystemCommitter;
-        use crate::content_tree::builder::ContentTreeNodeBuilder;
-        use crate::content_tree::writer::ContentTreeNodeWriter;
-        use crate::engine::sync::SyncEngine;
-        use tempfile::tempdir;
-
         let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
+        let temp_dir = tempfile::tempdir()?;
         // Canonicalize the path to match what try_parse_uri does in real usage
         // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
@@ -2586,14 +2606,8 @@ mod tests {
     /// them to the log as well would cause double-counting on replay.
     #[test]
     fn test_manifest_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::committer::FileSystemCommitter;
-        use crate::content_tree::builder::ContentTreeNodeBuilder;
-        use crate::content_tree::writer::ContentTreeNodeWriter;
-        use crate::engine::sync::SyncEngine;
-        use tempfile::tempdir;
-
         let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
+        let temp_dir = tempfile::tempdir()?;
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
@@ -2650,10 +2664,10 @@ mod tests {
             .join("_delta_log/")?
             .to_file_path()
             .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
-        let v2_log = std::fs::read_to_string(delta_log_path.join("00000000000000000002.json"))?;
+        let v2_log = read_to_string(delta_log_path.join("00000000000000000002.json"))?;
 
         for line in v2_log.lines() {
-            let json: serde_json::Value = serde_json::from_str(line)?;
+            let json: Value = serde_json::from_str(line)?;
             assert!(
                 json.get("remove").is_none(),
                 "manifest commit should not write remove actions to the delta log, but found: {line}"
@@ -2665,10 +2679,6 @@ mod tests {
 
     /// Helper to create an Add action with a deletion vector
     fn make_add_action_with_dv(path: String, dv_path: String) -> crate::actions::Add {
-        use crate::actions::deletion_vector::{
-            DeletionVectorDescriptor, DeletionVectorStorageType,
-        };
-
         crate::actions::Add {
             path,
             partition_values: Default::default(),
@@ -2695,15 +2705,8 @@ mod tests {
     /// Tests that removing files with deletion vectors in leaf manifests works properly
     #[test]
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::committer::FileSystemCommitter;
-        use crate::content_tree::builder::ContentTreeNodeBuilder;
-        use crate::content_tree::writer::ContentTreeNodeWriter;
-        use crate::content_tree::DataContentType;
-        use crate::engine::sync::SyncEngine;
-        use tempfile::tempdir;
-
         let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
+        let temp_dir = tempfile::tempdir()?;
         // Canonicalize the path to match what try_parse_uri does in real usage
         // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
@@ -2827,34 +2830,16 @@ mod tests {
         // Step 7: Verify the ManifestDV for the delete manifest
         // When delete_from_leaf is used, it creates a ManifestDV entry that marks which
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
-        use crate::content_tree::ContentTreeNode;
 
-        // Read the checkpoint action from version 2 to get the new manifest path
-        let delta_log_path = table_root
-            .join("_delta_log/")?
-            .to_file_path()
-            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
-        let v2_log_file = delta_log_path.join("00000000000000000002.json");
-        let v2_log_content = std::fs::read_to_string(&v2_log_file)
-            .map_err(|e| Error::generic(format!("Failed to read v2 log: {e}")))?;
+        // Load a fresh snapshot at v2 to get the checkpoint action through kernel APIs
+        let v2_snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert_eq!(v2_snapshot.version(), 2);
+        let ca = v2_snapshot
+            .checkpoint_action()
+            .expect("v2 snapshot must have a checkpoint action");
+        let content_root_path = ca.content_root.path.clone();
 
-        // Parse the checkpoint action to get the manifest path
-        let content_root_path: String = v2_log_content
-            .lines()
-            .find_map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("checkpoint")?
-                            .get("contentRoot")?
-                            .get("path")?
-                            .as_str()
-                            .map(String::from)
-                    })
-            })
-            .ok_or_else(|| Error::generic("No checkpoint action found in v2"))?;
-
-        // Read the root manifest (path is now relative, so join with table root)
+        // Read the root manifest (path is relative, so join with table root)
         let root_manifest_url = table_root
             .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
@@ -2904,7 +2889,6 @@ mod tests {
         }
 
         // Decode the roaring bitmap to verify the deleted index
-        use roaring::RoaringTreemap;
         let inline_content = manifest_dv_bytes;
         let deleted_indices =
             RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
@@ -2966,93 +2950,15 @@ mod tests {
 
     #[test]
     fn test_content_root_version_matches_commit() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
-        use std::fs::read_dir;
-        use tempfile::tempdir;
-
         let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
+        let temp_dir = tempfile::tempdir()?;
         // Canonicalize the path to match what try_parse_uri does in real usage
         // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        // Step 1: Create initial table (v0) with Protocol + Metadata for checkpoint action support
-        // Create a table with metadataTree-experimental feature and column mapping
-        use serde_json::json;
-        use std::fs::{create_dir_all, write};
-        use uuid::Uuid;
-
-        let table_id = Uuid::new_v4().to_string();
-        let schema = json!({
-            "type": "struct",
-            "fields": [
-                {
-                    "name": "id",
-                    "type": "integer",
-                    "nullable": true,
-                    "metadata": {
-                        "PARQUET:field_id": 1,
-                        "delta.columnMapping.id": 1,
-                        "delta.columnMapping.physicalName": "id"
-                    }
-                },
-                {
-                    "name": "value",
-                    "type": "string",
-                    "nullable": true,
-                    "metadata": {
-                        "PARQUET:field_id": 2,
-                        "delta.columnMapping.id": 2,
-                        "delta.columnMapping.physicalName": "value"
-                    }
-                }
-            ]
-        });
-
-        let protocol = json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": ["columnMapping", "metadataTree-experimental"],
-                "writerFeatures": ["columnMapping", "metadataTree-experimental"]
-            }
-        });
-
-        let metadata = json!({
-            "metaData": {
-                "id": table_id,
-                "format": {
-                    "provider": "parquet",
-                    "options": {}
-                },
-                "schemaString": schema.to_string(),
-                "partitionColumns": [],
-                "configuration": {
-                    "delta.columnMapping.mode": "id"
-                },
-                "createdTime": 1677811175819u64
-            }
-        });
-
-        let data = [
-            serde_json::to_vec(&protocol)?,
-            b"\n".to_vec(),
-            serde_json::to_vec(&metadata)?,
-        ]
-        .concat();
-
-        let delta_log_path = table_root
-            .join("_delta_log/")?
-            .to_file_path()
-            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
-
-        create_dir_all(&delta_log_path)
-            .map_err(|e| Error::generic(format!("Failed to create _delta_log: {e}")))?;
-
-        let file_path = delta_log_path.join("00000000000000000000.json");
-        write(&file_path, data)
-            .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
+        // Step 1: Create initial table (v0) with metadataTree-experimental + column mapping
+        create_initial_table(&table_root, true)?;
 
         // Step 2: Create snapshot and transaction in manifest_commit mode
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -3243,64 +3149,40 @@ mod tests {
             "Root manifest at version 1 should exist: 00000000000000000001.content.parquet"
         );
 
-        // Step 9: Validate that the checkpoint action points to the correct root manifest
-        use serde_json::Value;
-        use std::fs::read_to_string;
+        // Step 9: Validate the checkpoint action through kernel APIs
+        let v1_snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert_eq!(v1_snapshot.version(), 1);
+        let ca = v1_snapshot
+            .checkpoint_action()
+            .expect("v1 snapshot must have a checkpoint action");
 
-        let commit_1_path = delta_log_path.join("00000000000000000001.json");
-        let commit_content = read_to_string(&commit_1_path)?;
-
-        // Parse each line as JSON and find the checkpoint action
-        let mut found_checkpoint_action = false;
-        for line in commit_content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let action: Value = serde_json::from_str(line)?;
-            if let Some(checkpoint) = action.get("checkpoint") {
-                let content_root = checkpoint
-                    .get("contentRoot")
-                    .expect("checkpoint should have contentRoot");
-                if let Some(path) = content_root.get("path").and_then(|p| p.as_str()) {
-                    // The path should reference the version 1 root manifest
-                    assert!(
-                        path.contains("00000000000000000001.content.parquet"),
-                        "Checkpoint action should reference version 1 root manifest, got: {}",
-                        path
-                    );
-
-                    // sizeInBytes should match the actual file size on disk
-                    let reported_size = content_root
-                        .get("sizeInBytes")
-                        .and_then(|s| s.as_u64())
-                        .expect("checkpoint contentRoot sizeInBytes should be present");
-                    let manifest_file = table_root
-                        .join(path)
-                        .expect("should join path")
-                        .to_file_path()
-                        .expect("should be a local path");
-                    let disk_size = manifest_file
-                        .metadata()
-                        .expect("manifest file should exist")
-                        .len();
-                    assert!(
-                        reported_size > 0,
-                        "Checkpoint contentRoot sizeInBytes should be non-zero"
-                    );
-                    assert_eq!(
-                        reported_size, disk_size,
-                        "Checkpoint contentRoot sizeInBytes should match actual file size"
-                    );
-
-                    found_checkpoint_action = true;
-                    break;
-                }
-            }
-        }
-
+        // The content root path should reference the version 1 root manifest
         assert!(
-            found_checkpoint_action,
-            "Checkpoint action should exist in version 1 commit"
+            ca.content_root
+                .path
+                .contains("00000000000000000001.content.parquet"),
+            "Checkpoint action should reference version 1 root manifest, got: {}",
+            ca.content_root.path
+        );
+
+        // sizeInBytes should match the actual file size on disk
+        let reported_size = ca.content_root.size_in_bytes;
+        let manifest_file = table_root
+            .join(&ca.content_root.path)
+            .expect("should join path")
+            .to_file_path()
+            .expect("should be a local path");
+        let disk_size = manifest_file
+            .metadata()
+            .expect("manifest file should exist")
+            .len();
+        assert!(
+            reported_size > 0,
+            "Checkpoint contentRoot sizeInBytes should be non-zero"
+        );
+        assert_eq!(
+            reported_size, disk_size,
+            "Checkpoint contentRoot sizeInBytes should match actual file size"
         );
 
         Ok(())
@@ -3506,7 +3388,6 @@ mod tests {
         #[case] expected_cols: usize,
         #[case] expected_partition_cols: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::Float64Array;
         let (_snap, wc) = snapshot_and_write_context(table_path)?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
@@ -3786,20 +3667,12 @@ mod tests {
     /// Test that icebergNativeV4 forces manifest commit without explicit with_manifest_commit()
     #[test]
     fn test_iceberg_native_v4_forces_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
-        use crate::expressions::{MapData, Scalar};
-        use tempfile::tempdir;
-
         let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
+        let temp_dir = tempfile::tempdir()?;
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Create a table with icebergNativeV4 (and its dependencies) in the protocol
-        use serde_json::json;
-        use std::fs::{create_dir_all, write};
-        use uuid::Uuid;
-
         let table_id = Uuid::new_v4().to_string();
         let schema = json!({
             "type": "struct",
@@ -3897,6 +3770,94 @@ mod tests {
             txn.is_manifest_commit(),
             "icebergNativeV4 should force manifest commit even without with_manifest_commit()"
         );
+
+        Ok(())
+    }
+
+    /// Helper to write a normal (non-manifest) add action commit as a JSON file.
+    fn write_add_action_commit(table_root: &Url, version: u64, file_path: &str) -> DeltaResult<()> {
+        let add = json!({
+            "add": {
+                "path": file_path,
+                "partitionValues": {},
+                "size": 1024,
+                "modificationTime": 1677811178336u64,
+                "dataChange": true
+            }
+        });
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        let file_name = format!("{:020}.json", version);
+        write(delta_log_path.join(file_name), serde_json::to_vec(&add)?)
+            .map_err(|e| Error::generic(format!("Failed to write add commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Verifies that a manifest commit produces a checkpoint action with correct nested P+M,
+    /// and that loading a fresh snapshot recovers matching protocol, metadata, and version.
+    #[test]
+    fn test_manifest_commit_pm_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // v0: create table with metadataTree-experimental + columnMapping
+        create_initial_table(&table_root, true)?;
+
+        // v1: checkpoint action with one data file
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+        builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
+        let root_metadata = builder.build(&engine, 1)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+            .write(&engine)?
+            .location;
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
+
+        // v2: normal add commit
+        write_add_action_commit(&table_root, 2, "data/incremental-file.parquet")?;
+
+        // v3: manifest commit
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot.transaction(committer, &engine)?;
+        txn.with_manifest_commit();
+        match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(_) => {}
+            other => panic!("Expected committed transaction, got {:?}", other),
+        };
+
+        // Load a fresh snapshot at v3 and verify P+M round-trip
+        let fresh = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert_eq!(fresh.version(), 3);
+
+        let fresh_config = fresh.table_configuration();
+        let fresh_protocol = fresh_config.protocol();
+        let fresh_metadata = fresh_config.metadata();
+
+        // Protocol must match what the table was created with
+        assert_eq!(fresh_protocol.min_reader_version(), 3);
+        assert_eq!(fresh_protocol.min_writer_version(), 7);
+        assert!(
+            fresh_protocol.has_reader_feature(&crate::table_features::TableFeature::ColumnMapping)
+        );
+        assert!(fresh_protocol
+            .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental));
+
+        // Metadata id must be non-empty and stable
+        assert!(!fresh_metadata.id().is_empty());
+
+        // Checkpoint action's nested P+M must agree with the snapshot's top-level P+M
+        let ca = fresh
+            .checkpoint_action()
+            .expect("snapshot must have a checkpoint action");
+        assert_eq!(&ca.protocol, fresh_protocol);
+        assert_eq!(ca.meta_data.id(), fresh_metadata.id());
+        assert_eq!(ca.version, fresh.version());
 
         Ok(())
     }

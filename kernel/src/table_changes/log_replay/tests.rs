@@ -1,7 +1,9 @@
 use super::table_changes_action_iter;
 use super::TableChangesScanMetadata;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::actions::{
+    Add, Cdc, CheckpointAction, CommitInfo, ContentRoot, Metadata, Protocol, Remove,
+};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
 use crate::log_segment::LogSegment;
@@ -1323,5 +1325,66 @@ async fn test_timestamp_with_commit_info_not_first() {
     assert_result_error_with_message(
         result,
         "In-commit timestamp is enabled but not found in commit at version 0",
+    );
+}
+
+/// Verifies that the CDF log replay extracts Protocol and Metadata from a checkpoint action's
+/// nested fields when no top-level P+M is present (manifest commit scenario).
+#[tokio::test]
+async fn nested_pm_in_checkpoint_action_extracted_for_cdf() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    let protocol = Protocol::try_new(1, 4, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        get_schema(),
+        vec![],
+        0,
+        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+    )
+    .unwrap();
+
+    // v0: normal commit with top-level P+M and an add action
+    mock_table
+        .commit([
+            Action::Protocol(protocol.clone()),
+            Action::Metadata(metadata.clone()),
+            Action::Add(Add {
+                path: "file1.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    // v1: manifest commit -- only a checkpoint action with nested P+M, no top-level P+M.
+    // The CDF path must extract P+M from the checkpoint action via fill_missing_pm.
+    mock_table
+        .commit([
+            Action::Checkpoint(CheckpointAction {
+                version: 0,
+                content_root: ContentRoot {
+                    path: "fake_root_manifest.parquet".into(),
+                    size_in_bytes: 1024,
+                },
+                protocol,
+                meta_data: metadata,
+            }),
+            Action::Add(Add {
+                path: "file2.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    // Reading v0 to v1 should succeed -- fill_missing_pm extracts nested P+M
+    let result = execute_table_changes(engine, &mock_table, 0, Some(1));
+    assert!(
+        result.is_ok(),
+        "CDF should succeed when P+M are nested in checkpoint action: {:?}",
+        result.err()
     );
 }

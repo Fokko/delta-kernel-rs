@@ -14,8 +14,8 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
-    IntoEngineData, RowVisitor as _, Version,
+    DeltaResult, Engine, EngineData, Error, FileMeta, FileSize, IntoEngineData, RowVisitor as _,
+    Version,
 };
 
 use url::Url;
@@ -382,34 +382,41 @@ impl Metadata {
     }
 }
 
-// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
-// and create_one expects flattened values for nested schemas.
+impl TryFrom<Metadata> for Scalar {
+    type Error = Error;
+
+    fn try_from(metadata: Metadata) -> DeltaResult<Self> {
+        // TODO: Consider caching the schema via LazyLock (like the visitors do).
+        Ok(Scalar::Struct(StructData::try_new(
+            Metadata::to_schema().into_fields().collect(),
+            vec![
+                metadata.id.into(),
+                metadata.name.into(),
+                metadata.description.into(),
+                metadata.format.try_into()?,
+                metadata.schema_string.into(),
+                metadata.partition_columns.try_into()?,
+                metadata.created_time.into(),
+                metadata.configuration.try_into()?,
+            ],
+        )?))
+    }
+}
+
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
-        let values = [
-            self.id.into(),
-            self.name.into(),
-            self.description.into(),
-            self.format.provider.into(),
-            self.format.options.try_into()?,
-            self.schema_string.into(),
-            self.partition_columns.try_into()?,
-            self.created_time.into(),
-            self.configuration.try_into()?,
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
+        let scalar: Scalar = self.try_into()?;
+        engine
+            .evaluation_handler()
+            .create_many(schema, &[&[scalar]])
     }
 }
 
-#[derive(
-    Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
-)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -670,6 +677,35 @@ impl Protocol {
     }
 }
 
+impl TryFrom<Protocol> for Scalar {
+    type Error = Error;
+
+    fn try_from(protocol: Protocol) -> DeltaResult<Self> {
+        Ok(Scalar::Struct(StructData::try_new(
+            Protocol::to_schema().into_fields().collect(),
+            vec![
+                protocol.min_reader_version.into(),
+                protocol.min_writer_version.into(),
+                protocol.reader_features.try_into()?,
+                protocol.writer_features.try_into()?,
+            ],
+        )?))
+    }
+}
+
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let scalar: Scalar = self.try_into()?;
+        engine
+            .evaluation_handler()
+            .create_many(schema, &[&[scalar]])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
@@ -922,17 +958,31 @@ pub(crate) struct ContentRoot {
     pub(crate) size_in_bytes: FileSize,
 }
 
+impl TryFrom<ContentRoot> for Scalar {
+    type Error = Error;
+
+    fn try_from(cr: ContentRoot) -> DeltaResult<Self> {
+        Ok(Scalar::Struct(StructData::try_new(
+            ContentRoot::to_schema().into_fields().collect(),
+            vec![cr.path.into(), cr.size_in_bytes.into()],
+        )?))
+    }
+}
+
 /// The checkpoint action embeds V4 metadata tree state in a Delta log entry.
 ///
 /// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
 /// references a V4 root manifest file. The `version` field indicates the table version up to
-/// which the checkpoint is complete.
+/// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
+/// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
 /// JSON format:
 /// ```json
 /// { "checkpoint": {
 ///     "version": 42,
-///     "contentRoot": { "path": "...", "sizeInBytes": 1024 }
+///     "contentRoot": { "path": "...", "sizeInBytes": 1024 },
+///     "protocol": { ... },
+///     "metaData": { ... }
 /// } }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -948,6 +998,10 @@ pub(crate) struct CheckpointAction {
     pub(crate) version: Version,
     /// Reference to the V4 root manifest file.
     pub(crate) content_root: ContentRoot,
+    /// The table protocol at the checkpoint version.
+    pub(crate) protocol: Protocol,
+    /// The table metadata at the checkpoint version.
+    pub(crate) meta_data: Metadata,
 }
 
 impl CheckpointAction {
@@ -977,6 +1031,39 @@ impl CheckpointAction {
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
     }
+
+    /// Fill missing protocol and metadata from this checkpoint action's nested fields.
+    ///
+    /// Manifest commits embed P+M inside the checkpoint action. This extracts them when
+    /// they haven't been found as top-level actions.
+    pub(crate) fn fill_missing_pm(
+        &self,
+        protocol_opt: &mut Option<Protocol>,
+        metadata_opt: &mut Option<Metadata>,
+    ) {
+        if protocol_opt.is_none() {
+            *protocol_opt = Some(self.protocol.clone());
+        }
+        if metadata_opt.is_none() {
+            *metadata_opt = Some(self.meta_data.clone());
+        }
+    }
+}
+
+impl TryFrom<CheckpointAction> for Scalar {
+    type Error = Error;
+
+    fn try_from(ca: CheckpointAction) -> DeltaResult<Self> {
+        Ok(Scalar::Struct(StructData::try_new(
+            CheckpointAction::to_schema().into_fields().collect(),
+            vec![
+                ca.version.into(),
+                ca.content_root.try_into()?,
+                ca.protocol.try_into()?,
+                ca.meta_data.try_into()?,
+            ],
+        )?))
+    }
 }
 
 impl IntoEngineData for CheckpointAction {
@@ -985,13 +1072,10 @@ impl IntoEngineData for CheckpointAction {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.version.into(),
-            self.content_root.path.into(),
-            self.content_root.size_in_bytes.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
+        let scalar: Scalar = self.try_into()?;
+        engine
+            .evaluation_handler()
+            .create_many(schema, &[&[scalar]])
     }
 }
 
@@ -1181,8 +1265,8 @@ mod tests {
     use crate::{
         arrow::{
             array::{
-                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+                BooleanArray, Int64Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
+                StringBuilder,
             },
             datatypes::{DataType as ArrowDataType, Field, Schema},
             json::ReaderBuilder,
@@ -1978,25 +2062,28 @@ mod tests {
 
         // have to get the id since it's random
         let test_id = test_metadata.id.clone();
+        let metadata_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
         let actual = test_metadata
-            .into_engine_data(Metadata::to_schema().into(), &engine)
+            .into_engine_data(metadata_schema, &engine)
             .unwrap()
             .try_into_record_batch()
             .unwrap();
 
         let expected_json = json!({
-            "id": test_id,
-            "name": "test",
-            "description": "my table",
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
-            "partitionColumns": ["part"],
-            "createdTime": 123,
-            "configuration": {
-                "k": "v"
+            "metaData": {
+                "id": test_id,
+                "name": "test",
+                "description": "my table",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": ["part"],
+                "createdTime": 123,
+                "configuration": {
+                    "k": "v"
+                }
             }
         }).to_string();
         let expected = ReaderBuilder::new(actual.schema())
@@ -2070,99 +2157,29 @@ mod tests {
         )
         .unwrap();
 
-        let engine_data = protocol
-            .clone()
-            .into_engine_data(Protocol::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
-        let protocol_fields = vec![
-            Field::new("minReaderVersion", ArrowDataType::Int32, false),
-            Field::new("minWriterVersion", ArrowDataType::Int32, false),
-            Field::new(
-                "readerFeatures",
-                ArrowDataType::List(list_field.clone()),
-                true, // nullable
-            ),
-            Field::new(
-                "writerFeatures",
-                ArrowDataType::List(list_field.clone()),
-                true, // nullable
-            ),
-        ];
-        let schema = Arc::new(Schema::new(protocol_fields.clone()));
-
-        let string_builder = StringBuilder::new();
-        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
-        list_builder.values().append_value("deletionVectors");
-        list_builder.values().append_value("columnMapping");
-        list_builder.append(true);
-        let reader_features_array = list_builder.finish();
-
-        let string_builder = StringBuilder::new();
-        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
-        list_builder.values().append_value("deletionVectors");
-        list_builder.values().append_value("columnMapping");
-        list_builder.append(true);
-        let writer_features_array = list_builder.finish();
-
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![3])),
-                Arc::new(Int32Array::from(vec![7])),
-                Arc::new(reader_features_array.clone()),
-                Arc::new(writer_features_array.clone()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-
-        // test with the full log schema that wraps protocol in a "protocol" field
         let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
-        let engine_data = protocol.into_engine_data(commit_schema, &engine);
+        let actual = protocol
+            .into_engine_data(commit_schema, &engine)
+            .try_into_record_batch()
+            .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "protocol",
-            ArrowDataType::Struct(protocol_fields.into()),
-            true,
-        )]));
+        let expected_json = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors", "columnMapping"],
+                "writerFeatures": ["deletionVectors", "columnMapping"]
+            }
+        })
+        .to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
 
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StructArray::from(vec![
-                (
-                    Arc::new(Field::new("minReaderVersion", ArrowDataType::Int32, false)),
-                    Arc::new(Int32Array::from(vec![3])) as Arc<dyn Array>,
-                ),
-                (
-                    Arc::new(Field::new("minWriterVersion", ArrowDataType::Int32, false)),
-                    Arc::new(Int32Array::from(vec![7])) as Arc<dyn Array>,
-                ),
-                (
-                    Arc::new(Field::new(
-                        "readerFeatures",
-                        ArrowDataType::List(list_field.clone()),
-                        true,
-                    )),
-                    Arc::new(reader_features_array) as Arc<dyn Array>,
-                ),
-                (
-                    Arc::new(Field::new(
-                        "writerFeatures",
-                        ArrowDataType::List(list_field),
-                        true,
-                    )),
-                    Arc::new(writer_features_array) as Arc<dyn Array>,
-                ),
-            ]))],
-        )
-        .unwrap();
-
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        assert_eq!(record_batch, expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2171,29 +2188,29 @@ mod tests {
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
+        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let actual = protocol
+            .into_engine_data(commit_schema, &engine)
+            .try_into_record_batch()
             .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
 
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
+        let expected_json = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }
+        })
+        .to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
 
-        // reader/writer features are Some([]) lists
-        let reader_features_col = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(reader_features_col.len(), 1);
-        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
-        let writer_features_col = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(writer_features_col.len(), 1);
-        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2201,17 +2218,27 @@ mod tests {
         let engine = ExprEngine::new();
         let protocol = Protocol::try_new_legacy(1, 2).unwrap();
 
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
+        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let actual = protocol
+            .into_engine_data(commit_schema, &engine)
+            .try_into_record_batch()
             .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
 
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
+        let expected_json = json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 2
+            }
+        })
+        .to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
 
-        // reader/writer features are null
-        assert!(record_batch.column(2).is_null(0));
-        assert!(record_batch.column(3).is_null(0));
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2220,83 +2247,30 @@ mod tests {
             .project(&[CHECKPOINT_ACTION_NAME])
             .unwrap();
 
-        let expected = StructType::new_unchecked([StructField::nullable(
-            CHECKPOINT_ACTION_NAME,
-            StructType::new_unchecked([
-                StructField::not_null("version", DataType::LONG),
-                StructField::not_null(
-                    "contentRoot",
-                    StructType::new_unchecked([
-                        StructField::not_null("path", DataType::STRING),
-                        StructField::not_null("sizeInBytes", DataType::LONG),
-                    ]),
-                ),
-            ]),
-        )]);
-
-        assert_eq!(*schema, expected);
-    }
-
-    #[test]
-    fn test_checkpoint_action_into_engine_data_with_log_schema() {
-        use crate::arrow::array::AsArray;
-        use crate::engine::arrow_data::ArrowEngineData;
-
-        let engine = ExprEngine::new();
-
-        let checkpoint_action = CheckpointAction {
-            version: 1,
-            content_root: ContentRoot {
-                path: "s3://bucket/table/data.parquet".to_string(),
-                size_in_bytes: 1024,
-            },
+        let checkpoint_field = schema.field(CHECKPOINT_ACTION_NAME).unwrap();
+        assert!(checkpoint_field.is_nullable());
+        let inner = match checkpoint_field.data_type() {
+            DataType::Struct(s) => s,
+            other => panic!("Expected struct, got {:?}", other),
         };
+        let field_names: Vec<&str> = inner.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["version", "contentRoot", "protocol", "metaData"]
+        );
 
-        // Test with full log schema that wraps CheckpointAction in a "checkpoint" field
-        let log_schema = get_commit_schema()
-            .project(&[CHECKPOINT_ACTION_NAME])
-            .unwrap();
-        let engine_data = checkpoint_action
-            .into_engine_data(log_schema.clone(), &engine)
-            .unwrap();
+        // protocol and metaData are required (non-nullable) struct fields
+        let protocol_field = inner.field("protocol").unwrap();
+        assert!(!protocol_field.is_nullable());
+        assert!(matches!(protocol_field.data_type(), DataType::Struct(_)));
 
-        let record_batch: RecordBatch = engine_data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-
-        // Verify the structure has the checkpoint wrapper field
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 1); // checkpoint field
-
-        // Verify the checkpoint field contains the expected data
-        let checkpoint_array = record_batch.column(0).as_struct();
-        assert_eq!(checkpoint_array.num_columns(), 2); // version, contentRoot
-
-        // Verify the version field
-        let version_array = checkpoint_array
-            .column(0)
-            .as_primitive::<crate::arrow::datatypes::Int64Type>();
-        assert_eq!(version_array.value(0), 1);
-
-        // Verify the contentRoot struct
-        let content_root_array = checkpoint_array.column(1).as_struct();
-        assert_eq!(content_root_array.num_columns(), 2); // path, sizeInBytes
-
-        let path_array = content_root_array.column(0).as_string::<i32>();
-        assert_eq!(path_array.value(0), "s3://bucket/table/data.parquet");
-
-        let size_array = content_root_array
-            .column(1)
-            .as_primitive::<crate::arrow::datatypes::Int64Type>();
-        assert_eq!(size_array.value(0), 1024);
+        let metadata_field = inner.field("metaData").unwrap();
+        assert!(!metadata_field.is_nullable());
+        assert!(matches!(metadata_field.data_type(), DataType::Struct(_)));
     }
 
     #[test]
     fn test_checkpoint_action_with_log_schema() {
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let engine = ExprEngine::new();
 
         let checkpoint_action = CheckpointAction {
@@ -2305,19 +2279,28 @@ mod tests {
                 path: "s3://bucket/table/data.parquet".to_string(),
                 size_in_bytes: 1024,
             },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            meta_data: Metadata {
+                id: "test-id".to_string(),
+                name: None,
+                description: None,
+                format: Format {
+                    provider: "parquet".to_string(),
+                    options: HashMap::new(),
+                },
+                schema_string: r#"{"type":"struct","fields":[]}"#.to_string(),
+                partition_columns: vec![],
+                created_time: Some(1677811175819),
+                configuration: HashMap::new(),
+            },
         };
 
-        // Test with the full log schema that wraps CheckpointAction in a "checkpoint" field
-        let log_schema = get_commit_schema()
-            .project(&[CHECKPOINT_ACTION_NAME])
-            .unwrap();
-        let actual: RecordBatch = checkpoint_action
+        // Test with the write schema that includes all fields
+        let log_schema = get_log_checkpoint_action_schema().clone();
+        let actual = checkpoint_action
             .into_engine_data(log_schema, &engine)
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+            .try_into_record_batch()
+            .unwrap();
 
         let expected_json = json!({
             "checkpoint": {
@@ -2325,6 +2308,90 @@ mod tests {
                 "contentRoot": {
                     "path": "s3://bucket/table/data.parquet",
                     "sizeInBytes": 1024
+                },
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                },
+                "metaData": {
+                    "id": "test-id",
+                    "format": {
+                        "provider": "parquet",
+                        "options": {}
+                    },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "createdTime": 1677811175819i64,
+                    "configuration": {}
+                }
+            }
+        })
+        .to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_checkpoint_action_into_engine_data_with_populated_pm() {
+        let engine = ExprEngine::new();
+
+        let checkpoint_action = CheckpointAction {
+            version: 5,
+            content_root: ContentRoot {
+                path: "root.parquet".to_string(),
+                size_in_bytes: 2048,
+            },
+            protocol: Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
+            meta_data: Metadata {
+                id: "test-id".to_string(),
+                name: None,
+                description: None,
+                format: Format {
+                    provider: "parquet".to_string(),
+                    options: HashMap::new(),
+                },
+                schema_string: r#"{"type":"struct","fields":[]}"#.to_string(),
+                partition_columns: vec![],
+                created_time: Some(1677811175819),
+                configuration: HashMap::new(),
+            },
+        };
+
+        let log_schema = get_log_checkpoint_action_schema().clone();
+        let actual = checkpoint_action
+            .into_engine_data(log_schema, &engine)
+            .try_into_record_batch()
+            .unwrap();
+
+        let expected_json = json!({
+            "checkpoint": {
+                "version": 5,
+                "contentRoot": {
+                    "path": "root.parquet",
+                    "sizeInBytes": 2048
+                },
+                "protocol": {
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": [],
+                    "writerFeatures": []
+                },
+                "metaData": {
+                    "id": "test-id",
+                    "format": {
+                        "provider": "parquet",
+                        "options": {}
+                    },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "createdTime": 1677811175819i64,
+                    "configuration": {}
                 }
             }
         })

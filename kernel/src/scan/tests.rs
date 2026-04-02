@@ -733,6 +733,16 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         writer.write(engine.as_ref()).unwrap().location
     };
 
+    // Nested P+M suffix for checkpoint actions (must match commit0's P+M)
+    let checkpoint_pm = concat!(
+        r#","protocol":{"minReaderVersion":3,"minWriterVersion":7,"#,
+        r#""readerFeatures":["columnMapping","metadataTree-experimental"],"#,
+        r#""writerFeatures":["columnMapping","metadataTree-experimental"]},"#,
+        r#""metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"#,
+        r#""schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-value\"}}]}","#,
+        r#""partitionColumns":[],"configuration":{"delta.columnMapping.mode":"id"}}"#,
+    );
+
     // Create commit files: versions 1, 2, 3, 4, 5
     // Content root is at version 3, so we should only read commits 4 and 5
     for version in 1..=5 {
@@ -740,7 +750,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             // Version 3 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}{checkpoint_pm}}}}}"#,
                 version, version, content_root_url
             )
         } else {
@@ -1041,6 +1051,16 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         writer.write(engine.as_ref()).unwrap().location
     };
 
+    // Nested P+M suffix for checkpoint actions (must match commit0's P+M)
+    let checkpoint_pm = concat!(
+        r#","protocol":{"minReaderVersion":3,"minWriterVersion":7,"#,
+        r#""readerFeatures":["columnMapping","metadataTree-experimental"],"#,
+        r#""writerFeatures":["columnMapping","metadataTree-experimental"]},"#,
+        r#""metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"#,
+        r#""schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-value\"}}]}","#,
+        r#""partitionColumns":[],"configuration":{"delta.columnMapping.mode":"id"}}"#,
+    );
+
     // Create commit files: versions 1, 2, 5, 10, 15, 20
     // Content root is at version 10
     // Commits before version 10 should be ignored (0, 1, 2, 5, 10)
@@ -1051,7 +1071,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             // Version 10 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}{checkpoint_pm}}}}}"#,
                 version, version, content_root_url
             )
         } else {

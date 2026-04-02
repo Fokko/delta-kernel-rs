@@ -724,11 +724,15 @@ impl RowVisitor for CheckpointActionVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Getter count is derived from to_schema leaf count (via selected_column_names_and_types);
+        // this require! is a runtime safety net.
+        let expected = self.selected_column_names_and_types().1.len();
         require!(
-            getters.len() == 3,
+            getters.len() == expected,
             Error::internal_error(format!(
-                "Wrong number of CheckpointActionVisitor getters: {}",
-                getters.len()
+                "Wrong number of CheckpointActionVisitor getters: {} (expected {})",
+                getters.len(),
+                expected,
             ))
         );
         for i in 0..row_count {
@@ -741,24 +745,40 @@ impl RowVisitor for CheckpointActionVisitor {
     }
 }
 
+/// Schema-derived getter offsets for [`visit_checkpoint_action_at`].
+///
+/// Computes the starting indices for the protocol and metadata getter slices from the leaf
+/// counts of [`ContentRoot`] and [`Protocol`] schemas, rather than hardcoding the offsets.
+static CHECKPOINT_GETTER_OFFSETS: LazyLock<(usize, usize)> = LazyLock::new(|| {
+    let version_leaves = 1; // version is a single primitive leaf
+    let content_root_leaves = ContentRoot::to_schema().leaves(None).as_ref().1.len();
+    let protocol_leaves = Protocol::to_schema().leaves(None).as_ref().1.len();
+    let protocol_offset = version_leaves + content_root_leaves;
+    let metadata_offset = protocol_offset + protocol_leaves;
+    (protocol_offset, metadata_offset)
+});
+
 /// Extract a [`CheckpointAction`] from getters at the given row index.
 ///
-/// Getter layout (derived from `CheckpointAction::to_schema`):
-///   \[0\] version
-///   \[1\] contentRoot.path
-///   \[2\] contentRoot.sizeInBytes
+/// Getter layout is derived from `CheckpointAction::to_schema`:
+///   - version + contentRoot leaves (prefix)
+///   - protocol leaves
+///   - metaData leaves
+///
+/// The exact offsets between these groups are computed from schema leaf counts
+/// via `CHECKPOINT_GETTER_OFFSETS`, not hardcoded.
+///
+/// Protocol and metadata are extracted using [`visit_protocol_at`] and [`visit_metadata_at`],
+/// which validate their own slice lengths independently.
+/// Returns `None` if protocol or metadata are missing.
 #[internal_api]
 pub(crate) fn visit_checkpoint_action_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<CheckpointAction>> {
-    require!(
-        getters.len() == 3,
-        Error::InternalError(format!(
-            "Wrong number of CheckpointAction getters: {}",
-            getters.len()
-        ))
-    );
+    // No redundant length check here: visit_protocol_at and visit_metadata_at
+    // validate their own sub-slices. The caller (CheckpointActionVisitor::visit)
+    // validates the total count.
 
     let Some(version): Option<i64> = getters[0].get_opt(row_index, "checkpoint.version")? else {
         return Ok(None);
@@ -772,12 +792,24 @@ pub(crate) fn visit_checkpoint_action_at<'a>(
     else {
         return Ok(None);
     };
+
+    let (protocol_offset, metadata_offset) = *CHECKPOINT_GETTER_OFFSETS;
+    let Some(protocol) = visit_protocol_at(row_index, &getters[protocol_offset..metadata_offset])?
+    else {
+        return Ok(None);
+    };
+    let Some(meta_data) = visit_metadata_at(row_index, &getters[metadata_offset..])? else {
+        return Ok(None);
+    };
+
     Ok(Some(CheckpointAction {
         version: version as u64,
         content_root: ContentRoot {
             path: path.into(),
             size_in_bytes: size_in_bytes as u64,
         },
+        protocol,
+        meta_data,
     }))
 }
 
@@ -1410,7 +1442,12 @@ mod tests {
     fn test_parse_checkpoint_action() {
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177}}"#,
-            r#"{"checkpoint":{"version":3,"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345}}}"#,
+            concat!(
+                r#"{"checkpoint":{"version":3,"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345},"#,
+                r#""protocol":{"minReaderVersion":1,"minWriterVersion":2},"#,
+                r#""metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"#,
+                r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}}"#,
+            ),
             r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
         .into();
@@ -1451,11 +1488,18 @@ mod tests {
     #[test]
     fn test_parse_checkpoint_action_multiple_takes_first() {
         // Although multiple checkpoint actions shouldn't happen in practice, test that we take the first one
-        let json_strings: StringArray = vec![
-            r#"{"checkpoint":{"version":1,"contentRoot":{"path":"first.parquet","sizeInBytes":100}}}"#,
-            r#"{"checkpoint":{"version":2,"contentRoot":{"path":"second.parquet","sizeInBytes":200}}}"#,
-        ]
-        .into();
+        let pm_suffix = concat!(
+            r#""protocol":{"minReaderVersion":1,"minWriterVersion":2},"#,
+            r#""metaData":{"id":"id","format":{"provider":"parquet","options":{}},"#,
+            r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}"#,
+        );
+        let first = format!(
+            r#"{{"checkpoint":{{"version":1,"contentRoot":{{"path":"first.parquet","sizeInBytes":100}},{pm_suffix}}}}}"#
+        );
+        let second = format!(
+            r#"{{"checkpoint":{{"version":2,"contentRoot":{{"path":"second.parquet","sizeInBytes":200}},{pm_suffix}}}}}"#
+        );
+        let json_strings: StringArray = vec![first.as_str(), second.as_str()].into();
         let batch = parse_json_batch(json_strings);
 
         let mut visitor = CheckpointActionVisitor::default();
@@ -1492,5 +1536,28 @@ mod tests {
         visitor.visit_rows_of(batch.as_ref()).unwrap();
         assert_eq!(visitor.selection_vector, input);
         assert_eq!(visitor.num_filtered, expected_filtered);
+    }
+
+    #[test]
+    fn test_parse_checkpoint_action_with_nested_protocol_and_metadata() {
+        let json_strings: StringArray = vec![
+            r#"{"checkpoint":{"version":5,"contentRoot":{"path":"root.parquet","sizeInBytes":2048},"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping","metadataTree-experimental"],"writerFeatures":["columnMapping","metadataTree-experimental"]},"metaData":{"id":"test-table-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut visitor = CheckpointActionVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        let checkpoint = visitor
+            .checkpoint
+            .expect("Should have found checkpoint action");
+        assert_eq!(checkpoint.version, 5);
+        assert_eq!(checkpoint.content_root.path, "root.parquet");
+        assert_eq!(checkpoint.content_root.size_in_bytes, 2048);
+
+        assert_eq!(checkpoint.protocol.min_reader_version(), 3);
+        assert_eq!(checkpoint.protocol.min_writer_version(), 7);
+        assert_eq!(checkpoint.meta_data.id(), "test-table-id");
     }
 }

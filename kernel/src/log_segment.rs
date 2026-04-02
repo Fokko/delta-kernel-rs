@@ -1208,9 +1208,6 @@ impl LogSegment {
         existing_protocol: Option<&Protocol>,
         lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<CheckpointAction>)> {
-        // TODO: When CheckpointAction contains optional P+M, revisit checkpoint discovery to
-        // extract P+M directly from the checkpoint action.
-
         // Try CRC-optimized path for P&M
         let (mut metadata_opt, mut protocol_opt) =
             self.read_protocol_metadata_opt(engine, lazy_crc)?;
@@ -1257,6 +1254,21 @@ impl LogSegment {
             // Only search for checkpoint action if enabled
             if root_enabled && checkpoint_action_opt.is_none() {
                 checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
+
+                // Extract nested P+M from checkpoint action if top-level ones were not found.
+                if let Some(ref ca) = checkpoint_action_opt {
+                    let had_protocol = protocol_opt.is_some();
+                    ca.fill_missing_pm(&mut protocol_opt, &mut metadata_opt);
+                    if !had_protocol {
+                        if let Some(protocol) = protocol_opt.as_ref() {
+                            Self::validate_checkpoint_action_with_protocol(
+                                protocol,
+                                &checkpoint_action_opt,
+                                &mut root_enabled,
+                            )?;
+                        }
+                    }
+                }
             }
 
             // Early termination: stop when we have everything we need
@@ -1276,6 +1288,7 @@ impl LogSegment {
                 }
             }
         }
+
         Ok((metadata_opt, protocol_opt, checkpoint_action_opt))
     }
 
