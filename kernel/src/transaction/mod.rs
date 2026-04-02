@@ -3812,7 +3812,7 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
-        let root_metadata = builder.build(&engine, 1)?;
+        let (root_metadata, _next_row_id) = builder.build(&engine, 1, 0)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
