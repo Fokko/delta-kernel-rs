@@ -58,6 +58,7 @@ url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 rand = { version = "0.8", optional = true }
+iceberg = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 # Unity Catalog - only used by benchmark binaries, not exposed as a feature
 uc-client = { path = "../uc-client", optional = true }
@@ -125,6 +126,11 @@ catalog-managed = []
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# WARNING: experimental feature, still under active development
+# Enables icebergNativeV4 support, including Iceberg schema conversion
+# and metadata.json generation. Adds the Apache Iceberg crate as a dependency.
+iceberg-nativev4 = ["dep:iceberg"]
+
 # Enables Chrome trace span capture for benchmarks (outputs .trace.json files)
 trace-spans = ["dep:tracing-chrome", "dep:tracing-subscriber"]
 
@@ -150,7 +156,7 @@ default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["catalog-managed", "test-utils"] }
+delta_kernel = { path = ".", features = ["catalog-managed", "iceberg-nativev4", "test-utils"] }
 # NOTE: test_utils forcibly pulls the default engine and arrow-56. By default it ALSO pulls
 # arrow-57, which takes precedence and would make it impossible to test against arrow-56.
 test_utils = { path = "../test-utils", default-features = false }

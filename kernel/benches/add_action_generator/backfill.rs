@@ -1052,7 +1052,7 @@ fn partition_actions_into_leaves(
             leaf_count += 1;
             actions_in_current_leaf = 0;
 
-            if leaf_count % 10 == 0 {
+            if leaf_count.is_multiple_of(10) {
                 println!("         Finished {} leaves...", leaf_count);
             }
         }
