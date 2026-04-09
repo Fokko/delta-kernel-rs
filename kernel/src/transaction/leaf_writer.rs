@@ -12,7 +12,7 @@ use url::Url;
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
 ///
-/// This is an opaque type - use it by passing to [`crate::transaction::ManifestCommitState::add_leaf`].
+/// This is an opaque type - use it by passing to [`crate::transaction::Transaction::add_leaf`].
 #[derive(Debug)]
 pub struct LeafNodeWriterResult {
     /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries are deleted.

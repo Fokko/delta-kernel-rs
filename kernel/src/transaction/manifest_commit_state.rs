@@ -87,7 +87,7 @@ impl ManifestCommitState {
     /// Returns an error if called more than once per transaction.
     ///
     /// [`Scan`]: crate::scan::Scan
-    /// [`new_leaf_node_writer`]: ManifestCommitState::new_leaf_node_writer
+    /// [`new_leaf_node_writer`]: crate::transaction::Transaction::new_leaf_node_writer
     pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
         if self.root_released {
             return Err(Error::generic(
