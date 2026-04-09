@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::error::Error;
+use crate::scan::ScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Version};
 
@@ -36,10 +37,6 @@ pub struct ManifestCommitState {
     pub(super) leaf_manifests: Vec<ContentTreeNodeEntry>,
     pub(super) root_released: bool,
     pub(super) cached_root_manifest_url: OnceCell<Option<Url>>,
-
-    /// Running cursor for row tracking first_row_id assignment across leaves.
-    /// `Some(next_available_row_id)` when row tracking is enabled, `None` otherwise.
-    pub(super) row_id_cursor: Option<i64>,
 }
 
 impl ManifestCommitState {
@@ -59,7 +56,6 @@ impl ManifestCommitState {
             leaf_manifests: Vec::new(),
             root_released: false,
             cached_root_manifest_url: OnceCell::new(),
-            row_id_cursor: None,
         }
     }
 
@@ -106,7 +102,7 @@ impl ManifestCommitState {
         //
         // Create a scan that ONLY reads root + delta log (excluding leaf manifests).
         // Include stats columns so that parsed stats are available for AMT leaf population.
-        let scan = crate::scan::ScanBuilder::new(self.read_snapshot.clone())
+        let scan = ScanBuilder::new(self.read_snapshot.clone())
             .skip_leaf_manifests(true)
             .include_all_stats_columns()
             .build()?;
@@ -114,21 +110,23 @@ impl ManifestCommitState {
         Ok(scan)
     }
 
-    /// Create a new [`LeafNodeWriter`] for this transaction.
-    ///
-    /// The writer can be used to add files to a leaf manifest, which will be written and
-    /// incorporated into the root manifest when the transaction commits.
+    /// Create a new [`LeafNodeWriter`] for this manifest commit.
     ///
     /// # Arguments
     ///
     /// * `engine` - The engine to use for fetching the root manifest URL (only on first call;
     ///   subsequent calls use the cached value).
+    /// * `starting_first_row_id` - The next available row ID for row tracking assignment.
     ///
     /// # Returns
     ///
     /// A new [`LeafNodeWriter`] initialized with the transaction's table root, version, snapshot
     /// ID, and root manifest URL.
-    pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
+    pub(super) fn new_leaf_node_writer(
+        &mut self,
+        engine: &dyn Engine,
+        starting_first_row_id: i64,
+    ) -> DeltaResult<LeafNodeWriter> {
         let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
             url.clone()
         } else {
@@ -156,15 +154,6 @@ impl ManifestCommitState {
                 .as_ref()
                 .make_physical(column_mapping_mode)?,
         );
-
-        // Lazily initialize the row_id_cursor from the snapshot HWM on first use.
-        // Row tracking is always required for content trees.
-        if self.row_id_cursor.is_none() {
-            use crate::row_tracking::RowTrackingDomainMetadata;
-            let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-            self.row_id_cursor = Some(hwm.unwrap_or(-1) + 1);
-        }
-        let starting_first_row_id = self.row_id_cursor.unwrap_or(0);
 
         let writer = LeafNodeWriter::new(
             self.read_snapshot.table_root().clone(),
@@ -198,18 +187,13 @@ impl ManifestCommitState {
 
     /// Incorporate leaf writer results into this manifest commit.
     ///
-    /// - Detects duplicate unreconciled files across leaves (returns an error if found).
-    /// - Unions manifest deletion vectors (roaring bitmaps) across leaves.
-    /// - Collects leaf manifest entries to include in the root when the transaction commits.
+    /// Unions manifest deletion vectors (roaring bitmaps) across leaves and collects leaf
+    /// manifest entries to include in the root when the transaction commits.
     ///
     /// # Arguments
     ///
     /// * `leaf_result` - The result from calling `finish()` on a [`LeafNodeWriter`].
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success.
-    pub fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
+    pub(super) fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
         self.aggregated_unreconciled
             .extend(leaf_result.root_entries_to_remove);
 
@@ -227,9 +211,6 @@ impl ManifestCommitState {
         if let Some(data_manifest) = leaf_result.data_file_manifest_written {
             self.leaf_manifests.push(data_manifest);
         }
-
-        // Advance the row ID cursor with the leaf's next available row ID
-        self.row_id_cursor = Some(leaf_result.next_row_id);
 
         Ok(())
     }

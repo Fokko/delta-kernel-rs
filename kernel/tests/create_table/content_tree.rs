@@ -35,9 +35,9 @@ async fn test_create_table_manifest_commit_with_leaves() -> Result<(), Box<dyn s
     let add_files_schema = txn.add_files_schema();
 
     {
-        let mc = txn.with_manifest_commit();
+        txn.with_manifest_commit();
 
-        let mut leaf1 = mc.new_leaf_node_writer(engine.as_ref())?;
+        let mut leaf1 = txn.new_leaf_node_writer(engine.as_ref())?;
         leaf1.add_files(
             engine.as_ref(),
             create_add_files_metadata(
@@ -48,9 +48,9 @@ async fn test_create_table_manifest_commit_with_leaves() -> Result<(), Box<dyn s
                 ],
             )?,
         )?;
-        mc.add_leaf(leaf1.finish(engine.as_ref())?)?;
+        txn.add_leaf(leaf1.finish(engine.as_ref())?)?;
 
-        let mut leaf2 = mc.new_leaf_node_writer(engine.as_ref())?;
+        let mut leaf2 = txn.new_leaf_node_writer(engine.as_ref())?;
         leaf2.add_files(
             engine.as_ref(),
             create_add_files_metadata(
@@ -61,7 +61,7 @@ async fn test_create_table_manifest_commit_with_leaves() -> Result<(), Box<dyn s
                 ],
             )?,
         )?;
-        mc.add_leaf(leaf2.finish(engine.as_ref())?)?;
+        txn.add_leaf(leaf2.finish(engine.as_ref())?)?;
     }
 
     let committed = match txn.commit(engine.as_ref())? {

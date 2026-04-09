@@ -25,6 +25,23 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use tracing::instrument;
 use url::Url;
 
+/// Result of building a content tree node via [`ContentTreeNodeBuilder::build`] or
+/// [`ContentTreeNodeBuilder::build_leaf`].
+pub(crate) struct BuildResult {
+    /// The built content tree node.
+    pub(crate) node: ContentTreeNode,
+    /// The next available row ID after all assignments in this node.
+    pub(crate) next_row_id: i64,
+}
+
+/// Result of writing a leaf manifest via [`ContentTreeNodeBuilder::write_leaf`].
+pub(crate) struct WriteLeafResult {
+    /// The manifest entry representing the written leaf.
+    pub(crate) entry: ContentTreeNodeEntry,
+    /// The next available row ID after all assignments in this leaf.
+    pub(crate) next_row_id: i64,
+}
+
 /// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
 const ROARING_BITMAP_PORTABLE_MAGIC_BYTES: [u8; 4] = 1681511377u32.to_be_bytes();
 const ROARING_BITMAP_PORTABLE_MAGIC_LEN: usize = ROARING_BITMAP_PORTABLE_MAGIC_BYTES.len();
@@ -1084,12 +1101,11 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
         starting_first_row_id: i64,
-    ) -> DeltaResult<(ContentTreeNodeEntry, i64)> {
+    ) -> DeltaResult<WriteLeafResult> {
         // Build the leaf metadata with a UUID
-        let (leaf_metadata, next_row_id) =
-            self.build_leaf(engine, snapshot_id, starting_first_row_id)?;
+        let build_result = self.build_leaf(engine, snapshot_id, starting_first_row_id)?;
 
-        let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let write_result = ContentTreeNodeWriter::try_new(build_result.node)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root)?;
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
         // ParquetObjectReader::with_file_size when reading the leaf manifest back.
@@ -1178,7 +1194,10 @@ impl ContentTreeNodeBuilder {
             .manifest_stats_opt(manifest_stats)
             .build();
 
-        Ok((manifest_entry, next_row_id))
+        Ok(WriteLeafResult {
+            entry: manifest_entry,
+            next_row_id: build_result.next_row_id,
+        })
     }
 
     /// Builds a root ContentTreeNode instance (leaf is `None`).
@@ -1191,7 +1210,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
         starting_first_row_id: i64,
-    ) -> DeltaResult<(ContentTreeNode, i64)> {
+    ) -> DeltaResult<BuildResult> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
@@ -1209,8 +1228,8 @@ impl ContentTreeNodeBuilder {
 
         // Handle empty case early
         if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok((
-                ContentTreeNode {
+            return Ok(BuildResult {
+                node: ContentTreeNode {
                     table_root: self.table_root.clone(),
                     data: vec![],
                     version: self.version,
@@ -1218,7 +1237,7 @@ impl ContentTreeNodeBuilder {
                     leaf: None,
                 },
                 next_row_id,
-            ));
+            });
         }
 
         let mut data: Vec<Box<dyn EngineData>> = Vec::new();
@@ -1240,8 +1259,8 @@ impl ContentTreeNodeBuilder {
         // Add pre-transformed columnar batches
         data.append(&mut self.pre_built_data);
 
-        Ok((
-            ContentTreeNode {
+        Ok(BuildResult {
+            node: ContentTreeNode {
                 table_root: self.table_root.clone(),
                 data,
                 version: self.version,
@@ -1249,7 +1268,7 @@ impl ContentTreeNodeBuilder {
                 leaf: None,
             },
             next_row_id,
-        ))
+        })
     }
 
     /// Builds a leaf ContentTreeNode instance with a generated UUID.
@@ -1261,7 +1280,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
         starting_first_row_id: i64,
-    ) -> DeltaResult<(ContentTreeNode, i64)> {
+    ) -> DeltaResult<BuildResult> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
@@ -1279,8 +1298,8 @@ impl ContentTreeNodeBuilder {
 
         // Handle empty case early
         if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok((
-                ContentTreeNode {
+            return Ok(BuildResult {
+                node: ContentTreeNode {
                     table_root: self.table_root.clone(),
                     data: vec![],
                     version: self.version,
@@ -1288,7 +1307,7 @@ impl ContentTreeNodeBuilder {
                     leaf: Some(uuid::Uuid::new_v4()),
                 },
                 next_row_id,
-            ));
+            });
         }
 
         let mut data: Vec<Box<dyn EngineData>> = Vec::new();
@@ -1310,8 +1329,8 @@ impl ContentTreeNodeBuilder {
         // Add pre-transformed columnar batches
         data.append(&mut self.pre_built_data);
 
-        Ok((
-            ContentTreeNode {
+        Ok(BuildResult {
+            node: ContentTreeNode {
                 table_root: self.table_root.clone(),
                 data,
                 version: self.version,
@@ -1319,7 +1338,7 @@ impl ContentTreeNodeBuilder {
                 leaf: Some(uuid::Uuid::new_v4()),
             },
             next_row_id,
-        ))
+        })
     }
 
     /// Build and evaluate a scan-row transformation expression.
@@ -2126,7 +2145,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let (root_metadata, _) = builder.build(engine, snapshot_id, 0)?;
+        let root_metadata = builder.build(engine, snapshot_id, 0)?.node;
         let table_root = root_metadata.table_root.clone();
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
@@ -2325,7 +2344,7 @@ mod tests {
 
         // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
-        let (metadata, _) = builder.build(&engine, 1, 0)?;
+        let metadata = builder.build(&engine, 1, 0)?.node;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].record_count, 100);
@@ -2754,7 +2773,7 @@ mod tests {
         builder.add_entry(entry2);
 
         // Write the leaf manifest
-        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1, 0)?.entry;
 
         // Verify content_stats is populated on the leaf manifest entry
         assert!(
@@ -2851,7 +2870,7 @@ mod tests {
         builder.add_entry(entry);
 
         // Write the leaf manifest
-        let (leaf_manifest_entry, _) = builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1, 0)?.entry;
 
         // When all entries have None content_stats, the aggregate should also be None
         assert!(
@@ -3051,7 +3070,7 @@ mod tests {
         }
 
         // Write the leaf
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
@@ -3138,7 +3157,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
@@ -3209,7 +3228,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
@@ -3261,7 +3280,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
@@ -3328,7 +3347,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
         // leaf_path is now already relative
         let relative_path = &leaf_path;
@@ -3466,7 +3485,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
@@ -3692,7 +3711,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf

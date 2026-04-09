@@ -315,15 +315,15 @@ fn verify_stats(
 
 /// Helper to create and add a leaf node with files
 fn add_leaf_with_files(
-    mc: &mut delta_kernel::transaction::ManifestCommitState,
+    txn: &mut delta_kernel::transaction::Transaction,
     engine: &dyn delta_kernel::Engine,
     add_files_schema: &Arc<StructType>,
     files: Vec<TestFileStats<'_>>,
 ) -> DeltaResult<()> {
-    let mut leaf = mc.new_leaf_node_writer(engine)?;
+    let mut leaf = txn.new_leaf_node_writer(engine)?;
     let data = create_add_files_with_stats(add_files_schema, files)?;
     leaf.add_files(engine, data)?;
-    mc.add_leaf(leaf.finish(engine)?)?;
+    txn.add_leaf(leaf.finish(engine)?)?;
     Ok(())
 }
 
@@ -393,9 +393,9 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
 
     // Add files to leaves: leaf1 (files 1-2), leaf2 (file3)
     {
-        let mc = txn.with_manifest_commit();
+        txn.with_manifest_commit();
         add_leaf_with_files(
-            mc,
+            &mut txn,
             engine.as_ref(),
             &add_files_schema,
             vec![
@@ -421,7 +421,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         )?;
 
         add_leaf_with_files(
-            mc,
+            &mut txn,
             engine.as_ref(),
             &add_files_schema,
             vec![TestFileStats {

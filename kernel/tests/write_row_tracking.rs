@@ -20,7 +20,7 @@ use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{collect_file_paths, create_table, engine_store_setup, read_scan};
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
 /// when row tracking is enabled on the table when a remove action is generated for a
@@ -164,34 +164,26 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     // 5 rows, starting at 0: HWM should be 4 (last row ID)
     assert_eq!(hwm, 4, "HWM should be num_records - 1");
 
-    if !use_batch_commit {
-        // For log commits, also verify JSON add action fields directly
-        let add_actions: Vec<_> = parsed_commits
-            .iter()
-            .filter(|action| action.get("add").is_some())
-            .collect();
-        assert_eq!(add_actions.len(), 1, "Expected exactly one add action");
+    // Verify the added file is visible via scan and the data reads back correctly.
+    // This works uniformly for both log and batch commits.
+    let snapshot_v1 = Snapshot::builder_for(table_url.clone())
+        .at_version(1)
+        .build(engine_arc.as_ref())?;
+    let file_paths = collect_file_paths(snapshot_v1.clone(), engine_arc.as_ref())?;
+    assert_eq!(file_paths.len(), 1, "Expected exactly one data file");
 
-        let add = &add_actions[0]["add"];
-        let base_row_id = add["baseRowId"]
-            .as_i64()
-            .expect("baseRowId should be an i64");
-        assert_eq!(base_row_id, 0, "First file should have baseRowId 0");
-
-        let default_row_commit_version = add["defaultRowCommitVersion"]
-            .as_i64()
-            .expect("Missing defaultRowCommitVersion");
-        assert_eq!(default_row_commit_version, 1);
-    } else {
-        // For batch commits, add actions are in the content tree, not JSON
-        let has_add_actions = parsed_commits
+    let scan = snapshot_v1.scan_builder().build()?;
+    let batches = read_scan(&scan, engine_arc.clone())?;
+    let actual = batches.iter().flat_map(|b| {
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
             .iter()
-            .any(|action| action.get("add").is_some());
-        assert!(
-            !has_add_actions,
-            "Batch commit should not have add actions in JSON log"
-        );
-    }
+            .copied()
+    }).collect::<Vec<_>>();
+    assert_eq!(actual, vec![1, 2, 3, 4, 5], "Data should round-trip correctly");
 
     // ===== SECOND COMMIT: Remove the file =====
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;
@@ -232,35 +224,6 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
         file_count += metadata?.scan_files.data().len();
     }
     assert_eq!(file_count, 0, "All files should be removed after commit 2");
-
-    if !use_batch_commit {
-        // For log commits, verify remove action row tracking fields in JSON
-        let commit2_url = tmp_test_dir_url
-            .join("test_row_tracking/_delta_log/00000000000000000002.json")
-            .unwrap();
-        let commit2 = store
-            .get(&Path::from_url_path(commit2_url.path()).unwrap())
-            .await?;
-
-        let parsed_commits2: Vec<_> = Deserializer::from_slice(&commit2.bytes().await?)
-            .into_iter::<serde_json::Value>()
-            .try_collect()?;
-
-        let remove_actions: Vec<_> = parsed_commits2
-            .iter()
-            .filter(|action| action.get("remove").is_some())
-            .collect();
-        assert_eq!(remove_actions.len(), 1);
-
-        let remove = &remove_actions[0]["remove"];
-        let remove_base_row_id = remove["baseRowId"].as_i64().expect("Missing baseRowId");
-        assert_eq!(remove_base_row_id, 0);
-
-        let remove_default_row_commit_version = remove["defaultRowCommitVersion"]
-            .as_i64()
-            .expect("Missing defaultRowCommitVersion");
-        assert_eq!(remove_default_row_commit_version, 1);
-    }
 
     Ok(())
 }

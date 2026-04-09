@@ -45,7 +45,7 @@ pub mod manifest_commit_state;
 use content_tree::ScanMetadataRemoveVisitor;
 
 // Re-export types needed for public API
-pub use leaf_writer::LeafNodeWriterResult;
+pub use leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 pub use manifest_commit_state::ManifestCommitState;
 
 #[cfg(feature = "internal-api")]
@@ -244,6 +244,9 @@ pub struct Transaction<S = ExistingTable> {
     // Manifest commit state. `Some` when the caller has opted in via
     // `with_manifest_commit()`. `None` for log commits.
     manifest_commit_state: Option<ManifestCommitState>,
+    // Running cursor for row tracking first_row_id assignment across leaves.
+    // Lazily initialized from the snapshot HWM on first use. `None` until initialized.
+    row_id_cursor: Option<i64>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -286,7 +289,7 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -364,7 +367,16 @@ impl<S> Transaction<S> {
         // Step 3: Get commit version for actions
         let commit_version = self.get_commit_version();
 
-        // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
+        // Step 4: Determine if this is a manifest commit and pre-compute the row ID cursor
+        // while we still have &mut self access.
+        let manifest_commit = self.is_manifest_commit();
+        let row_id_cursor = if manifest_commit {
+            Some(self.ensure_row_id_cursor(engine)?)
+        } else {
+            None
+        };
+
+        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
         // than written to the delta log (same issue as removes). This requires:
         // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions
@@ -375,23 +387,23 @@ impl<S> Transaction<S> {
         //    has_work_to_do check.
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 5: Generate remove actions for the delta log (skipped in manifest commit mode, where
+        // Step 6: Generate remove actions for the delta log (skipped in manifest commit mode, where
         // removes are recorded in the content tree instead).
-        let manifest_commit = self.is_manifest_commit();
         let remove_actions = if manifest_commit {
             None
         } else {
             Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
         };
 
-        // Step 6: Generate all log actions (commit info, protocol, metadata for create-table,
-        // set transactions, domain metadata, add actions)
+        // Step 7: Generate all log actions (commit info, protocol, metadata for create-table,
+        // set transactions, domain metadata, add actions).
         let (actions, dm_changes) = self.generate_log_actions(
             engine,
             commit_version,
             snapshot_id,
             commit_info_action,
             set_transaction_actions,
+            row_id_cursor,
         )?;
 
         let filtered_actions = actions
@@ -454,6 +466,7 @@ impl<S> Transaction<S> {
         snapshot_id: i64,
         commit_info_action: DeltaResult<Box<dyn EngineData>>,
         set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
+        row_id_cursor: Option<i64>,
     ) -> DeltaResult<(Vec<DeltaResult<FilteredEngineData>>, Vec<DomainMetadata>)> {
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let (add_actions, row_tracking_domain_metadata) =
@@ -643,30 +656,20 @@ impl<S> Transaction<S> {
                 }
             }
 
-            // Determine starting row ID for row tracking in the content tree.
-            // Use the batch state's cursor (which was advanced by leaf writes) if available,
-            // otherwise read the HWM from the snapshot.
-            let starting_first_row_id = match self
-                .manifest_commit_state
-                .as_ref()
-                .and_then(|b| b.row_id_cursor)
-            {
-                Some(c) => c,
-                None => {
-                    let hwm = RowTrackingDomainMetadata::get_high_water_mark(
-                        &self.read_snapshot,
-                        engine,
-                    )?;
-                    hwm.unwrap_or(-1) + 1
-                }
-            };
+            // Row ID cursor was pre-computed before entering generate_log_actions.
+            let starting_first_row_id = row_id_cursor.ok_or_else(|| {
+                Error::generic("row_id_cursor must be set when manifest commit is active")
+            })?;
 
-            let (new_metadata, next_row_id) =
+            let build_result =
                 metadata_builder.build(engine, snapshot_id, starting_first_row_id)?;
 
-            // Write new row tracking HWM domain metadata for the batch commit path
+            // Write new row tracking HWM domain metadata for the batch commit path.
+            // next_row_id is the first *unassigned* row ID, but the high water mark
+            // records the last *assigned* one (i.e. the inclusive upper bound), so we
+            // subtract 1.
             {
-                let new_hwm = next_row_id - 1;
+                let new_hwm = build_result.next_row_id - 1;
                 let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
                 let dm_action: DomainMetadata = rt_dm.try_into()?;
                 let schema = get_log_domain_metadata_schema().clone();
@@ -678,7 +681,7 @@ impl<S> Transaction<S> {
             let ContentTreeWriteResult {
                 location: content_metadata_path,
                 size_in_bytes,
-            } = ContentTreeNodeWriter::try_new(new_metadata)?.write(engine)?;
+            } = ContentTreeNodeWriter::try_new(build_result.node)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
@@ -746,10 +749,10 @@ impl<S> Transaction<S> {
     ///
     /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
-    /// The returned `&mut ManifestCommitState` provides tree-manipulation methods
-    /// ([`ManifestCommitState::release_root_and_delta_actions`], [`ManifestCommitState::new_leaf_node_writer`],
-    /// [`ManifestCommitState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
-    /// other `&mut Transaction` methods.
+    /// The returned `&mut ManifestCommitState` provides tree-manipulation methods such as
+    /// [`ManifestCommitState::release_root_and_delta_actions`]. Use
+    /// [`Transaction::new_leaf_node_writer`] and [`Transaction::add_leaf`] for leaf operations
+    /// (these live on `Transaction` because they manage the transaction-level row ID cursor).
     ///
     /// # Example
     ///
@@ -757,14 +760,10 @@ impl<S> Transaction<S> {
     /// let mut txn = snapshot.transaction(committer, engine)?
     ///     .with_data_change(true);
     ///
-    /// {
-    ///     let mc = txn.with_manifest_commit();
-    ///     let scan = mc.release_root_and_delta_actions()?;
-    ///     // ...process scan...
-    ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
-    ///     leaf.add_files(engine, metadata)?;
-    ///     mc.add_leaf(leaf.finish(engine)?)?;
-    /// } // mc borrow released
+    /// txn.with_manifest_commit();
+    /// let mut leaf = txn.new_leaf_node_writer(engine)?;
+    /// leaf.add_files(engine, metadata)?;
+    /// txn.add_leaf(leaf.finish(engine)?)?;
     ///
     /// txn.commit(engine)?;
     /// ```
@@ -776,6 +775,53 @@ impl<S> Transaction<S> {
                 self.read_snapshot.clone(),
             )
         })
+    }
+
+    /// Create a new [`LeafNodeWriter`] for this transaction.
+    ///
+    /// The writer can be used to add files to a leaf manifest, which will be written and
+    /// incorporated into the root manifest when the transaction commits.
+    ///
+    /// Requires [`with_manifest_commit`](Transaction::with_manifest_commit) to have been called
+    /// first.
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - The engine to use for I/O operations.
+    pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
+        let starting_first_row_id = self.ensure_row_id_cursor(engine)?;
+        let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
+            Error::generic("new_leaf_node_writer requires with_manifest_commit() to be called first")
+        })?;
+        mc.new_leaf_node_writer(engine, starting_first_row_id)
+    }
+
+    /// Incorporate leaf writer results into this transaction.
+    ///
+    /// Advances the transaction-level row ID cursor and delegates manifest bookkeeping
+    /// to [`ManifestCommitState`].
+    ///
+    /// # Arguments
+    ///
+    /// * `leaf_result` - The result from calling `finish()` on a [`LeafNodeWriter`].
+    pub fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
+        self.row_id_cursor = Some(leaf_result.next_row_id);
+        let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
+            Error::generic("add_leaf requires with_manifest_commit() to be called first")
+        })?;
+        mc.add_leaf(leaf_result)
+    }
+
+    /// Lazily initializes and returns the row ID cursor from the snapshot's high water mark.
+    fn ensure_row_id_cursor(&mut self, engine: &dyn Engine) -> DeltaResult<i64> {
+        if let Some(cursor) = self.row_id_cursor {
+            return Ok(cursor);
+        }
+        let hwm =
+            RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+        let cursor = hwm.unwrap_or(-1) + 1;
+        self.row_id_cursor = Some(cursor);
+        Ok(cursor)
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -2529,11 +2575,11 @@ mod tests {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let (root_metadata, _) = root_builder.build(&engine, 1, 0)?;
+        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2621,11 +2667,11 @@ mod tests {
         for path in &data_files {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let (leaf_manifest_entry, _) = leaf_builder.write_leaf(&engine, 1, 0)?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let (root_metadata, _) = root_builder.build(&engine, 1, 0)?;
+        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2749,14 +2795,14 @@ mod tests {
         // File without DV
         data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let (data_leaf_entry, _) = data_leaf_builder.write_leaf(&engine, 1, 0)?;
+        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1, 0)?.entry;
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let (root_metadata, _) = root_builder.build(&engine, 1, 0)?;
+        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2975,10 +3021,10 @@ mod tests {
             let mc = txn.with_manifest_commit();
             // Step 3: Release root and delta actions
             scan = mc.release_root_and_delta_actions()?;
-            // Step 4: Create leaf writers
-            leaf1 = mc.new_leaf_node_writer(&engine)?;
-            leaf2 = mc.new_leaf_node_writer(&engine)?;
         }
+        // Step 4: Create leaf writers
+        leaf1 = txn.new_leaf_node_writer(&engine)?;
+        leaf2 = txn.new_leaf_node_writer(&engine)?;
 
         // Helper to create add metadata for testing
         // Note: stats are set to null (empty struct) because proper content_stats requires
@@ -3088,11 +3134,8 @@ mod tests {
         leaf2.add_files(&engine, leaf2_metadata)?;
 
         // Step 5: Finish leaf writers and add to manifest commit
-        {
-            let mc = txn.with_manifest_commit();
-            mc.add_leaf(leaf1.finish(&engine)?)?;
-            mc.add_leaf(leaf2.finish(&engine)?)?;
-        }
+        txn.add_leaf(leaf1.finish(&engine)?)?;
+        txn.add_leaf(leaf2.finish(&engine)?)?;
 
         // Exhaust the scan (required before commit)
         for _ in scan.scan_metadata(&engine)? {}
@@ -3812,7 +3855,7 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
-        let (root_metadata, _next_row_id) = builder.build(&engine, 1, 0)?;
+        let root_metadata = builder.build(&engine, 1, 0)?.node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;

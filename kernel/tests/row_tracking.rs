@@ -26,6 +26,31 @@ use test_utils::{
     test_read, test_table_setup,
 };
 
+/// Setup a row-tracking table with a single nullable integer column.
+///
+/// Returns `(table_url, engine, store, schema)`.
+async fn setup_int_row_tracking_table(
+    table_name: &str,
+) -> DeltaResult<(
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+    SchemaRef,
+)> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let schema: SchemaRef = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let (table_url, engine, store) =
+        create_row_tracking_table(&tmp_test_dir, table_name, schema.clone()).await?;
+    // Leak the tempdir so it isn't cleaned up while we still need the files.
+    // Tests are short-lived processes so this is fine.
+    let _ = tmp_test_dir.keep();
+    Ok((table_url, engine, store, schema))
+}
+
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
     tmp_dir: &TempDir,
@@ -212,16 +237,8 @@ async fn verify_row_tracking_in_commit(
 
 #[tokio::test]
 async fn test_row_tracking_append() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_append").await?;
 
     // Create two new arrow record batches to append
     let data = generate_data(
@@ -260,16 +277,8 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_single_records", schema.clone()).await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_single_records").await?;
 
     // Write individual records in separate batches
     let data = generate_data(
@@ -299,16 +308,8 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_large_batch() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_large_batch", schema.clone()).await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_large_batch").await?;
 
     // Write a large batch with 1000 records
     let large_batch: Vec<i32> = (1..=1000).collect();
@@ -342,17 +343,8 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
-            .await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_consecutive_commits").await?;
 
     // First transaction: write two batches with 3 records each
     let data_1 = generate_data(
@@ -500,16 +492,8 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_append").await?;
 
     // Create two regular and one empty arrow record batches to append
     let data = generate_data(
@@ -549,16 +533,8 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_append").await?;
 
     // Create two new _empty_ arrow record batches to append
     let data = generate_data(
@@ -598,17 +574,8 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_without_adds() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
-            .await?;
+    let (table_url, engine, store, _schema) =
+        setup_int_row_tracking_table("test_consecutive_commits").await?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
@@ -633,17 +600,8 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
-    // Setup
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_parallel_row_tracking", schema.clone())
-            .await?;
+    let (table_url, engine, store, schema) =
+        setup_int_row_tracking_table("test_parallel_row_tracking").await?;
 
     let engine1 = engine.clone();
     let engine2 = engine;
@@ -767,10 +725,9 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
-    // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+    let schema: SchemaRef = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
     )])?);
@@ -885,6 +842,30 @@ fn create_batch_commit_table(
     Ok(txn)
 }
 
+/// Write files into a single leaf manifest and add it to the transaction.
+fn write_leaf<S>(
+    txn: &mut delta_kernel::transaction::Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut leaf = txn.new_leaf_node_writer(engine)?;
+    leaf.add_files(engine, create_add_files_metadata(schema, files)?)?;
+    txn.add_leaf(leaf.finish(engine)?)?;
+    Ok(())
+}
+
+/// Commit a transaction and assert it succeeds at the expected version.
+fn commit_at<S: std::fmt::Debug>(
+    txn: delta_kernel::transaction::Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    expected_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let committed = txn.commit(engine)?.unwrap_committed();
+    assert_eq!(committed.commit_version(), expected_version);
+    Ok(())
+}
+
 /// Verify the row ID high water mark in a batch commit's domain metadata.
 ///
 /// Batch commits store file-level row IDs in the content tree manifest (as first_row_id),
@@ -940,40 +921,24 @@ async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn st
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
-    let add_files_schema = txn.add_files_schema();
-
-    {
-        let batch = txn.with_manifest_commit();
-
-        let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf1.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("leaf1-part1.parquet", 1024, 1_000_000, 10),
-                    ("leaf1-part2.parquet", 2048, 1_000_001, 20),
-                ],
-            )?,
-        )?;
-        batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
-
-        let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf2.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("leaf2-part1.parquet", 3072, 1_000_002, 30)],
-            )?,
-        )?;
-        batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
-    }
-
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed, got {other:?}"),
-    };
-    assert_eq!(committed.commit_version(), 0);
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit();
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("leaf1-part1.parquet", 1024, 1_000_000, 10),
+            ("leaf1-part2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf2-part1.parquet", 3072, 1_000_002, 30)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
 
     // HWM = total_records - 1 = 10 + 20 + 30 - 1 = 59
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -995,51 +960,34 @@ async fn test_batch_commit_row_tracking_consecutive_commits(
 
     // First commit: create table with 2 files (10 + 20 = 30 records)
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
-    let add_files_schema = txn.add_files_schema();
-    {
-        let batch = txn.with_manifest_commit();
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("file1.parquet", 1024, 1_000_000, 10),
-                    ("file2.parquet", 2048, 1_000_001, 20),
-                ],
-            )?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-    let result = txn.commit(engine.as_ref())?;
-    assert!(matches!(result, CommitResult::CommittedTransaction(ref c) if c.commit_version() == 0));
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit();
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
 
     let table_url = Url::from_directory_path(&table_path).unwrap();
-
-    // Verify first commit HWM = 29
     verify_batch_commit_hwm(&table_url, 0, 29).await?;
 
-    // Second commit: add 1 more file with 15 records
-    // Should start row IDs from 30 (HWM 29 + 1)
+    // Second commit: add 1 more file with 15 records (row IDs start from 30 = HWM 29 + 1)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let add_files_schema = txn2.add_files_schema();
-    {
-        let batch = txn2.with_manifest_commit();
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("file3.parquet", 4096, 1_000_002, 15)],
-            )?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-    let result2 = txn2.commit(engine.as_ref())?;
-    assert!(
-        matches!(result2, CommitResult::CommittedTransaction(ref c) if c.commit_version() == 1)
-    );
+    let schema = txn2.add_files_schema();
+    txn2.with_manifest_commit();
+    write_leaf(
+        &mut txn2,
+        engine.as_ref(),
+        schema,
+        vec![("file3.parquet", 4096, 1_000_002, 15)],
+    )?;
+    commit_at(txn2, engine.as_ref(), 1)?;
 
     // Verify second commit HWM = 44 (29 + 15 = 44)
     verify_batch_commit_hwm(&table_url, 1, 44).await?;
@@ -1060,50 +1008,12 @@ async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
-    let add_files_schema = txn.add_files_schema();
-
-    {
-        let batch = txn.with_manifest_commit();
-
-        // Leaf 1: 5 records
-        let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf1.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("leaf1.parquet", 512, 1_000_000, 5)],
-            )?,
-        )?;
-        batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
-
-        // Leaf 2: 7 records (should start at row ID 5)
-        let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf2.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("leaf2.parquet", 768, 1_000_001, 7)],
-            )?,
-        )?;
-        batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
-
-        // Leaf 3: 3 records (should start at row ID 12)
-        let mut leaf3 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf3.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("leaf3.parquet", 256, 1_000_002, 3)],
-            )?,
-        )?;
-        batch.add_leaf(leaf3.finish(engine.as_ref())?)?;
-    }
-
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed, got {other:?}"),
-    };
-    assert_eq!(committed.commit_version(), 0);
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit();
+    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf1.parquet", 512, 1_000_000, 5)])?;
+    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf2.parquet", 768, 1_000_001, 7)])?;
+    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf3.parquet", 256, 1_000_002, 3)])?;
+    commit_at(txn, engine.as_ref(), 0)?;
 
     // Verify HWM = 14 (5 + 7 + 3 - 1)
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -1119,32 +1029,19 @@ async fn test_batch_commit_row_tracking_multiple_files_per_leaf(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
-    let add_files_schema = txn.add_files_schema();
-
-    {
-        let batch = txn.with_manifest_commit();
-
-        // Single leaf with 3 files: 10, 20, 30 records
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("file1.parquet", 1024, 1_000_000, 10),
-                    ("file2.parquet", 2048, 1_000_001, 20),
-                    ("file3.parquet", 3072, 1_000_002, 30),
-                ],
-            )?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed, got {other:?}"),
-    };
-    assert_eq!(committed.commit_version(), 0);
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit();
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+            ("file3.parquet", 3072, 1_000_002, 30),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
 
     // Verify HWM = 59 (10 + 20 + 30 - 1)
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -1162,23 +1059,15 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
 
     // First commit: create the table with some data
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
-    let add_files_schema = txn.add_files_schema();
-    {
-        let batch = txn.with_manifest_commit();
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                add_files_schema,
-                vec![("file1.parquet", 1024, 1_000_000, 10)],
-            )?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-    assert!(matches!(
-        txn.commit(engine.as_ref())?,
-        CommitResult::CommittedTransaction(_)
-    ));
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit();
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("file1.parquet", 1024, 1_000_000, 10)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
 
     verify_batch_commit_hwm(
         &Url::from_directory_path(&table_path).unwrap(),
@@ -1193,7 +1082,7 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     {
-        let _batch = txn2.with_manifest_commit();
+        txn2.with_manifest_commit();
         // Don't add any leaves
     }
     let result = txn2.commit(engine.as_ref())?;
@@ -1225,90 +1114,118 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
 async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
 
-    // Commit 0: 10 + 20 = 30 records
+    // Commit 0: 10 + 20 = 30 records -> HWM = 29, Iceberg next-row-id = 30
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
-    {
-        let batch = txn.with_manifest_commit();
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(
-                schema,
-                vec![
-                    ("file1.parquet", 1024, 1_000_000, 10),
-                    ("file2.parquet", 2048, 1_000_001, 20),
-                ],
-            )?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-    assert!(matches!(
-        txn.commit(engine.as_ref())?,
-        CommitResult::CommittedTransaction(_)
-    ));
-
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-    // HWM = 29, Iceberg next-row-id = 30
+    txn.with_manifest_commit();
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
     verify_batch_commit_hwm(&table_url, 0, 29).await?;
 
-    // Commit 1: 15 records (should start at row ID 30 = previous HWM + 1)
+    // Commit 1: 15 records (row IDs start at 30 = previous HWM + 1)
+    // Contiguity: commit 0 used [0, 30), commit 1 uses [30, 45) -> HWM = 44
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let schema = txn2.add_files_schema();
-    {
-        let batch = txn2.with_manifest_commit();
-        let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(schema, vec![("file3.parquet", 3072, 1_000_002, 15)])?,
-        )?;
-        batch.add_leaf(leaf.finish(engine.as_ref())?)?;
-    }
-    assert!(matches!(
-        txn2.commit(engine.as_ref())?,
-        CommitResult::CommittedTransaction(_)
-    ));
-
-    // HWM = 44, Iceberg next-row-id = 45
-    // Contiguity: commit 0 used [0, 30), commit 1 used [30, 45)
+    txn2.with_manifest_commit();
+    write_leaf(
+        &mut txn2,
+        engine.as_ref(),
+        schema,
+        vec![("file3.parquet", 3072, 1_000_002, 15)],
+    )?;
+    commit_at(txn2, engine.as_ref(), 1)?;
     verify_batch_commit_hwm(&table_url, 1, 44).await?;
 
     // Commit 2: 5 + 10 = 15 records across 2 leaves
+    // Contiguity: commit 2 uses [45, 60) -> HWM = 59
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn3 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let schema = txn3.add_files_schema();
-    {
-        let batch = txn3.with_manifest_commit();
-
-        let mut leaf1 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf1.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(schema, vec![("file4.parquet", 512, 1_000_003, 5)])?,
-        )?;
-        batch.add_leaf(leaf1.finish(engine.as_ref())?)?;
-
-        let mut leaf2 = batch.new_leaf_node_writer(engine.as_ref())?;
-        leaf2.add_files(
-            engine.as_ref(),
-            create_add_files_metadata(schema, vec![("file5.parquet", 768, 1_000_004, 10)])?,
-        )?;
-        batch.add_leaf(leaf2.finish(engine.as_ref())?)?;
-    }
-    assert!(matches!(
-        txn3.commit(engine.as_ref())?,
-        CommitResult::CommittedTransaction(_)
-    ));
-
-    // HWM = 59, Iceberg next-row-id = 60
-    // Contiguity: commit 2 used [45, 60)
+    txn3.with_manifest_commit();
+    write_leaf(&mut txn3, engine.as_ref(), schema, vec![("file4.parquet", 512, 1_000_003, 5)])?;
+    write_leaf(&mut txn3, engine.as_ref(), schema, vec![("file5.parquet", 768, 1_000_004, 10)])?;
+    commit_at(txn3, engine.as_ref(), 2)?;
     verify_batch_commit_hwm(&table_url, 2, 59).await?;
 
     // Verify all 5 files visible
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let paths = collect_file_paths(snapshot, engine.as_ref())?;
     assert_eq!(paths.len(), 5, "Should have 5 data files total");
+
+    Ok(())
+}
+
+/// Multiple leaf writers created and finished independently within a single transaction
+/// get non-overlapping, sequential row ID ranges. This simulates a scenario where
+/// different processes each build a leaf manifest and then add them to the transaction.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_parallel_leaf_writers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+
+    txn.with_manifest_commit();
+
+    // Simulate parallel leaf creation: each writer is created, populated, and finished
+    // independently. The transaction-level cursor ensures non-overlapping row ID ranges.
+
+    // Leaf A: 100 records -> row IDs [0, 100)
+    let mut leaf_a = txn.new_leaf_node_writer(engine.as_ref())?;
+    leaf_a.add_files(
+        engine.as_ref(),
+        create_add_files_metadata(schema, vec![("leaf-a.parquet", 4096, 1_000_000, 100)])?,
+    )?;
+    let result_a = leaf_a.finish(engine.as_ref())?;
+    assert_eq!(result_a.next_row_id, 100);
+    txn.add_leaf(result_a)?;
+
+    // Leaf B: 50 records -> row IDs [100, 150)
+    let mut leaf_b = txn.new_leaf_node_writer(engine.as_ref())?;
+    leaf_b.add_files(
+        engine.as_ref(),
+        create_add_files_metadata(schema, vec![("leaf-b.parquet", 2048, 1_000_001, 50)])?,
+    )?;
+    let result_b = leaf_b.finish(engine.as_ref())?;
+    assert_eq!(result_b.next_row_id, 150);
+    txn.add_leaf(result_b)?;
+
+    // Leaf C: 200 records -> row IDs [150, 350)
+    let mut leaf_c = txn.new_leaf_node_writer(engine.as_ref())?;
+    leaf_c.add_files(
+        engine.as_ref(),
+        create_add_files_metadata(schema, vec![("leaf-c.parquet", 8192, 1_000_002, 200)])?,
+    )?;
+    let result_c = leaf_c.finish(engine.as_ref())?;
+    assert_eq!(result_c.next_row_id, 350);
+    txn.add_leaf(result_c)?;
+
+    let committed = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c,
+        other => panic!("Expected committed, got {other:?}"),
+    };
+    assert_eq!(committed.commit_version(), 0);
+
+    // HWM = 100 + 50 + 200 - 1 = 349
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 349).await?;
+
+    // Verify all 3 files are visible
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    assert_eq!(paths.len(), 3, "Should have 3 data files");
 
     Ok(())
 }

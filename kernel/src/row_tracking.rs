@@ -11,7 +11,7 @@ use crate::{DeltaResult, Engine, Error, Snapshot};
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RowTrackingDomainMetadata {
-    // NB: The Delta spec does not rule out negative high water marks
+    // NB: The Delta spec does not rule out negative high watermarks
     row_id_high_water_mark: i64,
 }
 

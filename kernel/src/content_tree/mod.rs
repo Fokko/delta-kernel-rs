@@ -3553,7 +3553,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        builder.build(engine, 1, 0).map(|(node, _)| node)
+        builder.build(engine, 1, 0).map(|result| result.node)
     }
 
     /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
@@ -3571,7 +3571,7 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        let (metadata, _) = builder.build(engine, 1, 0)?;
+        let metadata = builder.build(engine, 1, 0)?.node;
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?
@@ -4575,10 +4575,10 @@ mod tests {
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(record_batch));
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
                 leaf.add_files(engine.as_ref(), metadata_engine_data)?;
-                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
+                txn.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {
@@ -4619,8 +4619,8 @@ mod tests {
                 .with_operation("UPDATE".to_string());
 
             {
-                let mc = txn.with_manifest_commit();
-                let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+                txn.with_manifest_commit();
+                let leaf = txn.new_leaf_node_writer(engine.as_ref())?;
 
                 // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
                 // Previously used leaf.update_deletion_vectors(dv_updates) here.
@@ -4628,7 +4628,7 @@ mod tests {
                 // re-writing the data entry with updated dv_info.
                 let _ = (&file_locations, known_dv_size_in_bytes);
 
-                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
+                txn.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {

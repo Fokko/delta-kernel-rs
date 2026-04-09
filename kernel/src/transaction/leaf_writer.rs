@@ -29,7 +29,7 @@ pub struct LeafNodeWriterResult {
     pub(crate) root_dv_entries_to_remove: HashSet<String>,
 
     /// Next available row ID after all assignments in this leaf.
-    pub(crate) next_row_id: i64,
+    pub next_row_id: i64,
 }
 
 /// Builder for creating leaf manifests.
@@ -337,12 +337,12 @@ impl LeafNodeWriter {
         // In the new CombinedManifest model, DV info is inline on data entries,
         // so no separate DV manifest is needed.
         let (data_manifest_entry, next_row_id) = if self.data_builder.has_entries() {
-            let (entry, next_id) = self.data_builder.write_leaf(
+            let result = self.data_builder.write_leaf(
                 engine,
                 self.snapshot_id,
                 self.starting_first_row_id,
             )?;
-            (Some(entry), next_id)
+            (Some(result.entry), result.next_row_id)
         } else {
             (None, self.starting_first_row_id)
         };

@@ -14,6 +14,9 @@ use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntryBuilder, DataContentType,
     TrackingInfo, TrackingStatus,
 };
+use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::object_store::local::LocalFileSystem;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
 use crate::DeltaResult;
 
@@ -50,19 +53,22 @@ fn make_data_entry(
         .build()
 }
 
-/// Builds a root manifest with row tracking, writes to parquet, reads back,
-/// and verifies that first_row_id values survive the round-trip.
-#[test]
-fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-
+/// Creates a [`DefaultEngine`] backed by local storage and a [`ContentTreeNodeBuilder`]
+/// rooted at a temporary directory.
+fn setup_engine_and_builder() -> (DefaultEngine<TokioBackgroundExecutor>, ContentTreeNodeBuilder) {
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
     let engine = DefaultEngineBuilder::new(store).build();
     let table_root = url::Url::from_directory_path(&temp_path).unwrap();
+    let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+    (engine, builder)
+}
 
-    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+/// Builds a root manifest with row tracking, writes to parquet, reads back,
+/// and verifies that first_row_id values survive the round-trip.
+#[test]
+fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
+    let (engine, mut builder) = setup_engine_and_builder();
 
     builder.add_entry(make_data_entry(
         "file-a.parquet",
@@ -76,7 +82,9 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
     ));
 
     // Build with row tracking starting at 42
-    let (root_metadata, next_row_id) = builder.build(&engine, 1, 42)?;
+    let result = builder.build(&engine, 1, 42)?;
+    let root_metadata = result.node;
+    let next_row_id = result.next_row_id;
     assert_eq!(next_row_id, 342);
 
     // Write to parquet and read back
@@ -102,15 +110,7 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
 /// and that subsequent entries are assigned correctly.
 #[test]
 fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-
-    let temp_path = tempfile::tempdir().unwrap().keep();
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
-    let table_root = url::Url::from_directory_path(&temp_path).unwrap();
-
-    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+    let (engine, mut builder) = setup_engine_and_builder();
 
     builder.add_entry(make_data_entry(
         "file-a.parquet",
@@ -124,7 +124,9 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     ));
     builder.add_entry(make_data_entry("file-b.parquet", 50, TrackingStatus::Added));
 
-    let (root_metadata, next_row_id) = builder.build(&engine, 1, 0)?;
+    let result = builder.build(&engine, 1, 0)?;
+    let root_metadata = result.node;
+    let next_row_id = result.next_row_id;
     // Deleted entry does not consume IDs: 0 + 100 + 50 = 150
     assert_eq!(next_row_id, 150);
 
@@ -152,15 +154,7 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
 /// after a round-trip.
 #[test]
 fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-
-    let temp_path = tempfile::tempdir().unwrap().keep();
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
-    let table_root = url::Url::from_directory_path(&temp_path).unwrap();
-
-    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+    let (engine, mut builder) = setup_engine_and_builder();
 
     builder.add_entry(make_data_entry(
         "file-a.parquet",
@@ -174,7 +168,9 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     ));
 
     // Starting from HWM of 500 (so starting_row_id = 501)
-    let (root_metadata, next_row_id) = builder.build(&engine, 1, 501)?;
+    let result = builder.build(&engine, 1, 501)?;
+    let root_metadata = result.node;
+    let next_row_id = result.next_row_id;
     assert_eq!(next_row_id, 801);
 
     let table_root = root_metadata.table_root.clone();
@@ -200,21 +196,9 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
 /// manifest list first_row_id computation), and survives a parquet round-trip.
 #[test]
 fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
-    use crate::content_tree::builder::ContentTreeNodeBuilder;
-    use crate::content_tree::writer::ContentTreeNodeWriter;
-    use crate::content_tree::{
-        absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntryBuilder, DataContentType,
-        ManifestStats, TrackingInfo, TrackingStatus,
-    };
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
+    use crate::content_tree::ManifestStats;
 
-    let temp_path = tempfile::tempdir().unwrap().keep();
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
-    let table_root = url::Url::from_directory_path(&temp_path).unwrap();
-
-    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+    let (engine, mut builder) = setup_engine_and_builder();
 
     // Manifest 1: 100 added + 200 existing = 300 row ID slots
     builder.add_entry(
@@ -269,7 +253,9 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
     );
 
     let starting_row_id = 1000;
-    let (root_metadata, next_row_id) = builder.build(&engine, 1, starting_row_id)?;
+    let result = builder.build(&engine, 1, starting_row_id)?;
+    let root_metadata = result.node;
+    let next_row_id = result.next_row_id;
     // 1000 + 300 + 100 = 1400
     assert_eq!(next_row_id, 1400);
 
@@ -305,15 +291,7 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
 /// manifest entries preserve their first_row_id.
 #[test]
 fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-
-    let temp_path = tempfile::tempdir().unwrap().keep();
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
-    let table_root = url::Url::from_directory_path(&temp_path).unwrap();
-
-    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+    let (engine, mut builder) = setup_engine_and_builder();
 
     // Existed file with pre-assigned first_row_id from a previous commit
     let mut existed_entry = make_data_entry("existed-file.parquet", 100, TrackingStatus::Existed);
@@ -327,31 +305,23 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
         TrackingStatus::Added,
     ));
 
-    let (root_metadata, next_row_id) = builder.build(&engine, 1, 0)?;
+    let result = builder.build(&engine, 1, 0)?;
+    let root_metadata = result.node;
+    let next_row_id = result.next_row_id;
     // Existed file has range [500, 600), cursor jumps to 600
     // Added file gets [600, 650)
     assert_eq!(next_row_id, 650);
 
     // Write and read back
     let table_root = root_metadata.table_root.clone();
-    let root_url = crate::content_tree::writer::ContentTreeNodeWriter::try_new(root_metadata)?
+    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-    let (iter, version, path_in_log) = crate::content_tree::ContentTreeNode::open_stream(
-        engine.parquet_handler(),
-        &root_url,
-        root_path,
-        None,
-        None,
-    )?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let (iter, version, path_in_log) =
+        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-    let root = crate::content_tree::ContentTreeNode::from_batches_with_version(
-        data,
-        version,
-        path_in_log,
-        table_root,
-    )?;
+    let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
     let entries = root.entries()?;
 
     assert_eq!(entries.len(), 2);
