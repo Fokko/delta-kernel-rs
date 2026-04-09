@@ -174,16 +174,23 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
 
     let scan = snapshot_v1.scan_builder().build()?;
     let batches = read_scan(&scan, engine_arc.clone())?;
-    let actual = batches.iter().flat_map(|b| {
-        b.column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .copied()
-    }).collect::<Vec<_>>();
-    assert_eq!(actual, vec![1, 2, 3, 4, 5], "Data should round-trip correctly");
+    let actual = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![1, 2, 3, 4, 5],
+        "Data should round-trip correctly"
+    );
 
     // ===== SECOND COMMIT: Remove the file =====
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;

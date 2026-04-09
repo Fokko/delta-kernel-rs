@@ -791,7 +791,9 @@ impl<S> Transaction<S> {
     pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
         let starting_first_row_id = self.ensure_row_id_cursor(engine)?;
         let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
-            Error::generic("new_leaf_node_writer requires with_manifest_commit() to be called first")
+            Error::generic(
+                "new_leaf_node_writer requires with_manifest_commit() to be called first",
+            )
         })?;
         mc.new_leaf_node_writer(engine, starting_first_row_id)
     }
@@ -817,8 +819,7 @@ impl<S> Transaction<S> {
         if let Some(cursor) = self.row_id_cursor {
             return Ok(cursor);
         }
-        let hwm =
-            RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+        let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
         let cursor = hwm.unwrap_or(-1) + 1;
         self.row_id_cursor = Some(cursor);
         Ok(cursor)

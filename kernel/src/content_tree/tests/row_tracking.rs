@@ -55,7 +55,10 @@ fn make_data_entry(
 
 /// Creates a [`DefaultEngine`] backed by local storage and a [`ContentTreeNodeBuilder`]
 /// rooted at a temporary directory.
-fn setup_engine_and_builder() -> (DefaultEngine<TokioBackgroundExecutor>, ContentTreeNodeBuilder) {
+fn setup_engine_and_builder() -> (
+    DefaultEngine<TokioBackgroundExecutor>,
+    ContentTreeNodeBuilder,
+) {
     let temp_path = tempfile::tempdir().unwrap().keep();
     let store = Arc::new(LocalFileSystem::new());
     let engine = DefaultEngineBuilder::new(store).build();

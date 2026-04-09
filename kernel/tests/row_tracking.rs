@@ -237,8 +237,7 @@ async fn verify_row_tracking_in_commit(
 
 #[tokio::test]
 async fn test_row_tracking_append() -> DeltaResult<()> {
-    let (table_url, engine, store, schema) =
-        setup_int_row_tracking_table("test_append").await?;
+    let (table_url, engine, store, schema) = setup_int_row_tracking_table("test_append").await?;
 
     // Create two new arrow record batches to append
     let data = generate_data(
@@ -492,8 +491,7 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
-    let (table_url, engine, store, schema) =
-        setup_int_row_tracking_table("test_append").await?;
+    let (table_url, engine, store, schema) = setup_int_row_tracking_table("test_append").await?;
 
     // Create two regular and one empty arrow record batches to append
     let data = generate_data(
@@ -533,8 +531,7 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
-    let (table_url, engine, store, schema) =
-        setup_int_row_tracking_table("test_append").await?;
+    let (table_url, engine, store, schema) = setup_int_row_tracking_table("test_append").await?;
 
     // Create two new _empty_ arrow record batches to append
     let data = generate_data(
@@ -1010,9 +1007,24 @@ async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn 
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
-    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf1.parquet", 512, 1_000_000, 5)])?;
-    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf2.parquet", 768, 1_000_001, 7)])?;
-    write_leaf(&mut txn, engine.as_ref(), schema, vec![("leaf3.parquet", 256, 1_000_002, 3)])?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf1.parquet", 512, 1_000_000, 5)],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf2.parquet", 768, 1_000_001, 7)],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf3.parquet", 256, 1_000_002, 3)],
+    )?;
     commit_at(txn, engine.as_ref(), 0)?;
 
     // Verify HWM = 14 (5 + 7 + 3 - 1)
@@ -1153,8 +1165,18 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     let mut txn3 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let schema = txn3.add_files_schema();
     txn3.with_manifest_commit();
-    write_leaf(&mut txn3, engine.as_ref(), schema, vec![("file4.parquet", 512, 1_000_003, 5)])?;
-    write_leaf(&mut txn3, engine.as_ref(), schema, vec![("file5.parquet", 768, 1_000_004, 10)])?;
+    write_leaf(
+        &mut txn3,
+        engine.as_ref(),
+        schema,
+        vec![("file4.parquet", 512, 1_000_003, 5)],
+    )?;
+    write_leaf(
+        &mut txn3,
+        engine.as_ref(),
+        schema,
+        vec![("file5.parquet", 768, 1_000_004, 10)],
+    )?;
     commit_at(txn3, engine.as_ref(), 2)?;
     verify_batch_commit_hwm(&table_url, 2, 59).await?;
 
