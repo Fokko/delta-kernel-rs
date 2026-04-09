@@ -2394,12 +2394,12 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             .try_collect()?;
 
         // With batch_commit, JSON log should contain:
-        // commit_info + domainMetadata (row tracking) + contentRoot
+        // commit_info + domainMetadata (row tracking) + checkpoint (which wraps contentRoot)
         // No add actions should be in the JSON log
         assert_eq!(
             parsed_actions.len(),
             3,
-            "Expected commitInfo, domainMetadata, and contentRoot actions, got {}. Actions: {:?}",
+            "Expected commitInfo, domainMetadata, and checkpoint actions, got {}. Actions: {:?}",
             parsed_actions.len(),
             parsed_actions,
         );
@@ -2410,9 +2410,13 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             parsed_actions[1]
         );
         assert!(
-            parsed_actions[2].get("contentRoot").is_some(),
-            "Third action should be contentRoot, but got: {:?}",
+            parsed_actions[2].get("checkpoint").is_some(),
+            "Third action should be checkpoint, but got: {:?}",
             parsed_actions[2]
+        );
+        assert!(
+            parsed_actions[2]["checkpoint"].get("contentRoot").is_some(),
+            "Checkpoint action should contain contentRoot"
         );
 
         // Verify no add actions in JSON log
