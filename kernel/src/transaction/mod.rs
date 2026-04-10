@@ -662,7 +662,7 @@ impl<S> Transaction<S> {
             })?;
 
             let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
-            let build_result = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
+            let root_node = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
 
             // The allocator's cursor is the first *unassigned* row ID, but the high water
             // mark records the last *assigned* one (i.e. the inclusive upper bound), so we
@@ -680,7 +680,7 @@ impl<S> Transaction<S> {
             let ContentTreeWriteResult {
                 location: content_metadata_path,
                 size_in_bytes,
-            } = ContentTreeNodeWriter::try_new(build_result.node)?.write(engine)?;
+            } = ContentTreeNodeWriter::try_new(root_node)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
@@ -2575,15 +2575,12 @@ mod tests {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let leaf_manifest_entry = leaf_builder
-            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .entry;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder
-            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .node;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2671,15 +2668,12 @@ mod tests {
         for path in &data_files {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let leaf_manifest_entry = leaf_builder
-            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .entry;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder
-            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .node;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2803,18 +2797,15 @@ mod tests {
         // File without DV
         data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let data_leaf_entry = data_leaf_builder
-            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .entry;
+        let data_leaf_entry =
+            data_leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_metadata = root_builder
-            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .node;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -3867,9 +3858,7 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
-        let root_metadata = builder
-            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
-            .node;
+        let root_metadata = builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;

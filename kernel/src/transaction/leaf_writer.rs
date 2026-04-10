@@ -338,10 +338,10 @@ impl LeafNodeWriter {
         // In the new CombinedManifest model, DV info is inline on data entries,
         // so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
-            let result =
+            Some(
                 self.data_builder
-                    .write_leaf(engine, self.snapshot_id, &mut self.allocator)?;
-            Some(result.entry)
+                    .write_leaf(engine, self.snapshot_id, &mut self.allocator)?,
+            )
         } else {
             None
         };

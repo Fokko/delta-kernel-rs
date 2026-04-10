@@ -734,8 +734,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
                 1,
                 &mut crate::row_tracking::CursorRowIdAllocator::new(0),
             )
-            .unwrap()
-            .node;
+            .unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().location
     };
@@ -1059,8 +1058,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
                 1,
                 &mut crate::row_tracking::CursorRowIdAllocator::new(0),
             )
-            .unwrap()
-            .node;
+            .unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().location
     };

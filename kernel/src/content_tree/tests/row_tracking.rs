@@ -87,8 +87,7 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
 
     // Build with row tracking starting at 42
     let mut allocator = CursorRowIdAllocator::new(42);
-    let result = builder.build(&engine, 1, &mut allocator)?;
-    let root_metadata = result.node;
+    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
     assert_eq!(allocator.current(), 342);
 
     // Write to parquet and read back
@@ -129,8 +128,7 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     builder.add_entry(make_data_entry("file-b.parquet", 50, TrackingStatus::Added));
 
     let mut allocator = CursorRowIdAllocator::new(0);
-    let result = builder.build(&engine, 1, &mut allocator)?;
-    let root_metadata = result.node;
+    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
     // Deleted entry does not consume IDs: 0 + 100 + 50 = 150
     assert_eq!(allocator.current(), 150);
 
@@ -173,8 +171,7 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
 
     // Starting from HWM of 500 (so starting_row_id = 501)
     let mut allocator = CursorRowIdAllocator::new(501);
-    let result = builder.build(&engine, 1, &mut allocator)?;
-    let root_metadata = result.node;
+    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
     assert_eq!(allocator.current(), 801);
 
     let table_root = root_metadata.table_root.clone();
@@ -257,8 +254,7 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
     );
 
     let mut allocator = CursorRowIdAllocator::new(1000);
-    let result = builder.build(&engine, 1, &mut allocator)?;
-    let root_metadata = result.node;
+    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
     // 1000 + 300 + 100 = 1400
     assert_eq!(allocator.current(), 1400);
 
@@ -309,8 +305,7 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
     ));
 
     let mut allocator = CursorRowIdAllocator::new(0);
-    let result = builder.build(&engine, 1, &mut allocator)?;
-    let root_metadata = result.node;
+    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
     // Existed file has range [500, 600), cursor jumps to 600
     // Added file gets [600, 650)
     assert_eq!(allocator.current(), 650);
