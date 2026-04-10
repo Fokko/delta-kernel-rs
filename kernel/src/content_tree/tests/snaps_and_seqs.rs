@@ -13,6 +13,7 @@ use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
     TrackingStatus,
 };
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
 use crate::DeltaResult;
 use crate::Version;
@@ -85,7 +86,9 @@ fn write_root_manifest(
     table_root: &Url,
     snapshot_id: i64,
 ) -> DeltaResult<String> {
-    let root = builder.build(engine, snapshot_id, 0)?.node;
+    let root = builder
+        .build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?
+        .node;
     let root_url = ContentTreeNodeWriter::try_new(root)?
         .write(engine)?
         .location;
@@ -98,7 +101,9 @@ fn build_and_read_root(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let root_metadata = builder.build(engine, snapshot_id, 0)?.node;
+    let root_metadata = builder
+        .build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?
+        .node;
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(engine)?
@@ -117,7 +122,9 @@ fn build_and_read_leaf(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let leaf_metadata = builder.build_leaf(engine, snapshot_id, 0)?.node;
+    let leaf_metadata = builder
+        .build_leaf(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?
+        .node;
     let table_root = leaf_metadata.table_root.clone();
     let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?
         .write(engine)?
@@ -234,7 +241,9 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     )?;
 
     // Write as a leaf manifest and verify the CombinedManifest entry
-    let manifest_entry = builder.write_leaf(&engine, 3, 0)?.entry;
+    let manifest_entry = builder
+        .write_leaf(&engine, 3, &mut CursorRowIdAllocator::new(0))?
+        .entry;
     assert_eq!(
         manifest_entry.content_type,
         DataContentType::CombinedManifest

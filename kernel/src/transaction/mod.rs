@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
-use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::row_tracking::{CursorRowIdAllocator, RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -661,15 +661,14 @@ impl<S> Transaction<S> {
                 Error::generic("row_id_cursor must be set when manifest commit is active")
             })?;
 
-            let build_result =
-                metadata_builder.build(engine, snapshot_id, starting_first_row_id)?;
+            let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
+            let build_result = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
 
-            // Write new row tracking HWM domain metadata for the batch commit path.
-            // next_row_id is the first *unassigned* row ID, but the high water mark
-            // records the last *assigned* one (i.e. the inclusive upper bound), so we
+            // The allocator's cursor is the first *unassigned* row ID, but the high water
+            // mark records the last *assigned* one (i.e. the inclusive upper bound), so we
             // subtract 1.
             {
-                let new_hwm = build_result.next_row_id - 1;
+                let new_hwm = allocator.current() - 1;
                 let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
                 let dm_action: DomainMetadata = rt_dm.try_into()?;
                 let schema = get_log_domain_metadata_schema().clone();
@@ -807,7 +806,7 @@ impl<S> Transaction<S> {
     ///
     /// * `leaf_result` - The result from calling `finish()` on a [`LeafNodeWriter`].
     pub fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
-        self.row_id_cursor = Some(leaf_result.next_row_id);
+        self.row_id_cursor = Some(leaf_result.final_cursor);
         let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
             Error::generic("add_leaf requires with_manifest_commit() to be called first")
         })?;
@@ -2576,11 +2575,15 @@ mod tests {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
+        let leaf_manifest_entry = leaf_builder
+            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .entry;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
+        let root_metadata = root_builder
+            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2668,11 +2671,15 @@ mod tests {
         for path in &data_files {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1, 0)?.entry;
+        let leaf_manifest_entry = leaf_builder
+            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .entry;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
+        let root_metadata = root_builder
+            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -2796,14 +2803,18 @@ mod tests {
         // File without DV
         data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1, 0)?.entry;
+        let data_leaf_entry = data_leaf_builder
+            .write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .entry;
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_metadata = root_builder.build(&engine, 1, 0)?.node;
+        let root_metadata = root_builder
+            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -3856,7 +3867,9 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
-        let root_metadata = builder.build(&engine, 1, 0)?.node;
+        let root_metadata = builder
+            .build(&engine, 1, &mut CursorRowIdAllocator::new(0))?
+            .node;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;

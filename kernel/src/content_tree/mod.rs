@@ -3553,7 +3553,13 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        builder.build(engine, 1, 0).map(|result| result.node)
+        builder
+            .build(
+                engine,
+                1,
+                &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+            )
+            .map(|result| result.node)
     }
 
     /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
@@ -3571,7 +3577,13 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        let metadata = builder.build(engine, 1, 0)?.node;
+        let metadata = builder
+            .build(
+                engine,
+                1,
+                &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+            )?
+            .node;
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?

@@ -1211,7 +1211,6 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
         create_add_files_metadata(schema, vec![("leaf-a.parquet", 4096, 1_000_000, 100)])?,
     )?;
     let result_a = leaf_a.finish(engine.as_ref())?;
-    assert_eq!(result_a.next_row_id, 100);
     txn.add_leaf(result_a)?;
 
     // Leaf B: 50 records -> row IDs [100, 150)
@@ -1221,7 +1220,6 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
         create_add_files_metadata(schema, vec![("leaf-b.parquet", 2048, 1_000_001, 50)])?,
     )?;
     let result_b = leaf_b.finish(engine.as_ref())?;
-    assert_eq!(result_b.next_row_id, 150);
     txn.add_leaf(result_b)?;
 
     // Leaf C: 200 records -> row IDs [150, 350)
@@ -1231,7 +1229,6 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
         create_add_files_metadata(schema, vec![("leaf-c.parquet", 8192, 1_000_002, 200)])?,
     )?;
     let result_c = leaf_c.finish(engine.as_ref())?;
-    assert_eq!(result_c.next_row_id, 350);
     txn.add_leaf(result_c)?;
 
     let committed = match txn.commit(engine.as_ref())? {

@@ -2,6 +2,7 @@ use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::DataType;
 use crate::{DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version};
 use roaring::RoaringTreemap;
@@ -28,8 +29,8 @@ pub struct LeafNodeWriterResult {
     /// Root DV entries to remove (DV paths that should be removed from root DV manifest)
     pub(crate) root_dv_entries_to_remove: HashSet<String>,
 
-    /// Next available row ID after all assignments in this leaf.
-    pub next_row_id: i64,
+    /// Final row ID cursor position after all assignments in this leaf.
+    pub(crate) final_cursor: i64,
 }
 
 /// Builder for creating leaf manifests.
@@ -70,8 +71,8 @@ pub struct LeafNodeWriter {
     /// Set to false when Transaction has released root to client control.
     track_root_removals: bool,
 
-    /// Starting first_row_id for row tracking assignment in the leaf.
-    starting_first_row_id: i64,
+    /// Row ID allocator for assigning `first_row_id` values in the leaf.
+    allocator: CursorRowIdAllocator,
 }
 
 /// Context for tracking manifest entry deletions
@@ -247,7 +248,7 @@ impl LeafNodeWriter {
             snapshot_id,
             root_manifest_path,
             track_root_removals,
-            starting_first_row_id,
+            allocator: CursorRowIdAllocator::new(starting_first_row_id),
         }
     }
 
@@ -336,15 +337,13 @@ impl LeafNodeWriter {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
         // In the new CombinedManifest model, DV info is inline on data entries,
         // so no separate DV manifest is needed.
-        let (data_manifest_entry, next_row_id) = if self.data_builder.has_entries() {
-            let result = self.data_builder.write_leaf(
-                engine,
-                self.snapshot_id,
-                self.starting_first_row_id,
-            )?;
-            (Some(result.entry), result.next_row_id)
+        let data_manifest_entry = if self.data_builder.has_entries() {
+            let result =
+                self.data_builder
+                    .write_leaf(engine, self.snapshot_id, &mut self.allocator)?;
+            Some(result.entry)
         } else {
-            (None, self.starting_first_row_id)
+            None
         };
 
         Ok(LeafNodeWriterResult {
@@ -352,7 +351,7 @@ impl LeafNodeWriter {
             root_entries_to_remove: self.root_entries_to_remove,
             root_dv_entries_to_remove: self.root_dv_entries_to_remove,
             data_file_manifest_written: data_manifest_entry,
-            next_row_id,
+            final_cursor: self.allocator.current(),
         })
     }
 }

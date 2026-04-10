@@ -17,6 +17,7 @@ use crate::content_tree::{
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::object_store::local::LocalFileSystem;
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
 use crate::DeltaResult;
 
@@ -85,10 +86,10 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
     ));
 
     // Build with row tracking starting at 42
-    let result = builder.build(&engine, 1, 42)?;
+    let mut allocator = CursorRowIdAllocator::new(42);
+    let result = builder.build(&engine, 1, &mut allocator)?;
     let root_metadata = result.node;
-    let next_row_id = result.next_row_id;
-    assert_eq!(next_row_id, 342);
+    assert_eq!(allocator.current(), 342);
 
     // Write to parquet and read back
     let table_root = root_metadata.table_root.clone();
@@ -127,11 +128,11 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     ));
     builder.add_entry(make_data_entry("file-b.parquet", 50, TrackingStatus::Added));
 
-    let result = builder.build(&engine, 1, 0)?;
+    let mut allocator = CursorRowIdAllocator::new(0);
+    let result = builder.build(&engine, 1, &mut allocator)?;
     let root_metadata = result.node;
-    let next_row_id = result.next_row_id;
     // Deleted entry does not consume IDs: 0 + 100 + 50 = 150
-    assert_eq!(next_row_id, 150);
+    assert_eq!(allocator.current(), 150);
 
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
@@ -171,10 +172,10 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     ));
 
     // Starting from HWM of 500 (so starting_row_id = 501)
-    let result = builder.build(&engine, 1, 501)?;
+    let mut allocator = CursorRowIdAllocator::new(501);
+    let result = builder.build(&engine, 1, &mut allocator)?;
     let root_metadata = result.node;
-    let next_row_id = result.next_row_id;
-    assert_eq!(next_row_id, 801);
+    assert_eq!(allocator.current(), 801);
 
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
@@ -255,12 +256,11 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
             .build(),
     );
 
-    let starting_row_id = 1000;
-    let result = builder.build(&engine, 1, starting_row_id)?;
+    let mut allocator = CursorRowIdAllocator::new(1000);
+    let result = builder.build(&engine, 1, &mut allocator)?;
     let root_metadata = result.node;
-    let next_row_id = result.next_row_id;
     // 1000 + 300 + 100 = 1400
-    assert_eq!(next_row_id, 1400);
+    assert_eq!(allocator.current(), 1400);
 
     // Write and read back
     let table_root = root_metadata.table_root.clone();
@@ -308,12 +308,12 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
         TrackingStatus::Added,
     ));
 
-    let result = builder.build(&engine, 1, 0)?;
+    let mut allocator = CursorRowIdAllocator::new(0);
+    let result = builder.build(&engine, 1, &mut allocator)?;
     let root_metadata = result.node;
-    let next_row_id = result.next_row_id;
     // Existed file has range [500, 600), cursor jumps to 600
     // Added file gets [600, 650)
-    assert_eq!(next_row_id, 650);
+    assert_eq!(allocator.current(), 650);
 
     // Write and read back
     let table_root = root_metadata.table_root.clone();
