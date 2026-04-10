@@ -304,9 +304,9 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
         TrackingStatus::Added,
     ));
 
-    let mut allocator = CursorRowIdAllocator::new(0);
+    // Allocator starts at HWM+1 = 600 (existed entry covers [500, 600))
+    let mut allocator = CursorRowIdAllocator::new(600);
     let root_metadata = builder.build(&engine, 1, &mut allocator)?;
-    // Existed file has range [500, 600), cursor jumps to 600
     // Added file gets [600, 650)
     assert_eq!(allocator.current(), 650);
 

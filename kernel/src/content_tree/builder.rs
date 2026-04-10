@@ -1447,22 +1447,17 @@ impl ContentTreeNodeBuilder {
 
             match entry.content_type {
                 DataContentType::Data => {
-                    if let Some(existing) = ti.first_row_id {
-                        // Preserve existing, advance cursor past its range
-                        allocator.set_cursor(existing + entry.record_count);
-                    } else {
+                    if ti.first_row_id.is_none() {
                         ti.first_row_id = Some(allocator.reserve_row_ids(entry.record_count));
                     }
                 }
                 DataContentType::CombinedManifest => {
-                    let row_increment = entry
-                        .manifest_stats
-                        .as_ref()
-                        .map(|ms| ms.added_rows_count + ms.existing_rows_count)
-                        .unwrap_or(0);
-                    if let Some(existing) = ti.first_row_id {
-                        allocator.set_cursor(existing + row_increment);
-                    } else {
+                    if ti.first_row_id.is_none() {
+                        let row_increment = entry
+                            .manifest_stats
+                            .as_ref()
+                            .map(|ms| ms.added_rows_count + ms.existing_rows_count)
+                            .unwrap_or(0);
                         ti.first_row_id = Some(allocator.reserve_row_ids(row_increment));
                     }
                 }
@@ -4022,7 +4017,8 @@ mod tests {
             .pending_entries
             .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
 
-        let mut allocator = CursorRowIdAllocator::new(0);
+        // Allocator starts at HWM+1 = 300 (existed entry covers [0, 300))
+        let mut allocator = CursorRowIdAllocator::new(300);
         builder.assign_first_row_ids(&mut allocator);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));

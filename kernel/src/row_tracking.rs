@@ -41,14 +41,6 @@ impl CursorRowIdAllocator {
     pub(crate) fn current(&self) -> i64 {
         self.cursor
     }
-
-    /// Jumps the cursor to a specific position.
-    ///
-    /// Used when entries already have assigned row IDs and the cursor must advance past
-    /// their range without allocating new IDs.
-    pub(crate) fn set_cursor(&mut self, pos: i64) {
-        self.cursor = pos;
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
