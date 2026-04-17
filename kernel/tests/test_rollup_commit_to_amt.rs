@@ -2,7 +2,7 @@
 //! then doing a manifest commit to convert those stats to content_stats.
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::Snapshot;
 use std::sync::Arc;

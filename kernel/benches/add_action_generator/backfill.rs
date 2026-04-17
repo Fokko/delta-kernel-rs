@@ -12,8 +12,10 @@ use std::fs;
 use std::process;
 
 use clap::Parser;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use unity_catalog_delta_client_api::Operation;
 
 // Share the generator modules from the same directory
 #[path = "deletion_vector.rs"]
@@ -191,7 +193,7 @@ async fn main() {
         &args.table_dir,
         args.uc_endpoint.as_deref(),
         args.uc_token.as_deref(),
-        uc_client::prelude::Operation::ReadWrite,
+        Operation::ReadWrite,
     )
     .await
     {

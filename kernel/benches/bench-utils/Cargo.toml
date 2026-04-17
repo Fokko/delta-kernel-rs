@@ -11,9 +11,10 @@ delta_kernel = { path = "../..", features = [
   "internal-api",
 ] }
 futures = "0.3"
-object_store = "0.12.3"
+object_store = "0.13"
 tokio = { version = "1.47", features = ["rt-multi-thread"] }
-uc-client = { path = "../../../uc-client" }
+unity-catalog-delta-rest-client = { path = "../../../unity-catalog-delta-rest-client" }
+unity-catalog-delta-client-api = { path = "../../../unity-catalog-delta-client-api" }
 url = "2"
 
 [dev-dependencies]

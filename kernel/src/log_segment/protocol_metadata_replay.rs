@@ -62,7 +62,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        self.read_actions(engine, schema, None)
+        self.read_actions(engine, schema)
     }
 }
 

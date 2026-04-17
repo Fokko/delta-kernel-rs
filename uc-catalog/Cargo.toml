@@ -17,7 +17,6 @@ release = false
 default = ["arrow"]
 arrow = ["arrow-57"]
 arrow-57 = ["delta_kernel/arrow-57"]
-arrow-56 = ["delta_kernel/arrow-56"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["catalog-managed"] }

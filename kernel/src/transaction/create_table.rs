@@ -32,6 +32,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 use crate::actions::DomainMetadata;
 use crate::committer::Committer;
@@ -175,7 +176,8 @@ impl CreateTableTransaction {
             snapshot_id: crate::actions::generate_snapshot_id(),
             manifest_commit_state: None,
             row_id_cursor: None,
-            clustering_columns_physical: clustering_columns,
+            physical_clustering_columns: clustering_columns,
+            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }

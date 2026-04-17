@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use tracing::instrument;
 
@@ -63,7 +63,7 @@ impl Transaction {
             .ensure_operation_supported(Operation::Write)?;
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_clustering_columns_physical(engine)?;
+        let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -93,7 +93,8 @@ impl Transaction {
             snapshot_id: generate_snapshot_id(),
             manifest_commit_state: None,
             row_id_cursor: None,
-            clustering_columns_physical: clustering_columns,
+            physical_clustering_columns: clustering_columns,
+            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }
@@ -146,11 +147,8 @@ impl Transaction {
     /// # use std::sync::Arc;
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
-    /// # #[cfg(feature = "catalog-managed")]
     /// # use delta_kernel::committer::FileSystemCommitter;
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
-    /// # #[cfg(feature = "catalog-managed")]
-    /// # {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
@@ -169,7 +167,6 @@ impl Transaction {
     ///
     /// // Commit the transaction
     /// txn.commit(engine.as_ref())?;
-    /// # }
     /// # Ok(())
     /// # }
     /// ```

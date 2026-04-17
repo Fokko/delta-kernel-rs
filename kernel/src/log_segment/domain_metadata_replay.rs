@@ -57,7 +57,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_log_domain_metadata_schema();
-        self.read_actions(engine, schema.clone(), None)
+        self.read_actions(engine, schema.clone())
     }
 }
 

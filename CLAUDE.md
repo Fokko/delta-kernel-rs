@@ -47,16 +47,17 @@ cargo fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                  | Directory       | Description                                    |
-|------------------------|-----------------|------------------------------------------------|
-| `delta_kernel`         | `kernel/`       | Core library                                   |
-| `delta_kernel_ffi`     | `ffi/`          | C/C++ FFI bindings                             |
-| `delta_kernel_derive`  | `derive-macros/`| Proc macros                                    |
-| `acceptance`           | `acceptance/`   | Acceptance tests (DAT)                         |
-| `test_utils`           | `test-utils/`   | Shared test utilities                          |
-| `feature_tests`        | `feature-tests/`| Feature flag tests                             |
-| `uc-catalog`           | `uc-catalog/`   | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`            | `uc-client/`    | Unity Catalog REST client                      |
+| Crate                                    | Directory                                  | Description                                             |
+|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
+| `delta_kernel`                           | `kernel/`                                  | Core library                                            |
+| `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
+| `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
+| `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
+| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
+| `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
+| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
+| `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
+| `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
 
 ### Feature Flags
 
@@ -82,9 +83,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`,
-assembles commit actions, enforces protocol compliance, delegates atomic commit to a
-`Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`
+(via `partitioned_write_context` or `unpartitioned_write_context`), assembles commit
+actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
@@ -98,7 +99,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
-- **Integration tests** exercise only public APIs end-to-end.
+- **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
+  for a catalog of available test tables (schema, protocol, features, and which tests use
+  them). Consult it before creating new test data to avoid duplication.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -112,6 +115,12 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
+- Actively look for rstest consolidation opportunities: when writing multiple tests
+  that share the same setup/flow and differ only in configuration and expected
+  outcome, write one parameterized rstest instead of separate functions. Also check
+  whether a new test duplicates the flow of an existing nearby test and should be
+  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
+  column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
@@ -151,9 +160,9 @@ is the source of truth. Key concepts:
   `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
   `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `clustering`,
   `inCommitTimestamp`
-- Reader + writer: `columnMapping`, `deletionVectors`, `timestampNtz`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`, `variantType-preview`,
-  `typeWidening`
+- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
+  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `variantType`, `variantType-preview`, `typeWidening`
 
 Keep this list updated when new protocol features are added to kernel.
 
@@ -169,6 +178,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Code Style / Documentation
 
+- Line width is 100 characters. Wrap comments and string literals at 100, not 80.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
 - MUST include doc comments for all public functions, structs, enums, and methods.
 - MUST document function parameters, return values, and errors.
 - Keep comments up-to-date with code changes.

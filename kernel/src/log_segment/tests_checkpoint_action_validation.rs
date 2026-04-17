@@ -3,7 +3,7 @@ use super::*;
 use crate::engine::default::DefaultEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStore;
+use crate::object_store::ObjectStoreExt as _;
 use crate::DeltaResult;
 use std::sync::Arc;
 use url::Url;
@@ -90,6 +90,7 @@ fn test_nested_pm_overrides_when_top_level_protocol_lacks_feature() -> DeltaResu
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     // Log replay processes v1 first (most recent). The checkpoint action's nested P+M
@@ -171,6 +172,7 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     // Pass existing protocol - should skip checkpoint action search entirely
@@ -249,6 +251,7 @@ fn test_find_checkpoint_action_when_protocol_has_feature() -> DeltaResult<()> {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
@@ -343,6 +346,7 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
@@ -439,6 +443,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
@@ -540,6 +545,7 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
@@ -642,6 +648,7 @@ fn test_multiple_checkpoint_actions_returns_most_recent() -> DeltaResult<()> {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
@@ -699,6 +706,7 @@ fn make_log_segment(log_root: &Url, end_version: u64) -> LogSegment {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     }
 }
 

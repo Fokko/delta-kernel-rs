@@ -49,7 +49,7 @@ pub fn generate_add_actions(
 ) -> Vec<AddActionMetadata> {
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_entropy(),
+        None => StdRng::from_os_rng(),
     };
 
     let stats_gen = StatsGenerator::new(deterministic_start);
@@ -62,7 +62,7 @@ pub fn generate_add_actions(
             let path = format!("part-{:05}-{}.snappy.parquet", i, uuid);
 
             // Generate size in bytes [4MB, 8MB)
-            let size = rng.gen_range(4_000_000..8_000_000);
+            let size = rng.random_range(4_000_000..8_000_000);
 
             // Current timestamp in milliseconds
             let modification_time = chrono::Utc::now().timestamp_millis();
@@ -71,7 +71,7 @@ pub fn generate_add_actions(
             let stats = stats_gen.generate(&mut rng);
 
             // Generate deletion vector based on probability
-            let deletion_vector = if rng.gen::<f64>() < dv_probability {
+            let deletion_vector = if rng.random::<f64>() < dv_probability {
                 Some(dv_gen.generate(&mut rng, stats.num_records))
             } else {
                 None

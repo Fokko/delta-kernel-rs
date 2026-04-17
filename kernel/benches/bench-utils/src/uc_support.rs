@@ -18,7 +18,8 @@
 //! to get table locations and credentials for S3 access.
 
 use std::sync::Arc;
-use uc_client::prelude::*;
+use unity_catalog_delta_client_api::Operation;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;
 
 /// Configuration for Unity Catalog access
@@ -55,7 +56,7 @@ pub async fn get_table_info(
     config: &UCConfig,
     table_name: &str,
 ) -> Result<UCTableInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let client_config = uc_client::ClientConfig::build(&config.endpoint, &config.token).build()?;
+    let client_config = ClientConfig::build(&config.endpoint, &config.token).build()?;
     let uc_client = UCClient::new(client_config)?;
 
     let res = uc_client.get_table(table_name).await?;
@@ -95,7 +96,7 @@ pub async fn create_engine_with_uc_credentials(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let client_config = uc_client::ClientConfig::build(&config.endpoint, &config.token).build()?;
+    let client_config = ClientConfig::build(&config.endpoint, &config.token).build()?;
     let uc_client = UCClient::new(client_config)?;
 
     // Get credentials for the operation

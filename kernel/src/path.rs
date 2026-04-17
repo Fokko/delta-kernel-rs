@@ -340,7 +340,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
@@ -405,6 +404,8 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedLogPath<Url> for a log compaction file
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
@@ -464,7 +465,6 @@ impl LogRoot {
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    #[allow(unused)] // TODO: Remove this once we remove catalog-managed feature
     pub(crate) fn new_staged_commit_path(
         &self,
         version: Version,
@@ -498,7 +498,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Commit);
@@ -515,7 +515,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
@@ -529,7 +529,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Crc);

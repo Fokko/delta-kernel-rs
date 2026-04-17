@@ -113,6 +113,26 @@ fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
         .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
 }
 
+/// Check if a path segment is `Option<HashMap<K, V>>`.
+fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
+    if seg.ident != "Option" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(angle_args) = &seg.arguments else {
+        return false;
+    };
+    // Option has exactly one type argument
+    let Some(syn::GenericArgument::Type(Type::Path(inner_type))) = angle_args.args.first() else {
+        return false;
+    };
+    // Check if the inner type's last segment is HashMap
+    inner_type
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "HashMap")
+}
+
 fn gen_schema_field(field: &Field) -> TokenStream {
     let name = get_schema_name(field.ident.as_ref().unwrap());
     let have_schema_null = field.attrs.iter().any(|attr| {
@@ -145,12 +165,18 @@ fn gen_schema_field(field: &Field) -> TokenStream {
 
             // First, determine which base function to call based on schema_null setting
             let base_call = if have_schema_null {
-                if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                    if last_ident != "HashMap" {
+                if let Some(last_seg) = type_path.path.segments.last() {
+                    let is_valid = last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
+                    if !is_valid {
                         return Error::new(
-                            last_ident.span(),
-                            format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
-                        ).to_compile_error();
+                            last_seg.ident.span(),
+                            format!(
+                                "Can only use allow_null_container_values on HashMap or \
+                                 Option<HashMap> fields, not {}",
+                                last_seg.ident
+                            ),
+                        )
+                        .to_compile_error();
                     }
                 }
                 quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
@@ -351,10 +377,10 @@ mod tests {
             struct TestStruct {
                 #[field_id = 123]
                 valid_field: String,
-                
+
                 #[field_id = 456]
                 another_valid_field: i32,
-                
+
                 normal_field: bool,
             }
         "#;

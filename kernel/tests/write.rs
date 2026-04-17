@@ -27,7 +27,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStore};
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::{CommitResult, Transaction};
 use tempfile::TempDir;
@@ -39,12 +39,11 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
+use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
-
-use delta_kernel::expressions::ColumnName;
-use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
 
@@ -83,6 +82,7 @@ fn create_column_mapping_schema(
         ),
     ])])?))
 }
+
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.
 ///
@@ -506,7 +506,7 @@ async fn write_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
@@ -564,7 +564,7 @@ async fn append_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
@@ -718,18 +718,18 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
 
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
         validate_timestamp(&parsed_commits[0]["commitInfo"]);
+        let snapshot_id = parsed_commits[0]["commitInfo"]["snapshotId"]
+            .as_i64()
+            .expect("snapshotId should be present and a positive integer in commitInfo");
+        assert!(
+            snapshot_id > 0,
+            "snapshotId must be positive, got {snapshot_id}"
+        );
 
         // Zero out non-deterministic fields for stable comparison.
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
-
-        // Remove snapshotId since it's randomly generated
-        if let Some(obj) = parsed_commits[0]
-            .get_mut("commitInfo")
-            .and_then(|v| v.as_object_mut())
-        {
-            obj.remove("snapshotId");
-        }
+        set_json_value(&mut parsed_commits[0], "commitInfo.snapshotId", json!(0))?;
 
         // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
         // omitted from the JSON — consistent with how the Delta log serializes optional fields.
@@ -745,6 +745,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "txnId": ZERO_UUID,
                 "timestamp": 0,
+                "snapshotId": 0,
             }
         })];
 
@@ -952,20 +953,25 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
         let tasks = append_data
             .into_iter()
             .zip(partition_vals)
             .map(|(data, partition_val)| {
+                let write_context = Arc::new(
+                    txn.partitioned_write_context(HashMap::from([(
+                        partition_col.to_string(),
+                        Scalar::String(partition_val.into()),
+                    )]))
+                    .unwrap(),
+                );
                 // arc clones
                 let engine = engine.clone();
-                let write_context = write_context.clone();
                 tokio::task::spawn(async move {
                     engine
                         .write_parquet(
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
-                            HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
+                            HashMap::new(),
                             &Default::default(),
                         )
                         .await
@@ -1068,6 +1074,102 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Verify that materialized partition columns do not get stats collected. The partition column
+// is physically present in the parquet file, but its stats should be omitted because the
+// value is already in the Add action's `partitionValues`.
+#[tokio::test]
+async fn test_materialized_partition_columns_excluded_from_stats(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "partition";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable("partition", DataType::STRING),
+    ])?);
+
+    // Create a table with materializePartitionColumns writer feature
+    let (store, engine, table_location) = engine_store_setup("test_mat_part", None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        table_schema.clone(),
+        &[partition_col],
+        true, // use_37_protocol for writer features
+        vec![],
+        vec!["materializePartitionColumns"],
+    )
+    .await?;
+
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine");
+
+    // With materializePartitionColumns, the data batch includes the partition column
+    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "a", "a"])),
+        ],
+    )?;
+    let data = Box::new(ArrowEngineData::new(batch));
+
+    let write_context = txn.partitioned_write_context(HashMap::from([(
+        partition_col.to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+    let result = engine
+        .write_parquet(&data, &write_context, HashMap::new(), &Default::default())
+        .await?;
+    txn.add_files(result);
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Read the commit log and verify stats
+    let commit = store
+        .get(&Path::from(
+            "/test_mat_part/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+    let parsed: Vec<serde_json::Value> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    let add = parsed
+        .iter()
+        .find(|v| v.get("add").is_some())
+        .expect("should have an add action");
+    let stats: serde_json::Value =
+        serde_json::from_str(add["add"]["stats"].as_str().unwrap()).unwrap();
+
+    // Stats should contain the data column but NOT the partition column
+    assert!(
+        stats["minValues"].get("number").is_some(),
+        "Data column 'number' should have minValues"
+    );
+    assert!(
+        stats["maxValues"].get("number").is_some(),
+        "Data column 'number' should have maxValues"
+    );
+    assert!(
+        stats["minValues"].get("partition").is_none(),
+        "Partition column should not have minValues even when materialized"
+    );
+    assert!(
+        stats["maxValues"].get("partition").is_none(),
+        "Partition column should not have maxValues even when materialized"
+    );
+    assert!(
+        stats["nullCount"].get("partition").is_none(),
+        "Partition column should not have nullCount even when materialized"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -1102,7 +1204,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -1310,7 +1412,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = engine
         .write_parquet(
@@ -1502,7 +1604,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1510,9 +1612,9 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
         .write_parquet_file(
-            write_context.target_dir(),
+            write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
             &Default::default(),
         )
@@ -1677,7 +1779,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1685,9 +1787,9 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
         .write_parquet_file(
-            write_context.target_dir(),
+            write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
             &Default::default(),
         )
@@ -1748,7 +1850,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
     // write context does not conflict with domain metadata
-    let _write_context = txn.get_write_context();
+    let _write_context = txn.unpartitioned_write_context().unwrap();
 
     // set multiple domain metadata
     let domain1 = "app.config";
@@ -2159,7 +2261,7 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let file_meta = engine
         .write_parquet(
             &ArrowEngineData::new(data),
@@ -2356,7 +2458,7 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
         let tasks = append_data.into_iter().map(|data| {
             let engine = engine.clone();
             let write_context = write_context.clone();
@@ -3424,7 +3526,7 @@ async fn add_files_to_transaction(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data),
@@ -3856,7 +3958,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
             &snapshot,
             &engine,
             batch,
-            HashMap::from([("letter".to_string(), "a".to_string())]),
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )
         .await;
         assert!(
@@ -3868,7 +3970,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
 }
 
 #[tokio::test]
-async fn test_write_parquet_rejects_unknown_partition_column(
+async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
@@ -3876,24 +3978,21 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("test");
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )?;
-
-        let result = write_batch_to_table(
-            &snapshot,
-            &engine,
-            batch,
-            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
-        )
-        .await;
-        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let result = txn.partitioned_write_context(HashMap::from([(
+            "nonexistent".to_string(),
+            Scalar::String("val".into()),
+        )]));
+        let err =
+            result.expect_err("should fail with partitioned_write_context on unpartitioned table");
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
-            "Error should mention the unknown column name, got: {err_msg}"
+            err_msg.contains("table is not partitioned"),
+            "Error should indicate table is not partitioned, got: {err_msg}"
         );
     }
     Ok(())
@@ -4230,7 +4329,7 @@ async fn test_column_mapping_partitioned_write(
         Arc::new(data_schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![1, 2]))],
     )?;
-    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    let partition_values = HashMap::from([("category".to_string(), Scalar::String("A".into()))]);
     write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
     // Read commit log and verify add.partitionValues key uses physical name
@@ -4287,7 +4386,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref()).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())

@@ -26,6 +26,7 @@ use crate::schema::{
 };
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
 use itertools::Itertools;
+
 use test_utils::delta_path_for_version;
 
 // ---------------------------------------------------------------------------

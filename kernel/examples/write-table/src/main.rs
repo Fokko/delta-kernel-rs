@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::{create_dir_all, read_to_string};
 use std::path::Path;
 use std::process::ExitCode;
@@ -94,89 +93,13 @@ async fn try_main() -> DeltaResult<()> {
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
 
-    // DEMONSTRATION: Query which statistics to collect
-    // The transaction provides two ways to determine which columns need statistics:
-
-    // 1. Get the full stats schema (useful for schema-aware engines)
-    let stats_schema = txn.stats_schema();
-    println!("\n=== Statistics Schema ===");
-    println!("The stats schema shows the full structure for statistics:");
-    println!("{:#?}", stats_schema);
-
-    // 2. Get a flat list of column names (simpler API)
-    let stats_columns = txn.stats_columns();
-    println!("\n=== Statistics Columns ===");
-    println!(
-        "Collect statistics for these {} columns:",
-        stats_columns.len()
-    );
-    for col in &stats_columns {
-        println!("  - {}", col);
-    }
-
-    // 3. Get the full add_files_schema that engines must conform to
-    let add_files_schema = txn.add_files_schema();
-    println!("\n=== Add Files Schema ===");
-    println!("Engines must return data matching this schema:");
-    println!("{:#?}", add_files_schema);
-
-    /*
-    HOW AN ENGINE WOULD COLLECT STATISTICS:
-
-    When writing a Parquet file, the engine would:
-
-    1. Query txn.stats_columns() or txn.stats_schema() to know which columns to track
-    2. While writing data, track for each column:
-       - numRecords: total row count
-       - nullCount: count of null values
-       - minValues: minimum value seen
-       - maxValues: maximum value seen
-    3. After writing, construct a stats struct matching the schema:
-
-    ```rust
-    use arrow::array::{Int64Array, StructArray};
-
-    // Example: For a table with columns "id" and "name"
-    let stats = StructArray::try_new_with_length(
-        vec![
-            Field::new("numRecords", DataType::Int64, true),
-            Field::new("nullCount", DataType::Struct(Fields::from(vec![
-                Field::new("id", DataType::Int64, true),
-                Field::new("name", DataType::Int64, true),
-            ])), true),
-            Field::new("minValues", DataType::Struct(Fields::from(vec![
-                Field::new("id", DataType::Int32, true),
-                Field::new("name", DataType::Utf8, true),
-            ])), true),
-            Field::new("maxValues", DataType::Struct(Fields::from(vec![
-                Field::new("id", DataType::Int32, true),
-                Field::new("name", DataType::Utf8, true),
-            ])), true),
-            Field::new("tightBounds", DataType::Boolean, true),
-        ].into(),
-        vec![
-            Arc::new(Int64Array::from(vec![1000])), // numRecords
-            Arc::new(StructArray::try_new(...)?),    // nullCount: {id: 0, name: 5}
-            Arc::new(StructArray::try_new(...)?),    // minValues: {id: 1, name: "Alice"}
-            Arc::new(StructArray::try_new(...)?),    // maxValues: {id: 1000, name: "Zoe"}
-            Arc::new(BooleanArray::from(vec![true])), // tightBounds
-        ],
-        None,
-        1,
-    )?;
-    ```
-
-    The engine returns this stats struct as part of the file metadata, and Kernel
-    automatically converts it to JSON when committing the transaction.
-    */
-
-    // Write the data using the engine (which internally collects statistics)
-    let write_context = Arc::new(txn.get_write_context());
+    // Write the data using the engine
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let file_metadata = engine
         .write_parquet(
             &sample_data,
             write_context.as_ref(),
-            HashMap::new(),
+            Default::default(),
             &Default::default(),
         )
         .await?;

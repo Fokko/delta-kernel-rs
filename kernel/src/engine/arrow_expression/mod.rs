@@ -258,12 +258,11 @@ pub struct ArrowEvaluationHandler;
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
             expression,
             output_type,
             output_schema: OnceLock::new(),
@@ -272,13 +271,10 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
     fn new_predicate_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
-        Ok(Arc::new(DefaultPredicateEvaluator {
-            _input_schema: schema,
-            predicate,
-        }))
+        Ok(Arc::new(DefaultPredicateEvaluator { predicate }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
@@ -294,29 +290,24 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 
-    /// Efficient implementation of create_many for Arrow that creates a multi-row EngineData
-    /// in a single pass by building columnar arrays directly.
-    ///
-    /// Each row should contain one structured scalar per top-level field in the schema.
     fn create_many(
         &self,
         schema: SchemaRef,
         rows: &[&[Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>> {
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
         if rows.is_empty() {
-            // Return empty EngineData (0 rows)
-            let null_row = self.null_row(schema.clone())?;
-            return null_row.apply_selection_vector(vec![]);
+            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
+                arrow_schema,
+            ))));
         }
 
         let num_rows = rows.len();
-        let num_fields = schema.as_ref().fields().len();
-
-        // Validate that all rows have the correct number of fields
+        let num_fields = schema.fields().len();
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != num_fields {
                 return Err(Error::generic(format!(
-                    "Row {} has {} fields, expected {}",
+                    "Row {} has {} scalars but schema has {} fields",
                     row_idx,
                     row.len(),
                     num_fields
@@ -324,34 +315,33 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             }
         }
 
-        // Convert the kernel schema to Arrow schema
-        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
-
-        // Create builders for top-level fields
         let mut builders: Vec<Box<dyn ArrayBuilder>> = arrow_schema
             .fields()
             .iter()
             .map(|field| array::make_builder(field.data_type(), num_rows))
             .collect();
 
-        // Column-major iteration: process all rows for each column
-        // This is better for cache locality and allows builders to batch operations
+        let fields: Vec<_> = schema.fields().collect();
         for (col_idx, builder) in builders.iter_mut().enumerate() {
-            for row in rows.iter() {
-                row[col_idx].append_to(builder.as_mut(), 1)?;
+            let field_name = fields[col_idx].name();
+            for (row_idx, row) in rows.iter().enumerate() {
+                row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
+                    Error::generic(format!(
+                        "Row {row_idx}, field '{field_name}' \
+                            (expected type {}, got {}): {e}",
+                        fields[col_idx].data_type(),
+                        row[col_idx].data_type()
+                    ))
+                })?;
             }
         }
 
-        // Finish all builders to create arrays
-        let arrays: Vec<ArrayRef> = builders
-            .into_iter()
-            .map(|mut builder| builder.finish())
-            .collect();
+        let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
-        // Create the RecordBatch
-        let batch = RecordBatch::try_new(arrow_schema, arrays)?;
-
-        Ok(Box::new(ArrowEngineData::new(batch)))
+        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema,
+            arrays,
+        )?)))
     }
 
     fn new_lookup_join_handler(
@@ -376,7 +366,6 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
     /// Lazily cached Arrow schema for non-struct output types (the `{output: <type>}` schema).
@@ -402,16 +391,6 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // let input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
-
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
@@ -444,7 +423,6 @@ static PREDICATE_OUTPUT_SCHEMA: OnceLock<Arc<ArrowSchema>> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    _input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -452,15 +430,6 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // let input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = PREDICATE_OUTPUT_SCHEMA.get_or_init(|| {
             Arc::new(ArrowSchema::new(vec![ArrowField::new(

@@ -41,7 +41,7 @@ impl DeletionVectorGenerator {
     /// Always uses relative path DVs (most common in production)
     pub fn generate(&self, rng: &mut StdRng, num_records: i64) -> DeletionVectorDescriptor {
         // Cardinality: 5-15% of total records, minimum 10
-        let cardinality = (num_records as f64 * rng.gen_range(0.05..0.15)) as i64;
+        let cardinality = (num_records as f64 * rng.random_range(0.05..0.15)) as i64;
         let cardinality = cardinality.max(10);
 
         // Always use relative path DVs (most common and efficient in production)
@@ -57,10 +57,10 @@ impl DeletionVectorGenerator {
         inline_prob: f64,
         relative_prob: f64,
     ) -> DeletionVectorDescriptor {
-        let cardinality = (num_records as f64 * rng.gen_range(0.05..0.15)) as i64;
+        let cardinality = (num_records as f64 * rng.random_range(0.05..0.15)) as i64;
         let cardinality = cardinality.max(10);
 
-        let rand_val: f64 = rng.gen();
+        let rand_val: f64 = rng.random();
         if rand_val < inline_prob {
             self.generate_inline_dv(rng, cardinality, num_records)
         } else if rand_val < inline_prob + relative_prob {
@@ -84,7 +84,7 @@ impl DeletionVectorGenerator {
 
         // Insert unique random row IDs
         while added < cardinality {
-            let row_id = rng.gen_range(0..num_records as u64);
+            let row_id = rng.random_range(0..num_records as u64);
             if bitmap.insert(row_id) {
                 added += 1;
             }
@@ -111,7 +111,7 @@ impl DeletionVectorGenerator {
     /// Generate a relative deletion vector with UUID-based path
     fn generate_relative_dv(&self, rng: &mut StdRng, cardinality: i64) -> DeletionVectorDescriptor {
         // Generate a random prefix (0-2 hex characters)
-        let prefix = format!("{:02x}", rng.gen::<u8>());
+        let prefix = format!("{:02x}", rng.random::<u8>());
 
         // Generate UUID and encode in base85
         let uuid = Uuid::new_v4();
@@ -125,8 +125,8 @@ impl DeletionVectorGenerator {
         DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv,
-            offset: Some(rng.gen_range(0..1000)),
-            size_in_bytes: rng.gen_range(100..1000),
+            offset: Some(rng.random_range(0..1000)),
+            size_in_bytes: rng.random_range(100..1000),
             cardinality,
         }
     }
@@ -140,7 +140,7 @@ impl DeletionVectorGenerator {
             storage_type: DeletionVectorStorageType::PersistedAbsolute,
             path_or_inline_dv: format!("s3://benchmark-bucket/dvs/{}.bin", uuid),
             offset: Some(0),
-            size_in_bytes: rng.gen_range(100..5000),
+            size_in_bytes: rng.random_range(100..5000),
             cardinality,
         }
     }

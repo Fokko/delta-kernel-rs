@@ -11,10 +11,11 @@ use crate::actions::{
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::table_features::TableFeature;
@@ -122,6 +123,9 @@ pub(crate) struct LogSegment {
     pub checkpoint_schema: Option<SchemaRef>,
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
+    /// Metadata from the `_last_checkpoint` hint file, stored for use by the
+    /// `last_checkpoint_hint_summary()` accessor.
+    pub(crate) last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
 /// A partial commit cover is a set of files that cover is a set of files that is a
@@ -187,6 +191,7 @@ impl LogSegment {
             log_root,
             table_root,
             checkpoint_schema: None,
+            last_checkpoint_metadata: None,
             listed: LogSegmentFiles::default(),
         }
     }
@@ -237,18 +242,51 @@ impl LogSegment {
             end_version,
         )?;
 
+        // Build last_checkpoint_metadata from checkpoint_version and checkpoint_schema
+        let last_checkpoint_metadata =
+            checkpoint_version.map(|version| LastCheckpointHintSummary {
+                version,
+                schema: checkpoint_schema.clone(),
+            });
+
         let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
             table_root,
             checkpoint_schema,
+            last_checkpoint_metadata,
             listed: listed_files,
         };
 
         info!(segment = %log_segment.summary());
 
         Ok(log_segment)
+    }
+
+    /// Returns the checkpoint version from the `_last_checkpoint` hint.
+    #[allow(dead_code)] // used in tests
+    pub(crate) fn last_checkpoint_version(&self) -> Option<Version> {
+        self.checkpoint_version
+    }
+
+    /// Returns the checkpoint schema from the `_last_checkpoint` hint when it is safe to use for
+    /// this segment's checkpoint parquet.
+    ///
+    /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, if this segment
+    /// has no checkpoint on disk, or if the hint's checkpoint version does not match this segment's
+    /// checkpoint version.
+    pub(crate) fn get_checkpoint_schema(&self) -> Option<SchemaRef> {
+        self.checkpoint_schema.clone()
+    }
+
+    /// Returns a copy of the stored `_last_checkpoint` hint summary.
+    ///
+    /// Prefer [`Self::get_checkpoint_schema`] or [`Self::last_checkpoint_version`] when requiring
+    /// individual values from the hint.
+    #[allow(dead_code)] // used in tests
+    pub(crate) fn last_checkpoint_hint_summary(&self) -> Option<LastCheckpointHintSummary> {
+        self.last_checkpoint_metadata.clone()
     }
 
     /// Succinct summary string for logging purposes.
@@ -339,20 +377,38 @@ impl LogSegment {
             .as_ref()
             .and_then(|hint| hint.checkpoint_schema.clone());
 
-        let listed_files = match (checkpoint_hint, time_travel_version) {
-            (Some(cp), None) => {
-                LogSegmentFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
-            }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                LogSegmentFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    log_tail,
-                    Some(end_version),
-                )?
-            }
-            _ => LogSegmentFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+        // The end_version is the time_travel_version, if present
+        // TODO: When max catalog version is implemented, we would use that as end_version if
+        // time_travel_version is not present
+        let end_version = time_travel_version;
+
+        // Keep the hint only if it points at or before end_version, or if there is no end_version bound
+        let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
+
+        // Cases:
+        //
+        // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from hint.version TO end_version
+        // 2. usable_hint present, end_version is None  --> list_with_checkpoint_hint from hint.version unbounded
+        // 3. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before end_version,
+        //                                                  list from that checkpoint TO end_version
+        //                                                  (falls back to v0 if no checkpoint found)
+        // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
+
+        let listed_files = match (usable_hint, end_version) {
+            // Cases 1 and 2
+            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
+                &cp,
+                storage,
+                &log_root,
+                log_tail,
+                end_version,
+            )?,
+            // Case 3
+            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                storage, &log_root, log_tail, end,
+            )?,
+            // Case 4
+            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
         LogSegment::try_new(
@@ -489,6 +545,84 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
+    /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
+    /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
+    /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            matches!(
+                checkpoint.file_type,
+                LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint
+            ),
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Path is not a single-file \
+                checkpoint. Path: {}, Type: {:?}.",
+                checkpoint.location.location, checkpoint.file_type
+            ))
+        );
+        require!(
+            checkpoint.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Checkpoint version ({}) does not \
+                equal LogSegment end_version ({}).",
+                checkpoint.version, self.end_version
+            ))
+        );
+
+        let mut new_log_segment = self.clone();
+        new_log_segment.checkpoint_version = Some(checkpoint.version);
+        new_log_segment.listed.checkpoint_parts = vec![checkpoint];
+        // A snapshot at version N only contains commits and compactions at versions <= N,
+        // so a checkpoint at N covers everything and we can clear them entirely.
+        new_log_segment.listed.ascending_commit_files.clear();
+        new_log_segment.listed.ascending_compaction_files.clear();
+        // TODO(#839): Once CheckpointWriter exposes the output schema, build a LastCheckpointHintSummary
+        // and thread it through here instead of None. Today the schema is computed inside checkpoint_data()
+        // but not returned. With None, the next scan will read the checkpoint parquet footer
+        // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).
+        new_log_segment.last_checkpoint_metadata = None;
+        Ok(new_log_segment)
+    }
+
+    /// Creates a new LogSegment with the given CRC file recorded as the latest.
+    /// The CRC file must be at `end_version`.
+    pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> DeltaResult<Self> {
+        require!(
+            crc_file.file_type == LogPathFileType::Crc,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. Path is not a CRC file. \
+                Path: {}, Type: {:?}.",
+                crc_file.location, crc_file.file_type
+            ))
+        );
+        require!(
+            crc_file.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. CRC version ({}) does not \
+                equal LogSegment end_version ({}).",
+                crc_file.version, self.end_version
+            ))
+        );
+        // Convert to FileMeta with placeholder metadata (size=0, last_modified=0).
+        // Only the URL matters for CRC files: downstream code uses it for version
+        // tracking and reading CRC content via `try_read_crc_file`. Neither `size`
+        // nor `last_modified` is ever accessed.
+        let crc_file = ParsedLogPath {
+            location: FileMeta {
+                location: crc_file.location,
+                last_modified: 0,
+                size: 0,
+            },
+            filename: crc_file.filename,
+            extension: crc_file.extension,
+            version: crc_file.version,
+            file_type: crc_file.file_type,
+        };
+        let mut new_log_segment = self.clone();
+        new_log_segment.listed.latest_crc_file = Some(crc_file);
+        Ok(new_log_segment)
+    }
+
     pub(crate) fn new_as_published(&self) -> DeltaResult<Self> {
         // In the future, we can additionally convert the staged commit files to published commit
         // files. That would reqire faking their FileMeta locations.
@@ -617,13 +751,12 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let action_with_checkpoint_info = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
             action_schema,
-            meta_predicate,
+            None,
             None,
             None,
             None,  // No data predicate for manifest-level skipping
@@ -793,103 +926,94 @@ impl LogSegment {
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
-    /// 1. The schema containing file actions (for future stats_parsed detection)
+    /// 1. The file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Sidecar file references if this is a V2 checkpoint
     ///
     /// The logic is:
-    /// - JSON checkpoint: Always V2, extract sidecars and read first sidecar's schema
-    /// - Parquet checkpoint: Check hint/footer for sidecar column
-    ///   - No sidecar column: V1, use footer schema
-    ///   - Has sidecar column: V2, extract sidecars and read first sidecar's schema
-    ///
-    /// Note: `self.checkpoint_schema` from `_last_checkpoint` hint is the main checkpoint
-    /// parquet schema. For V1 this is what we want. For V2 we need the sidecar schema.
+    /// - No checkpoint parts: return (None, [])
+    /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
+    /// - UUID-named JSON (always V2): extract sidecars, read first sidecar's schema
+    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from
+    ///   hint or footer, then check for sidecar column to distinguish
+    ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
+    ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        // Only process single-part checkpoints (multi-part are always V1, no sidecars)
-        let checkpoint = match self.listed.checkpoint_parts.first() {
-            Some(cp) if self.listed.checkpoint_parts.len() == 1 => cp,
-            _ => return Ok((None, vec![])),
+        // Hint schema from `_last_checkpoint` avoids footer reads when available.
+        let hint_schema = self.get_checkpoint_schema();
+
+        // All parts of a multi-part checkpoint belong to the same table version and follow
+        // the same V1 spec, so reading any one part's schema is sufficient.
+        let Some(checkpoint) = self.listed.checkpoint_parts.first() else {
+            return Ok((None, vec![]));
         };
 
-        // Cached hint schema for determining V1 vs V2 without footer read.
-        // hint_schema is Option<&SchemaRef> where SchemaRef = Arc<StructType>.
-        let hint_schema = self.checkpoint_schema.as_ref();
-
-        match checkpoint.extension.as_str() {
-            "json" => {
-                // JSON checkpoint is always V2, extract sidecars
-                let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-
-                // For V2, read first sidecar's schema (contains file actions)
-                let file_actions_schema = match sidecar_files.first() {
-                    Some(first) => {
-                        Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                    }
-                    None => None,
-                };
-                Ok((file_actions_schema, sidecar_files))
+        match &checkpoint.file_type {
+            MultiPartCheckpoint { .. } => {
+                // Multi-part checkpoints are always V1 and never have sidecars.
+                let schema =
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                Ok((Some(schema), vec![]))
             }
-            "parquet" => {
-                // Check hint first to avoid unnecessary footer reads
-                let has_sidecars_in_hint = hint_schema.map(|s| s.field(SIDECAR_NAME).is_some());
-
-                match has_sidecars_in_hint {
-                    Some(false) => {
-                        // Hint says V1 checkpoint (no sidecars)
-                        // Use hint schema as the file actions schema
-                        Ok((hint_schema.cloned(), vec![]))
-                    }
-                    Some(true) => {
-                        // Hint says V2 checkpoint, extract sidecars
-                        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                        // For V2, read first sidecar's schema if sidecars exist.
-                        // If no sidecars, V2 checkpoint may still have add actions in main file
-                        // (like V1), so fall back to hint schema for stats_parsed check.
-                        let file_actions_schema = match sidecar_files.first() {
-                            Some(first) => {
-                                Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                            }
-                            None => hint_schema.cloned(),
-                        };
-                        Ok((file_actions_schema, sidecar_files))
-                    }
-                    None => {
-                        // No hint, need to read parquet footer
-                        let footer = engine
-                            .parquet_handler()
-                            .read_parquet_footer(&checkpoint.location)?;
-
-                        if footer.schema.field(SIDECAR_NAME).is_some() {
-                            // V2 parquet checkpoint
-                            let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                            // For V2, read first sidecar's schema if sidecars exist.
-                            // If no sidecars, V2 checkpoint may still have add actions in main file
-                            // (like V1), so fall back to footer schema for stats_parsed check.
-                            let file_actions_schema = match sidecar_files.first() {
-                                Some(first) => Some(
-                                    engine.parquet_handler().read_parquet_footer(first)?.schema,
-                                ),
-                                None => Some(footer.schema),
-                            };
-                            Ok((file_actions_schema, sidecar_files))
-                        } else {
-                            // V1 parquet checkpoint
-                            Ok((Some(footer.schema), vec![]))
-                        }
-                    }
+            UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
+                // JSON checkpoint is always V2. No checkpoint schema is available since JSON
+                // checkpoints don't have a parquet footer to read.
+                self.read_sidecar_schema_and_files(engine, checkpoint, None)
+            }
+            SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
+                // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
+                // Check for sidecar column to distinguish.
+                let checkpoint_schema =
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                if checkpoint_schema.field(SIDECAR_NAME).is_some() {
+                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                } else {
+                    Ok((Some(checkpoint_schema), vec![]))
                 }
             }
             _ => Ok((None, vec![])),
         }
     }
 
+    /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
+    /// available or reading the parquet footer otherwise.
+    fn read_checkpoint_schema(
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        hint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        match hint_schema {
+            Some(schema) => Ok(schema.clone()),
+            None => Ok(engine
+                .parquet_handler()
+                .read_parquet_footer(&checkpoint.location)?
+                .schema),
+        }
+    }
+
+    /// Extracts sidecar file references and reads the file actions schema from the first
+    /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
+    /// since V2 checkpoints may store add actions directly in the main file.
+    fn read_sidecar_schema_and_files(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        checkpoint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let file_actions_schema = match sidecar_files.first() {
+            Some(first) => Some(engine.parquet_handler().read_parquet_footer(first)?.schema),
+            None => checkpoint_schema.cloned(),
+        };
+        Ok((file_actions_schema, sidecar_files))
+    }
+
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
-    /// For single-part checkpoints that need file actions, this function:
-    /// 1. Determines the files actions schema (for future stats_parsed detection)
+    /// For checkpoints that need file actions, this function:
+    /// 1. Determines the file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
@@ -966,10 +1090,6 @@ impl LogSegment {
             (Box::new(std::iter::empty()), action_schema.clone())
         };
 
-        // Extract file actions schema and sidecar files
-        // Only process sidecars when:
-        // 1. We need file actions (add/remove) - sidecars only contain file actions
-        // 2. Single-part checkpoint - multi-part checkpoints are always V1 (no sidecars)
         let (file_actions_schema, sidecar_files) = if need_file_actions {
             self.get_file_actions_schema_and_sidecars(engine)?
         } else {
@@ -1008,7 +1128,6 @@ impl LogSegment {
                     ));
                 };
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
                     add_fields.push(StructField::nullable(
                         "stats_parsed",
@@ -1351,7 +1470,7 @@ impl LogSegment {
     /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
     ///
     /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
     /// in `(start_v_exclusive, end_version]` are retained.
     #[allow(dead_code)]
     pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
@@ -1363,6 +1482,7 @@ impl LogSegment {
             log_root: self.log_root.clone(),
             table_root: self.table_root.clone(),
             checkpoint_schema: None,
+            last_checkpoint_metadata: None,
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
@@ -1377,7 +1497,7 @@ impl LogSegment {
     /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
     ///
     /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
+    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
     /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
     /// needed for this replay path (CRC file, latest commit file) are dropped.
     #[allow(dead_code)]
@@ -1390,6 +1510,7 @@ impl LogSegment {
             log_root: self.log_root.clone(),
             table_root: self.table_root.clone(),
             checkpoint_schema: self.checkpoint_schema.clone(),
+            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
@@ -1408,18 +1529,9 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema =
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Predicate::or(
-                    Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                    Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-                ),
-                Expression::column([CHECKPOINT_ACTION_NAME, "version"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema, META_PREDICATE.clone())
+        // IS NOT NULL predicates for protocol/metadata/checkpoint columns are auto-derived
+        // from the schema by `read_actions`.
+        self.read_actions(engine, schema)
     }
 
     /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.

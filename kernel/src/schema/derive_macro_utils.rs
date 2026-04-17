@@ -126,6 +126,13 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
     }
 }
 
+// Optional container types produce nullable fields with nullable values.
+impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
+    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
+        StructField::nullable(name, T::to_nullable_container_type())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
-    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
+    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
 use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use crate::arrow::datatypes::{
@@ -427,10 +427,16 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
+            // When min/max is None (all nulls or unsupported type), emit a null-valued
+            // single-element array to keep the field present in the stats struct. This
+            // allows downstream consumers (like StatsVerifier) to find the column and
+            // check nullCount == numRecords. The JSON serializer omits null fields, so
+            // the on-disk format still matches Spark's ignoreNullFields behavior.
+            let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
                 null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: compute_leaf_agg(column, Agg::Min)?,
-                max_value: compute_leaf_agg(column, Agg::Max)?,
+                min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
+                max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
             })
         }
     }
@@ -760,30 +766,27 @@ mod tests {
             .unwrap();
         assert_eq!(value_null_count.value(0), 3);
 
-        // All-null columns are omitted from minValues/maxValues entirely (no field, no null entry).
-        // StatsVerifier detects all-null via nullCount == numRecords and skips the min/max check.
-        assert!(
-            stats.column_by_name("minValues").is_none(),
-            "minValues should be absent when all stats columns are all-null"
-        );
-        assert!(
-            stats.column_by_name("maxValues").is_none(),
-            "maxValues should be absent when all stats columns are all-null"
-        );
+        // All-null columns are present in minValues/maxValues but with null values.
+        // The field must exist so that StatsVerifier can find it via visit_rows and
+        // check nullCount == numRecords. The JSON serializer omits null fields, so
+        // the on-disk format still matches Spark's ignoreNullFields behavior.
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let min_col = min_values.column_by_name("value").unwrap();
+        assert!(min_col.is_null(0));
 
-        // Verify JSON also omits minValues/maxValues entirely.
-        let json_array = to_json(&stats).unwrap();
-        let json_str = json_array.as_string::<i32>().value(0);
-        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        assert_eq!(json["nullCount"]["value"], 3);
-        assert!(
-            json.get("minValues").is_none(),
-            "minValues must be absent from JSON when all stats columns are all-null"
-        );
-        assert!(
-            json.get("maxValues").is_none(),
-            "maxValues must be absent from JSON when all stats columns are all-null"
-        );
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let max_col = max_values.column_by_name("value").unwrap();
+        assert!(max_col.is_null(0));
     }
 
     #[test]

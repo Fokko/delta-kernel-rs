@@ -25,6 +25,7 @@ use clap::{Parser, Subcommand};
 use delta_kernel::expressions::{column_expr, Expression, Scalar};
 use std::process;
 use std::sync::Arc;
+use unity_catalog_delta_client_api::Operation;
 use url::Url;
 
 #[path = "../uc_support.rs"]
@@ -145,12 +146,10 @@ async fn setup_table_and_engine(
 ) -> Result<(Url, Arc<dyn delta_kernel::Engine>), Box<dyn std::error::Error + Send + Sync>> {
     // Determine operation type based on scenario
     let operation = match args.scenario {
-        Scenario::FullTableScan | Scenario::NeedleInHaystack { .. } => {
-            uc_client::prelude::Operation::ReadWrite
-        }
+        Scenario::FullTableScan | Scenario::NeedleInHaystack { .. } => Operation::ReadWrite,
         Scenario::BulkWrite { .. }
         | Scenario::SmallWrite { .. }
-        | Scenario::VacuumDelete { .. } => uc_client::prelude::Operation::ReadWrite,
+        | Scenario::VacuumDelete { .. } => Operation::ReadWrite,
     };
 
     // Use the common setup function

@@ -133,28 +133,28 @@ impl StatsGenerator {
     /// Generate statistics for a single Add action
     pub fn generate(&self, rng: &mut StdRng) -> GeneratedStats {
         // Generate num_records in range [10000, 20000)
-        let num_records = rng.gen_range(10_000..20_000);
+        let num_records = rng.random_range(10_000..20_000);
 
         // String columns - select random values from predefined arrays
         // Ensure min <= max by comparing actual string values
-        let phonetic_val1 = PHONETIC_ALPHABET[rng.gen_range(0..PHONETIC_ALPHABET.len())];
-        let phonetic_val2 = PHONETIC_ALPHABET[rng.gen_range(0..PHONETIC_ALPHABET.len())];
+        let phonetic_val1 = PHONETIC_ALPHABET[rng.random_range(0..PHONETIC_ALPHABET.len())];
+        let phonetic_val2 = PHONETIC_ALPHABET[rng.random_range(0..PHONETIC_ALPHABET.len())];
         let (phonetic_min, phonetic_max) = if phonetic_val1 <= phonetic_val2 {
             (phonetic_val1.to_string(), phonetic_val2.to_string())
         } else {
             (phonetic_val2.to_string(), phonetic_val1.to_string())
         };
 
-        let city_val1 = US_CITIES[rng.gen_range(0..US_CITIES.len())];
-        let city_val2 = US_CITIES[rng.gen_range(0..US_CITIES.len())];
+        let city_val1 = US_CITIES[rng.random_range(0..US_CITIES.len())];
+        let city_val2 = US_CITIES[rng.random_range(0..US_CITIES.len())];
         let (city_min, city_max) = if city_val1 <= city_val2 {
             (city_val1.to_string(), city_val2.to_string())
         } else {
             (city_val2.to_string(), city_val1.to_string())
         };
 
-        let state_val1 = US_STATES[rng.gen_range(0..US_STATES.len())];
-        let state_val2 = US_STATES[rng.gen_range(0..US_STATES.len())];
+        let state_val1 = US_STATES[rng.random_range(0..US_STATES.len())];
+        let state_val2 = US_STATES[rng.random_range(0..US_STATES.len())];
         let (state_min, state_max) = if state_val1 <= state_val2 {
             (state_val1.to_string(), state_val2.to_string())
         } else {
@@ -163,56 +163,56 @@ impl StatsGenerator {
 
         // Random int64 columns (num1-num5)
         // For each column, generate min in [-10000, 10000] and max in [min, 100000]
-        let num1_min = rng.gen_range(-10_000..=10_000);
-        let num1_max = rng.gen_range(num1_min..=100_000);
+        let num1_min = rng.random_range(-10_000..=10_000);
+        let num1_max = rng.random_range(num1_min..=100_000);
 
-        let num2_min = rng.gen_range(-10_000..=10_000);
-        let num2_max = rng.gen_range(num2_min..=100_000);
+        let num2_min = rng.random_range(-10_000..=10_000);
+        let num2_max = rng.random_range(num2_min..=100_000);
 
-        let num3_min = rng.gen_range(-10_000..=10_000);
-        let num3_max = rng.gen_range(num3_min..=100_000);
+        let num3_min = rng.random_range(-10_000..=10_000);
+        let num3_max = rng.random_range(num3_min..=100_000);
 
-        let num4_min = rng.gen_range(-10_000..=10_000);
-        let num4_max = rng.gen_range(num4_min..=100_000);
+        let num4_min = rng.random_range(-10_000..=10_000);
+        let num4_max = rng.random_range(num4_min..=100_000);
 
-        let num5_min = rng.gen_range(-10_000..=10_000);
-        let num5_max = rng.gen_range(num5_min..=100_000);
+        let num5_min = rng.random_range(-10_000..=10_000);
+        let num5_max = rng.random_range(num5_min..=100_000);
 
         // Dollar values (num6) - float64 between 1000.00 and 10000.00
         // Round to 2 decimal places
-        let num6_min = (rng.gen_range(1000.0_f64..10000.0_f64) * 100.0).round() / 100.0;
-        let num6_max = (rng.gen_range(num6_min..=10000.0_f64) * 100.0).round() / 100.0;
+        let num6_min = (rng.random_range(1000.0_f64..10000.0_f64) * 100.0).round() / 100.0;
+        let num6_max = (rng.random_range(num6_min..=10000.0_f64) * 100.0).round() / 100.0;
 
         // Additional random int64 columns (num7-num16)
-        let num7_min = rng.gen_range(-10_000..=10_000);
-        let num7_max = rng.gen_range(num7_min..=100_000);
+        let num7_min = rng.random_range(-10_000..=10_000);
+        let num7_max = rng.random_range(num7_min..=100_000);
 
-        let num8_min = rng.gen_range(-10_000..=10_000);
-        let num8_max = rng.gen_range(num8_min..=100_000);
+        let num8_min = rng.random_range(-10_000..=10_000);
+        let num8_max = rng.random_range(num8_min..=100_000);
 
-        let num9_min = rng.gen_range(-10_000..=10_000);
-        let num9_max = rng.gen_range(num9_min..=100_000);
+        let num9_min = rng.random_range(-10_000..=10_000);
+        let num9_max = rng.random_range(num9_min..=100_000);
 
-        let num10_min = rng.gen_range(-10_000..=10_000);
-        let num10_max = rng.gen_range(num10_min..=100_000);
+        let num10_min = rng.random_range(-10_000..=10_000);
+        let num10_max = rng.random_range(num10_min..=100_000);
 
-        let num11_min = rng.gen_range(-10_000..=10_000);
-        let num11_max = rng.gen_range(num11_min..=100_000);
+        let num11_min = rng.random_range(-10_000..=10_000);
+        let num11_max = rng.random_range(num11_min..=100_000);
 
-        let num12_min = rng.gen_range(-10_000..=10_000);
-        let num12_max = rng.gen_range(num12_min..=100_000);
+        let num12_min = rng.random_range(-10_000..=10_000);
+        let num12_max = rng.random_range(num12_min..=100_000);
 
-        let num13_min = rng.gen_range(-10_000..=10_000);
-        let num13_max = rng.gen_range(num13_min..=100_000);
+        let num13_min = rng.random_range(-10_000..=10_000);
+        let num13_max = rng.random_range(num13_min..=100_000);
 
-        let num14_min = rng.gen_range(-10_000..=10_000);
-        let num14_max = rng.gen_range(num14_min..=100_000);
+        let num14_min = rng.random_range(-10_000..=10_000);
+        let num14_max = rng.random_range(num14_min..=100_000);
 
-        let num15_min = rng.gen_range(-10_000..=10_000);
-        let num15_max = rng.gen_range(num15_min..=100_000);
+        let num15_min = rng.random_range(-10_000..=10_000);
+        let num15_max = rng.random_range(num15_min..=100_000);
 
-        let num16_min = rng.gen_range(-10_000..=10_000);
-        let num16_max = rng.gen_range(num16_min..=100_000);
+        let num16_min = rng.random_range(-10_000..=10_000);
+        let num16_max = rng.random_range(num16_min..=100_000);
 
         // Deterministic column - min == max, incrementing
         let id_value = self.deterministic_counter.get();

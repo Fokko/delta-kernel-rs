@@ -743,10 +743,25 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
+    #[internal_api]
     pub(crate) fn walk_column_fields<'a>(
         &'a self,
         col: &ColumnName,
     ) -> DeltaResult<Vec<&'a StructField>> {
+        self.walk_column_fields_by(col, |s, name| s.field(name))
+    }
+
+    /// Helper to walk through nested columns. For each path component in `col`, calls
+    /// `find_field(current_struct, component)` to locate the matching field, then descends
+    /// into the next nested struct. Returns references to all [`StructField`]s along the path.
+    pub(crate) fn walk_column_fields_by<'a, F>(
+        &'a self,
+        col: &ColumnName,
+        find_field: F,
+    ) -> DeltaResult<Vec<&'a StructField>>
+    where
+        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
+    {
         let path = col.path();
         if path.is_empty() {
             return Err(Error::generic("Column path cannot be empty"));
@@ -754,7 +769,7 @@ impl StructType {
         let mut current_struct = self;
         let mut fields = Vec::with_capacity(path.len());
         for (i, field_name) in path.iter().enumerate() {
-            let field = current_struct.field(field_name).ok_or_else(|| {
+            let field = find_field(current_struct, field_name).ok_or_else(|| {
                 Error::generic(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
@@ -1483,6 +1498,7 @@ impl PrimitiveType {
     /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
     ///   since epoch, differing only in timezone semantics; this is a physical read
     ///   accommodation, not a Delta protocol type widening rule)
+    #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(

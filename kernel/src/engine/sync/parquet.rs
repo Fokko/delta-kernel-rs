@@ -12,8 +12,9 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::default::parquet::{build_writer_properties, reader_options, writer_options};
+use crate::engine::default::parquet::build_writer_properties;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::{reader_options, writer_options};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
@@ -29,9 +30,8 @@ fn try_create_from_parquet(
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let reader_options = reader_options();
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-
+    let reader_options = reader_options();
     let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
@@ -112,7 +112,6 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
 
-        // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
@@ -170,19 +169,13 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use crate::{DeltaResult, EngineData};
     use std::sync::Arc;
     use tempfile::tempdir;
     use url::Url;
 
-    #[test]
-    fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler;
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.parquet");
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        // Create test data
-        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+    fn test_data_iter() -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
                     "id",
@@ -195,15 +188,18 @@ mod tests {
             ])
             .unwrap(),
         ));
+        Box::new(std::iter::once(Ok(engine_data)))
+    }
 
-        // Create iterator with single batch
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
-        > = Box::new(std::iter::once(Ok(engine_data)));
+    #[test]
+    fn test_sync_write_parquet_file() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
 
-        // Write the file
         handler
-            .write_parquet_file(url.clone(), data_iter, &Default::default())
+            .write_parquet_file(url.clone(), test_data_iter(), &Default::default())
             .unwrap();
 
         // Verify the file exists
@@ -580,5 +576,18 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
+    }
+
+    #[test]
+    fn write_parquet_creates_parent_directories() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("a/b/c/test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        handler
+            .write_parquet_file(url, test_data_iter(), &Default::default())
+            .unwrap();
+        assert!(file_path.exists());
     }
 }

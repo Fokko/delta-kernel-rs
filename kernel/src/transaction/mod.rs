@@ -1,25 +1,31 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
-use tracing::{info, instrument, warn};
-use url::Url;
+use tracing::{info, instrument};
 
-use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
     CommitInfo, ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    get_commit_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
+    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
-use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::committer::{
+    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
+};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
 use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
+use crate::expressions::Scalar;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
+use crate::partition::{
+    serialization::serialize_partition_value, validation::validate_partition_values,
+};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{CursorRowIdAllocator, RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
@@ -29,12 +35,12 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version, PRE_COMMIT_VERSION,
+    DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version,
+    PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -67,7 +73,11 @@ mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
+mod write_context;
+
 use stats_verifier::StatsVerifier;
+use write_context::SharedWriteState;
+pub use write_context::WriteContext;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -250,7 +260,9 @@ pub struct Transaction<S = ExistingTable> {
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
-    clustering_columns_physical: Option<Vec<ColumnName>>,
+    physical_clustering_columns: Option<Vec<ColumnName>>,
+    // See `shared_write_state()` method.
+    shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -352,7 +364,7 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let commit_info = CommitInfo::new(
+        let kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
@@ -360,12 +372,23 @@ impl<S> Transaction<S> {
             self.snapshot_id,
             self.is_blind_append,
         );
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
+
+        // Step 3: Generate Protocol and Metadata actions for create-table (also for commit metadata)
+        let (protocol, metadata) = if self.is_create_table() {
+            let table_config = self.read_snapshot.table_configuration();
+            (
+                Some(table_config.protocol().clone()),
+                Some(table_config.metadata().clone()),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Step 3b: Get commit version for actions
+        let commit_version = self.get_commit_version();
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
-        let commit_info_action = self.generate_commit_info(engine, commit_info);
-
-        // Step 3: Get commit version for actions
-        let commit_version = self.get_commit_version();
 
         // Step 4: Determine if this is a manifest commit and pre-compute the row ID cursor
         // while we still have &mut self access.
@@ -412,35 +435,28 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        // Block FileSystemCommitter for catalog-managed tables (including create-table with catalog features)
-        #[cfg(feature = "catalog-managed")]
-        if !self.committer.is_catalog_committer()
-            && self
-                .read_snapshot
-                .table_configuration()
-                .is_catalog_managed()
-        {
-            return Err(Error::generic(
-                "A catalog committer must be used to commit to catalog-managed tables. Please \
-                    provide a catalog committer via Snapshot::transaction().",
-            ));
-        }
-        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let commit_metadata = CommitMetadata::new(
-            log_root,
+        let commit_metadata = self.create_commit_metadata(
             commit_version,
-            self.commit_timestamp,
-            self.read_snapshot
-                .log_segment()
-                .listed
-                .max_published_version,
-        );
+            in_commit_timestamp,
+            protocol,
+            metadata,
+            dm_changes.clone(),
+        )?;
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => {
-                let crc_delta = self.build_crc_delta(in_commit_timestamp, dm_changes)?;
+                let bin_boundaries = self
+                    .read_snapshot
+                    .get_file_stats_if_loaded()
+                    .and_then(|s| s.file_size_histogram)
+                    .map(|h| h.sorted_bin_boundaries);
+                let crc_delta = self.build_crc_delta(
+                    in_commit_timestamp,
+                    dm_changes,
+                    bin_boundaries.as_deref(),
+                )?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -881,6 +897,90 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Determines the commit type based on whether this is a create-table operation and whether
+    /// the table is catalog-managed.
+    fn determine_commit_type(
+        is_create: bool,
+        table_config: &crate::table_configuration::TableConfiguration,
+    ) -> CommitType {
+        let is_catalog_managed = table_config.is_catalog_managed();
+
+        // TODO: Handle UpgradeToCatalogManaged and DowngradeToPathBased when ALTER TABLE
+        // SET TBLPROPERTIES is supported.
+        match (is_create, is_catalog_managed) {
+            (true, true) => CommitType::CatalogManagedCreate,
+            (true, false) => CommitType::PathBasedCreate,
+            (false, true) => CommitType::CatalogManagedWrite,
+            (false, false) => CommitType::PathBasedWrite,
+        }
+    }
+
+    /// Validates that the committer type matches the commit type. A catalog committer must be
+    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
+    fn validate_commit_type(
+        is_catalog_committer: bool,
+        commit_type: &CommitType,
+    ) -> DeltaResult<()> {
+        match (
+            is_catalog_committer,
+            commit_type.requires_catalog_committer(),
+        ) {
+            (true, true) | (false, false) => Ok(()),
+            (false, true) => Err(Error::generic(
+                "This table is catalog-managed and requires a catalog committer. \
+                 Please provide a catalog committer via Snapshot::transaction().",
+            )),
+            (true, false) => Err(Error::generic(
+                "This table is path-based and cannot be committed to with a catalog committer.",
+            )),
+        }
+    }
+
+    /// Builds the [`CommitMetadata`] for this transaction. Determines the commit type,
+    /// validates the committer, and assembles the protocol/metadata state.
+    fn create_commit_metadata(
+        &self,
+        commit_version: Version,
+        in_commit_timestamp: Option<i64>,
+        new_protocol: Option<Protocol>,
+        new_metadata: Option<Metadata>,
+        domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
+    ) -> DeltaResult<CommitMetadata> {
+        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let table_config = self.read_snapshot.table_configuration();
+        let is_create = self.is_create_table();
+        let commit_type = Self::determine_commit_type(is_create, table_config);
+        Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
+        // For create-table: read P&M is None (no previous table), new P&M is set.
+        // For existing table: read P&M is from the snapshot, new P&M is None.
+        let (read_protocol, read_metadata) = if is_create {
+            (None, None)
+        } else {
+            (
+                Some(table_config.protocol().clone()),
+                Some(table_config.metadata().clone()),
+            )
+        };
+        let protocol_metadata = CommitProtocolMetadata::try_new(
+            read_protocol,
+            read_metadata,
+            new_protocol,
+            new_metadata,
+        )?;
+        Ok(CommitMetadata::new(
+            log_root,
+            commit_version,
+            commit_type,
+            in_commit_timestamp.unwrap_or(self.commit_timestamp),
+            self.read_snapshot
+                .log_segment()
+                .listed
+                .max_published_version,
+            protocol_metadata,
+            domain_metadata_changes,
+        ))
+    }
+
     /// Validate that the transaction is eligible to be marked as a blind append.
     ///
     /// Note: Domain metadata additions/removals are allowed; blind append only constrains
@@ -1051,19 +1151,8 @@ impl<S> Transaction<S> {
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         let tc = self.read_snapshot.table_configuration();
-        let clustering_columns_logical = self
-            .clustering_columns_physical
-            .as_deref()
-            .map(|cols| {
-                get_any_level_columns_logical_names(
-                    &tc.logical_schema(),
-                    cols,
-                    tc.column_mapping_mode(),
-                )
-            })
-            .transpose()?;
         let stats_schemas =
-            tc.build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?;
+            tc.build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -1082,7 +1171,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
+            .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -1109,59 +1198,122 @@ impl<S> Transaction<S> {
         Expression::transform(transform)
     }
 
-    /// Get the write context for this transaction. At the moment, this is constant for the whole
-    /// transaction.
-    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
-    // that engines cannot call this method after a metadata change, since the write context could
-    // have invalid metadata.
-    // Note: Callers that use get_write_context may be writing data to the table and they might
-    // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
-        let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
+    /// Returns the logical partition column names for this table.
+    pub fn logical_partition_columns(&self) -> &[String] {
+        self.read_snapshot.table_configuration().partition_columns()
+    }
 
-        // Compute physical schema: exclude partition columns since they're stored in the path
-        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
-        // logical field names to physical names.
-        let partition_columns: Vec<String> = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
-        let materialize_partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        let physical_fields = snapshot_schema
-            .fields()
-            .filter(|f| {
-                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+    /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
+    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
+        self.shared_write_state.get_or_init(|| {
+            let table_config = self.read_snapshot.table_configuration();
+            Arc::new(SharedWriteState {
+                table_root: self.read_snapshot.table_root().clone(),
+                logical_schema: self.read_snapshot.schema(),
+                physical_schema: table_config.physical_write_schema(),
+                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
+                column_mapping_mode: table_config.column_mapping_mode(),
+                stats_columns: self.stats_columns(),
+                logical_partition_columns: table_config.partition_columns().to_vec(),
             })
-            .map(|f| {
-                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
-                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
-                    warn!("make_physical failed: {e}");
-                    f.clone()
-                })
-            });
-        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+        })
+    }
 
-        // Get stats columns from table configuration
-        let stats_columns = self.stats_columns();
+    /// Creates a write context for writing data to a specific partition.
+    ///
+    /// Performs the following validations and transformations:
+    ///
+    /// - **Key completeness**: ensures all partition columns are present and no extra keys
+    ///   exist. For example, if the table has partition columns `["year", "region"]` and you
+    ///   pass `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
+    ///
+    /// - **Case normalization**: matches keys case-insensitively against the schema and
+    ///   normalizes to schema case. For example, passing `"YEAR"` for a column named `"year"`
+    ///   is accepted and normalized.
+    ///
+    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map)
+    ///   and validates that each non-null `Scalar`'s type matches the partition column's
+    ///   schema type. For example, passing `Scalar::String("2024")` for an `INTEGER` column
+    ///   returns an error. Null scalars skip the value type check (null is valid for any
+    ///   primitive partition column).
+    ///
+    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per
+    ///   the Delta protocol's "Partition Value Serialization" rules.
+    ///   `Scalar::Null(...)` becomes `None` in `add.partitionValues` (JSON null).
+    ///   `Scalar::String("")` also becomes `None` (empty string equals null for all types).
+    ///   `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
+    ///
+    /// - **Key translation**: translates logical column names to physical names using the
+    ///   table's column mapping mode. For example, under `ColumnMappingMode::Name`, logical
+    ///   `"year"` might become physical `"col-abc-123"` in the `partitionValues` map.
+    ///
+    /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
+    /// target directory (Hive-style paths when column mapping is off, random prefix when on).
+    ///
+    /// Returns an error if the table is not partitioned (use
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
+    ///
+    /// [`write_dir`]: WriteContext::write_dir
+    pub fn partitioned_write_context(
+        &self,
+        partition_values: HashMap<String, Scalar>,
+    ) -> DeltaResult<WriteContext> {
+        let shared = self.shared_write_state();
+        require!(
+            !shared.logical_partition_columns.is_empty(),
+            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
+        );
 
-        WriteContext::new(
-            target_dir.clone(),
-            snapshot_schema,
-            physical_schema,
-            Arc::new(logical_to_physical),
-            column_mapping_mode,
-            stats_columns,
-        )
+        // Validate keys (completeness, case normalization) and value types, then return
+        // the map re-keyed to schema case.
+        let normalized = validate_partition_values(
+            &shared.logical_partition_columns,
+            &shared.logical_schema,
+            partition_values,
+        )?;
+
+        // Serialize values and translate keys from logical to physical names.
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &shared.logical_partition_columns {
+            let scalar = normalized.get(logical_name).ok_or_else(|| {
+                Error::internal_error(format!(
+                    "partition column '{logical_name}' missing after validation"
+                ))
+            })?;
+            let value = serialize_partition_value(scalar)?;
+            let physical_name = shared
+                .logical_schema
+                .field(logical_name)
+                .ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(shared.column_mapping_mode)
+                .to_string();
+            serialized.insert(physical_name, value);
+        }
+
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: serialized,
+        })
+    }
+
+    /// Creates a write context for writing data to an unpartitioned table.
+    ///
+    /// Returns an error if the table has partition columns (use
+    /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        let shared = self.shared_write_state();
+        require!(
+            shared.logical_partition_columns.is_empty(),
+            Error::generic("table is partitioned; use partitioned_write_context() instead")
+        );
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: HashMap::new(),
+        })
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1184,7 +1336,7 @@ impl<S> Transaction<S> {
         if add_files.is_empty() {
             return Ok(());
         }
-        if let Some(ref clustering_cols) = self.clustering_columns_physical {
+        if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
                 let physical_schema = self.read_snapshot.table_configuration().physical_schema();
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
@@ -1377,10 +1529,12 @@ impl<S> Transaction<S> {
         &self,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
+        bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<CrcDelta> {
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
+            bin_boundaries,
         )?;
         let is_create = self.is_create_table();
         Ok(CrcDelta {
@@ -1520,92 +1674,6 @@ impl<S> Transaction<S> {
     }
 }
 
-/// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
-/// write table data.
-///
-/// [`Transaction`]: struct.Transaction.html
-pub struct WriteContext {
-    target_dir: Url,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    logical_to_physical: ExpressionRef,
-    column_mapping_mode: ColumnMappingMode,
-    /// Column names that should have statistics collected during writes.
-    stats_columns: Vec<ColumnName>,
-}
-
-impl WriteContext {
-    fn new(
-        target_dir: Url,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        logical_to_physical: ExpressionRef,
-        column_mapping_mode: ColumnMappingMode,
-        stats_columns: Vec<ColumnName>,
-    ) -> Self {
-        WriteContext {
-            target_dir,
-            logical_schema,
-            physical_schema,
-            logical_to_physical,
-            column_mapping_mode,
-            stats_columns,
-        }
-    }
-
-    pub fn target_dir(&self) -> &Url {
-        &self.target_dir
-    }
-
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
-    }
-
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
-    }
-
-    pub fn logical_to_physical(&self) -> ExpressionRef {
-        self.logical_to_physical.clone()
-    }
-
-    /// The [`ColumnMappingMode`] for this table.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
-    }
-
-    /// Returns the column names that should have statistics collected during writes.
-    ///
-    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
-    pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.stats_columns
-    }
-
-    /// Generate a new unique absolute URL for a deletion vector file.
-    ///
-    /// This method generates a unique file name in the table directory.
-    /// Each call to this method returns a new unique path.
-    ///
-    /// # Arguments
-    ///
-    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
-    ///   Making this non-empty can help distributed load on object storage when writing/reading
-    ///   to avoid throttling.  Typically a random string fo 2-4 characters is sufficient
-    ///   for this purpose.
-    ///
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
-    /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
-    /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
-    /// ```
-    pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
-    }
-}
-
 /// Kernel exposes information about the state of the table that engines might want to use to
 /// trigger actions like checkpointing or log compaction. This struct holds that information.
 #[derive(Debug)]
@@ -1734,18 +1802,13 @@ pub struct RetryableTransaction<S = ExistingTable> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::CommitInfo;
-    use crate::arrow::array::{
-        ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
-        StructArray,
-    };
-    use crate::arrow::buffer::OffsetBuffer;
-    use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::content_tree::builder::ContentTreeNodeBuilder;
@@ -1755,8 +1818,11 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{MapData, Scalar};
+    use crate::expressions::{MapData, Scalar, StructData};
     use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::schema::{ColumnMetadataKey, MapType, MetadataValue};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -1771,6 +1837,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::fs::{create_dir_all, read_dir, read_to_string, write};
     use std::path::PathBuf;
+    use url::Url;
     use uuid::Uuid;
 
     /// Helper function to create a logical test table schema with column mapping metadata.
@@ -1813,7 +1880,7 @@ mod tests {
         /// Set clustering columns for testing purposes without needing a table
         /// with the ClusteredTable feature enabled.
         fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.clustering_columns_physical = Some(columns);
+            self.physical_clustering_columns = Some(columns);
             self
         }
     }
@@ -1832,6 +1899,31 @@ mod tests {
         }
         fn is_catalog_committer(&self) -> bool {
             false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A mock catalog committer, used to test catalog committer validation.
+    struct MockCatalogCommitter;
+
+    impl Committer for MockCatalogCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            // This won't be reached in tests — the validation error fires before commit.
+            Ok(CommitResponse::Conflict { version: 0 })
+        }
+        fn is_catalog_committer(&self) -> bool {
+            true
         }
         fn publish(
             &self,
@@ -2001,7 +2093,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context().unwrap();
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -2033,7 +2125,10 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "letter".to_string(),
+            Scalar::String("a".into()),
+        )]))?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
@@ -2063,8 +2158,7 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
-    fn snapshot_and_write_context(
+    fn snapshot_and_partitioned_write_context(
         table_path: &str,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
@@ -2074,7 +2168,21 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        Ok((snapshot, txn.get_write_context()))
+        let partition_cols = txn.logical_partition_columns();
+        assert!(
+            !partition_cols.is_empty(),
+            "expected a partitioned table at {table_path}"
+        );
+        let schema = snapshot.schema();
+        let partition_vals: HashMap<String, Scalar> = partition_cols
+            .iter()
+            .map(|col| {
+                let dt = schema.field(col).unwrap().data_type().clone();
+                (col.clone(), Scalar::Null(dt))
+            })
+            .collect();
+        let wc = txn.partitioned_write_context(partition_vals)?;
+        Ok((snapshot, wc))
     }
 
     /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
@@ -2104,7 +2212,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Without materializePartitionColumns, partition column should be dropped
         let (snap_without, wc_without) =
-            snapshot_and_write_context("./tests/data/basic_partitioned/")?;
+            snapshot_and_partitioned_write_context("./tests/data/basic_partitioned/")?;
         let partition_cols = snap_without.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -2122,8 +2230,9 @@ mod tests {
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
-        let (snap_with, wc_with) =
-            snapshot_and_write_context("./tests/data/partitioned_with_materialize_feature/")?;
+        let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
+            "./tests/data/partitioned_with_materialize_feature/",
+        )?;
         let partition_cols = snap_with.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -2156,7 +2265,10 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
 
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "letter".to_string(),
+            Scalar::String("a".into()),
+        )]))?;
         let physical_schema = write_context.physical_schema();
 
         assert!(
@@ -2166,6 +2278,41 @@ mod tests {
         assert!(
             physical_schema.contains("number"),
             "Non-partition column 'number' should be in physical schema"
+        );
+        Ok(())
+    }
+
+    /// Using the wrong write context method for the table's partitioning returns an error.
+    #[rstest]
+    #[case::partitioned_on_unpartitioned(
+        "./tests/data/table-without-dv-small/",
+        true,
+        "not partitioned"
+    )]
+    #[case::unpartitioned_on_partitioned(
+        "./tests/data/basic_partitioned/",
+        false,
+        "table is partitioned"
+    )]
+    fn test_wrong_write_context_method_returns_error(
+        #[case] table_path: &str,
+        #[case] call_partitioned: bool,
+        #[case] expected_msg: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let result = if call_partitioned {
+            txn.partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
+        } else {
+            txn.unpartitioned_write_context()
+        };
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected_msg),
+            "expected '{expected_msg}' in error, got: {err}"
         );
         Ok(())
     }
@@ -3291,7 +3438,7 @@ mod tests {
         #[case] mode: ColumnMappingMode,
     ) -> DeltaResult<()> {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context().unwrap();
         crate::utils::test_utils::validate_physical_schema_column_mapping(
             write_context.logical_schema(),
             write_context.physical_schema(),
@@ -3300,75 +3447,36 @@ mod tests {
         Ok(())
     }
 
-    /// Builds a RecordBatch with logical field names matching [`test_schema_nested`].
-    fn build_test_record_batch() -> DeltaResult<RecordBatch> {
-        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
-
-        let id_arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
-
-        // info struct fields
-        let name_arr: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob"]));
-        let age_arr: ArrayRef = Arc::new(Int32Array::from(vec![30, 25]));
-
-        // info.tags: Map<String, String>
-        let keys = StringArray::from(vec!["k1", "k2"]);
-        let vals = StringArray::from(vec!["v1", "v2"]);
-        let entries_field = ArrowField::new(
-            "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    ArrowField::new("key", ArrowDataType::Utf8, false),
-                    ArrowField::new("value", ArrowDataType::Utf8, true),
-                ]
-                .into(),
-            ),
-            false,
-        );
-        let entries = StructArray::try_new(
-            vec![
-                ArrowField::new("key", ArrowDataType::Utf8, false),
-                ArrowField::new("value", ArrowDataType::Utf8, true),
-            ]
-            .into(),
-            vec![Arc::new(keys), Arc::new(vals)],
-            None,
-        )?;
-        let map_offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
-        let tags_arr: ArrayRef = Arc::new(MapArray::new(
-            Arc::new(entries_field),
-            map_offsets,
-            entries,
-            None,
-            false,
-        ));
-
-        // info.scores: Array<Int>
-        let score_values = Int32Array::from(vec![10, 20, 30]);
-        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
-        let scores_arr: ArrayRef = Arc::new(ListArray::try_new(
-            Arc::new(ArrowField::new("element", ArrowDataType::Int32, true)),
-            offsets,
-            Arc::new(score_values),
-            None,
-        )?);
-
-        // info struct
+    /// Builds two-row [`EngineData`] with logical field names matching [`test_schema_nested`].
+    fn build_test_record_batch() -> DeltaResult<Box<dyn EngineData>> {
+        let schema = test_schema_nested();
+        let tag_type = MapType::new(DataType::STRING, DataType::STRING, true);
+        let score_type = ArrayType::new(DataType::INTEGER, true);
         let info_fields = vec![
-            ArrowField::new("name", ArrowDataType::Utf8, true),
-            ArrowField::new("age", ArrowDataType::Int32, true),
-            ArrowField::new("tags", tags_arr.data_type().clone(), true),
-            ArrowField::new("scores", scores_arr.data_type().clone(), true),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+            StructField::nullable("tags", tag_type.clone()),
+            StructField::nullable("scores", score_type.clone()),
         ];
-        let info_arr: ArrayRef = Arc::new(StructArray::try_new(
-            info_fields.into(),
-            vec![name_arr, age_arr, tags_arr, scores_arr],
-            None,
+        let info1 = Scalar::Struct(StructData::try_new(
+            info_fields.clone(),
+            vec![
+                "alice".into(),
+                30i32.into(),
+                Scalar::Map(MapData::try_new(tag_type.clone(), [("k1", "v1")])?),
+                Scalar::Array(ArrayData::try_new(score_type.clone(), [10i32, 20i32])?),
+            ],
         )?);
-
-        Ok(RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![id_arr, info_arr],
-        )?)
+        let info2 = Scalar::Struct(StructData::try_new(
+            info_fields,
+            vec![
+                "bob".into(),
+                25i32.into(),
+                Scalar::Map(MapData::try_new(tag_type, [("k2", "v2")])?),
+                Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
+            ],
+        )?);
+        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
     }
 
     /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting levels.
@@ -3377,7 +3485,7 @@ mod tests {
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context().unwrap();
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
@@ -3389,7 +3497,7 @@ mod tests {
             );
         }
 
-        let batch = build_test_record_batch()?;
+        let data = build_test_record_batch()?;
 
         // Evaluate the logical_to_physical expression
         let input_schema: SchemaRef = logical_schema.clone();
@@ -3399,7 +3507,7 @@ mod tests {
             logical_to_physical_expression.clone(),
             physical_schema.clone().into(),
         )?;
-        let result = evaluator.evaluate(&ArrowEngineData::new(batch))?;
+        let result = evaluator.evaluate(data.as_ref())?;
         let result = ArrowEngineData::try_from_engine_data(result)?;
         let result_batch = result.record_batch();
 
@@ -3434,7 +3542,8 @@ mod tests {
         #[case] expected_cols: usize,
         #[case] expected_partition_cols: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_snap, wc) = snapshot_and_write_context(table_path)?;
+        use crate::arrow::array::Float64Array;
+        let (_snap, wc) = snapshot_and_partitioned_write_context(table_path)?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![
@@ -3467,157 +3576,86 @@ mod tests {
 
     /// Creates test add file metadata with configurable stats for the "value" column.
     fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
-        let path_array = StringArray::from(paths.to_vec());
-        let size_array = Int64Array::from(vec![1024i64; paths.len()]);
-        let mod_time_array = Int64Array::from(vec![1000000i64; paths.len()]);
-
-        // Create stats struct with full structure for "value" column (matches test table schema)
-        let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Int64, true));
-
-        let num_records: Vec<Option<i64>> = stats
-            .iter()
-            .map(|s| match s {
-                TestFileStats::None => Option::None,
-                _ => Some(100),
-            })
-            .collect();
-        let null_count_values: Vec<Option<i64>> = stats
-            .iter()
-            .map(|s| match s {
-                TestFileStats::None => Option::None,
-                TestFileStats::Present => Some(0),
-                TestFileStats::AllNull => Some(100),
-            })
-            .collect();
-        let min_values: Vec<Option<i64>> = stats
-            .iter()
-            .map(|s| match s {
-                TestFileStats::Present => Some(1),
-                _ => Option::None,
-            })
-            .collect();
-        let max_values: Vec<Option<i64>> = stats
-            .iter()
-            .map(|s| match s {
-                TestFileStats::Present => Some(100),
-                _ => Option::None,
-            })
-            .collect();
-
-        let num_records_array = Int64Array::from(num_records);
-        let null_count_array = Int64Array::from(null_count_values);
-        let null_count_struct = StructArray::new(
-            Fields::from(vec![value_field.clone()]),
-            vec![Arc::new(null_count_array) as ArrayRef],
-            None,
-        );
-        let min_values_array = Int64Array::from(min_values);
-        let min_values_struct = StructArray::new(
-            Fields::from(vec![value_field.clone()]),
-            vec![Arc::new(min_values_array) as ArrayRef],
-            None,
-        );
-        let max_values_array = Int64Array::from(max_values);
-        let max_values_struct = StructArray::new(
-            Fields::from(vec![value_field]),
-            vec![Arc::new(max_values_array) as ArrayRef],
-            None,
-        );
-
-        // Build stats struct fields
-        let value_struct_type = ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Int64,
-            true,
-        )]));
-        let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            ArrowField::new("nullCount", value_struct_type.clone(), true),
-            ArrowField::new("minValues", value_struct_type.clone(), true),
-            ArrowField::new("maxValues", value_struct_type, true),
+        let value_fields = vec![StructField::nullable("value", DataType::LONG)];
+        let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
+        let stats_type = DataType::struct_type_unchecked(vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", value_struct_type.clone()),
+            StructField::nullable("minValues", value_struct_type.clone()),
+            StructField::nullable("maxValues", value_struct_type.clone()),
         ]);
-
-        // Create validity bitmap - stats struct is null when stats are absent
-        let stats_validity: Vec<bool> = stats
-            .iter()
-            .map(|s| !matches!(s, TestFileStats::None))
-            .collect();
-        let stats_struct = StructArray::new(
-            stats_fields.clone(),
-            vec![
-                Arc::new(num_records_array) as ArrayRef,
-                Arc::new(null_count_struct) as ArrayRef,
-                Arc::new(min_values_struct) as ArrayRef,
-                Arc::new(max_values_struct) as ArrayRef,
-            ],
-            Some(stats_validity.into()),
-        );
-
-        // Create empty partition values map
-        let entries_field = Arc::new(ArrowField::new(
-            "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                    Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let empty_keys = StringArray::from(Vec::<&str>::new());
-        let empty_values = StringArray::from(Vec::<Option<&str>>::new());
-        let empty_entries = StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                Arc::new(empty_keys) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                Arc::new(empty_values) as ArrayRef,
-            ),
-        ]);
-        let offsets = OffsetBuffer::from_lengths(vec![0; paths.len()]);
-        let partition_values = MapArray::new(entries_field, offsets, empty_entries, None, false);
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new(
+        let stats_fields = vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", value_struct_type.clone()),
+            StructField::nullable("minValues", value_struct_type.clone()),
+            StructField::nullable("maxValues", value_struct_type),
+        ];
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
                 "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(ArrowField::new(
-                        "key_value",
-                        ArrowDataType::Struct(
-                            vec![
-                                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
+                MapType::new(DataType::STRING, DataType::STRING, true),
             ),
-            ArrowField::new("size", ArrowDataType::Int64, false),
-            ArrowField::new("modificationTime", ArrowDataType::Int64, false),
-            ArrowField::new("stats", ArrowDataType::Struct(stats_fields), true),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable("stats", stats_type.clone()),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(path_array),
-                Arc::new(partition_values),
-                Arc::new(size_array),
-                Arc::new(mod_time_array),
-                Arc::new(stats_struct),
-            ],
-        )
-        .unwrap();
+        let empty_map = Scalar::Map(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                Vec::<(&str, &str)>::new(),
+            )
+            .unwrap(),
+        );
 
-        Box::new(ArrowEngineData::new(batch))
+        let rows: Vec<Vec<Scalar>> = paths
+            .iter()
+            .zip(stats.iter())
+            .map(|(path, stat)| {
+                let stats_scalar = match stat {
+                    TestFileStats::None => Scalar::Null(stats_type.clone()),
+                    TestFileStats::Present | TestFileStats::AllNull => {
+                        let value_struct = |v: Option<i64>| {
+                            let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
+                            Scalar::Struct(
+                                StructData::try_new(value_fields.clone(), vec![scalar]).unwrap(),
+                            )
+                        };
+                        let (null_count, min, max) = match stat {
+                            TestFileStats::Present => (
+                                value_struct(Some(0)),
+                                value_struct(Some(1)),
+                                value_struct(Some(100)),
+                            ),
+                            _ => (
+                                value_struct(Some(100)),
+                                value_struct(None),
+                                value_struct(None),
+                            ),
+                        };
+                        Scalar::Struct(
+                            StructData::try_new(
+                                stats_fields.clone(),
+                                vec![100i64.into(), null_count, min, max],
+                            )
+                            .unwrap(),
+                        )
+                    }
+                };
+                vec![
+                    (*path).into(),
+                    empty_map.clone(),
+                    1024i64.into(),
+                    1000000i64.into(),
+                    stats_scalar,
+                ]
+            })
+            .collect();
+        let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
+        ArrowEvaluationHandler
+            .create_many(schema, &row_refs)
+            .unwrap()
     }
 
     #[test]
@@ -3905,6 +3943,180 @@ mod tests {
         assert_eq!(ca.meta_data.id(), fresh_metadata.id());
         assert_eq!(ca.version, fresh.version());
 
+        Ok(())
+    }
+
+    #[test]
+    fn disallow_catalog_committer_for_non_catalog_managed_table() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+
+        // Create a non-catalog-managed table (no catalogManaged feature)
+        let actions = [
+            r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1234567890}}"#,
+        ].join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+        // Try to commit with a catalog committer to a non-catalog-managed table
+        let committer = Box::new(MockCatalogCommitter);
+        let err = snapshot
+            .transaction(committer, &engine)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+        ));
+    }
+
+    #[test]
+    fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
+        let storage = Arc::new(InMemory::new());
+        let engine = crate::engine::default::DefaultEngineBuilder::new(storage).build();
+
+        // Create a non-catalog-managed table using a catalog committer
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
+            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+        ]));
+        let committer = Box::new(MockCatalogCommitter);
+        let err = create_table("memory:///", schema, "test-engine")
+            .build(&engine, committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+        ));
+    }
+
+    struct CapturingCommitter {
+        captured: Arc<Mutex<Option<i64>>>,
+    }
+
+    impl CapturingCommitter {
+        fn new() -> (Self, Arc<Mutex<Option<i64>>>) {
+            let captured = Arc::new(Mutex::new(None));
+            (
+                Self {
+                    captured: captured.clone(),
+                },
+                captured,
+            )
+        }
+    }
+
+    impl Committer for CapturingCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
+            Ok(CommitResponse::Conflict {
+                version: commit_metadata.version(),
+            })
+        }
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_commit_metadata_receives_ict_not_wall_time() -> DeltaResult<()> {
+        // Set up a table with ICT enabled and a very high previous ICT so that the
+        // monotonicity rule (max(wall_time, prev_ict + 1)) produces a value strictly
+        // greater than the current wall time. This lets us verify the computed ICT is
+        // passed to CommitMetadata (not the wall-clock timestamp).
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_dir = tempdir.path().join("_delta_log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let future_ict: i64 = 9_999_999_999_999; // far-future timestamp in ms
+        let commit_info = serde_json::json!({
+            "commitInfo": {
+                "timestamp": 1000,
+                "operation": "WRITE",
+                "inCommitTimestamp": future_ict
+            }
+        });
+        let protocol = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["inCommitTimestamp"]
+            }
+        });
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {}
+            }]
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_json.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableInCommitTimestamps": "true"
+                }
+            }
+        });
+        let commit0 = format!("{commit_info}\n{protocol}\n{metadata}\n");
+        std::fs::write(log_dir.join("00000000000000000000.json"), commit0).unwrap();
+
+        let table_url = Url::from_directory_path(tempdir.path()).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+        let prev_ict = snapshot.get_in_commit_timestamp(&engine)?;
+        assert_eq!(prev_ict, Some(future_ict));
+
+        let (committer, captured_ts) = CapturingCommitter::new();
+        let mut txn = snapshot.transaction(Box::new(committer), &engine)?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.commit(&engine)?;
+        assert!(
+            matches!(result, CommitResult::ConflictedTransaction(_)),
+            "Expected ConflictedTransaction from capturing committer"
+        );
+
+        // The ICT in CommitMetadata must be prev_ict + 1 (monotonicity), NOT the wall time.
+        let captured = captured_ts
+            .lock()
+            .unwrap()
+            .expect("should have captured a timestamp");
+        assert_eq!(
+            captured,
+            future_ict + 1,
+            "CommitMetadata.in_commit_timestamp should be the computed ICT (prev_ict + 1), \
+             not the wall-clock time"
+        );
         Ok(())
     }
 }
