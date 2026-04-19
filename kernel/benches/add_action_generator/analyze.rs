@@ -48,7 +48,7 @@ pub fn analyze_parquet_file(path: &str) {
 
     // Sort by compressed size
     let mut columns: Vec<_> = column_sizes.into_iter().collect();
-    columns.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    columns.sort_by_key(|col| std::cmp::Reverse(col.1 .0));
 
     println!("Column Size Breakdown (sorted by compressed size):");
     println!(
