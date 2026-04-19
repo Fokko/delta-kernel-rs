@@ -347,13 +347,13 @@ fn add_batches_to_txn(
     if bulk_mode {
         use std::thread;
 
-        let mc = txn.with_manifest_commit();
+        txn.with_manifest_commit();
 
         // Create leaf writers for each data batch and spawn threads to finish them
         let mut handles = Vec::new();
 
         for data in batches {
-            let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
             leaf.add_files(engine.as_ref(), data)?;
 
             // Clone engine for thread
@@ -366,10 +366,10 @@ fn add_batches_to_txn(
 
         // Collect results from threads and add to transaction
         for handle in handles {
-            let result = handle
+            let result: DeltaResult<_> = handle
                 .join()
                 .map_err(|_| delta_kernel::Error::generic("Thread panicked"))?;
-            mc.add_leaf(result?)?;
+            txn.add_leaf(result?)?;
         }
     } else {
         for data in batches {

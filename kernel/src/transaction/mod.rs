@@ -9,9 +9,8 @@ use tracing::{info, instrument};
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
-    CommitInfo, ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
-    get_commit_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
-    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    CommitInfo, ContentRoot, DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME,
+    PROTOCOL_NAME,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,

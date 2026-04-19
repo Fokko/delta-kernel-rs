@@ -272,8 +272,8 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
 
         // Step 2-3: Create leaf, add files, and add to manifest commit
         {
-            let mc = txn.with_manifest_commit();
-            let mut leaf = mc.new_leaf_node_writer(&engine)?;
+            txn.with_manifest_commit();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 add_files_schema,
                 vec![
@@ -282,7 +282,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
                 ],
             )?;
             leaf.add_files(&engine, metadata)?;
-            mc.add_leaf(leaf.finish(&engine)?)?;
+            txn.add_leaf(leaf.finish(&engine)?)?;
         }
 
         // Step 4: Commit
@@ -324,9 +324,9 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
 
         // Create and add 3 leaves with different files
         {
-            let mc = txn.with_manifest_commit();
+            txn.with_manifest_commit();
             for i in 0..3 {
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let files = vec![
                     (
                         format!("leaf{}_file1.parquet", i).leak() as &str,
@@ -343,7 +343,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
                 ];
                 let metadata = create_add_files_metadata(add_files_schema, files)?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
         }
 
@@ -385,8 +385,8 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .with_operation("WRITE".to_string());
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -395,7 +395,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
@@ -411,8 +411,8 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .with_operation("WRITE".to_string());
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -421,7 +421,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
@@ -437,8 +437,8 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .with_operation("WRITE".to_string());
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -447,7 +447,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
@@ -495,8 +495,8 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                 .with_operation("WRITE".to_string());
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -505,7 +505,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -542,11 +542,11 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                 .expect("Should have scan metadata")?;
 
             {
-                let mc = txn.with_manifest_commit();
+                txn.with_manifest_commit();
                 // Create new leaf (leaf B) and move files from leaf A
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 leaf.add_existing_actions(&engine, scan_metadata.scan_files)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             // Commit

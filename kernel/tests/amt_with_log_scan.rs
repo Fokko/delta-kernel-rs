@@ -39,8 +39,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -49,7 +49,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -164,14 +164,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 as part of the new root creation
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![("file5.parquet", 2048, 1000004, 100)],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -382,8 +382,8 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
@@ -394,7 +394,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
@@ -489,14 +489,14 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 via leaf writer as part of new root creation
-                let mc = txn.with_manifest_commit();
-                let mut leaf = mc.new_leaf_node_writer(&engine)?;
+                txn.with_manifest_commit();
+                let mut leaf = txn.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![("file5.parquet", 1024, 1000004, 50)],
                 )?;
                 leaf.add_files(&engine, metadata)?;
-                mc.add_leaf(leaf.finish(&engine)?)?;
+                txn.add_leaf(leaf.finish(&engine)?)?;
             }
 
             match txn.commit(&engine)? {
