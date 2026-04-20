@@ -1981,6 +1981,7 @@ impl ContentTreeNodeEntryBuilder {
 
     /// Set tracking info by computing status from `entry_version` vs `current_version`.
     /// If the file was written at `current_version`, its status is `Added`; otherwise `Existed`.
+    #[cfg(test)]
     pub(crate) fn with_tracking(
         mut self,
         entry_version: Version,
@@ -1994,6 +1995,23 @@ impl ContentTreeNodeEntryBuilder {
         };
         self.tracking = TrackingInfo {
             status,
+            snapshot_id: Some(snapshot_id),
+            sequence_number: Some(entry_version as i64),
+            file_sequence_number: Some(entry_version as i64),
+            first_row_id: None,
+            changes_dv: None,
+        };
+        self
+    }
+
+    /// Set tracking info with `Existed` status
+    pub(crate) fn with_existed_tracking(
+        mut self,
+        entry_version: Version,
+        snapshot_id: i64,
+    ) -> Self {
+        self.tracking = TrackingInfo {
+            status: TrackingStatus::Existed,
             snapshot_id: Some(snapshot_id),
             sequence_number: Some(entry_version as i64),
             file_sequence_number: Some(entry_version as i64),

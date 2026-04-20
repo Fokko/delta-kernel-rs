@@ -12,15 +12,13 @@ use url::Url;
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema, get_log_remove_schema,
-    get_log_txn_schema, Add, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
-    Protocol, Remove, SetTransaction, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    get_log_txn_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
+    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::content_tree::builder::{ContentRootRebuildProcessor, ContentTreeNodeBuilder};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
-use crate::content_tree::ContentTreeNode;
 use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -289,82 +287,6 @@ impl<S> std::fmt::Debug for Transaction<S> {
             self.engine_info.is_some()
         ))
     }
-}
-
-// =============================================================================
-// Content root rebuild helpers
-// =============================================================================
-
-/// Feeds delta log commit files at or after `from_version` through `processor` as log batches
-/// (newest first) and adds emitted entries to `builder`.
-fn replay_log_commits_into(
-    processor: &mut ContentRootRebuildProcessor,
-    builder: &mut ContentTreeNodeBuilder,
-    engine: &dyn Engine,
-    log_segment: &LogSegment,
-    from_version: Version,
-) -> DeltaResult<()> {
-    let schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-    ]));
-    let commit_files: Vec<(Version, FileMeta)> = log_segment
-        .listed
-        .ascending_commit_files
-        .iter()
-        .filter(|f| f.version >= from_version)
-        .rev()
-        .map(|f| (f.version, f.location.clone()))
-        .collect();
-    for (version, location) in &commit_files {
-        for batch in engine.json_handler().read_json_files(
-            std::slice::from_ref(location),
-            schema.clone(),
-            None,
-        )? {
-            for entry in processor
-                .process_actions_batch(ActionsBatch::new_with_version(batch?, true, *version))?
-            {
-                builder.add_entry(entry);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Feeds the existing content root through `processor` as a checkpoint baseline (entries whose
-/// `(path, dv_location)` key was seen in the log are suppressed) and adds surviving entries to
-/// `builder`. Also applies leaf manifest removes accumulated during log replay.
-fn replay_content_root_into(
-    processor: &mut ContentRootRebuildProcessor,
-    builder: &mut ContentTreeNodeBuilder,
-    engine: &dyn Engine,
-    root_path_str: &str,
-    table_root: &Url,
-) -> DeltaResult<()> {
-    let content_root_url = table_root.join(root_path_str).map_err(|e| {
-        Error::generic(format!("Failed to parse content root URL: {e}"))
-    })?;
-    let (content_root_iter, _, _) = ContentTreeNode::open_stream(
-        engine.parquet_handler(),
-        &content_root_url,
-        root_path_str.to_owned(),
-        None,
-        None,
-    )?;
-    for batch in content_root_iter {
-        for entry in processor.process_actions_batch(ActionsBatch::new(batch?, false))? {
-            builder.add_entry(entry);
-        }
-    }
-    // Only apply removes for leaf paths present in the current content root — removes targeting
-    // paths from an older root are already suppressed by (path, dv_location) deduplication.
-    for (leaf_path, bitmap) in processor.drain_leaf_removes() {
-        if builder.has_leaf_manifest(&leaf_path) {
-            builder.delete_multiple_from_leaf(&leaf_path, &bitmap, true)?;
-        }
-    }
-    Ok(())
 }
 
 // =============================================================================
@@ -722,96 +644,35 @@ impl<S> Transaction<S> {
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
             let physical_table_schema = table_schema.make_physical(column_mapping_mode)?;
-            let table_root = self.read_snapshot.table_root().clone();
-            let current_version = self.read_snapshot.version();
 
-            // Load existing metadata and determine the version from which to replay delta log.
-            // `from_content_root` is only called when no replay is needed (content root is current).
-            // When replay is needed, the builder starts empty and `ContentRootRebuildProcessor`
-            // incorporates both the log commits and the content root in one pass below.
-            let (mut metadata_builder, root_manifest_path, log_start_version) =
-                if let Some(checkpoint_action) = latest_checkpoint_action {
-                    let root_path = checkpoint_action.content_root.path.clone();
-                    let log_start_version = checkpoint_action.version + 1;
-
-                    if log_start_version <= current_version {
-                        // Replay needed — start with an empty builder; processor loads the content root.
-                        let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
-                            table_root.clone(),
-                            commit_version,
-                            physical_table_schema.clone(),
-                        );
-                        (builder, Some(root_path), log_start_version)
-                    } else {
-                        // No replay needed — load content root into builder directly.
-                        let builder =
-                            crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
-                                engine,
-                                &checkpoint_action.content_root,
-                                table_root.clone(),
-                                physical_table_schema.clone(),
-                                commit_version,
-                            )?;
-                        (builder, Some(root_path), log_start_version)
-                    }
-                } else {
-                    // No content root found, start with empty metadata.
-                    let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
-                        table_root.clone(),
-                        commit_version,
-                        physical_table_schema.clone(),
-                    );
-                    (builder, None, 0u64)
-                };
-
-            // If root was released to client control, clear all root data and DV entries
-            // The client will add them back via leaf manifests
-            if self
-                .manifest_commit_state
+            let root_manifest_path = latest_checkpoint_action
                 .as_ref()
-                .is_some_and(|b| b.root_released)
-            {
-                metadata_builder.clear_root_data_and_dv_entries();
+                .map(|ca| ca.content_root.path.clone());
 
-                // TODO: Process incremental removes from delta log and mark them as DELETED
-                // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the checkpoint action version
-                // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
-                // 3. Calling metadata_builder.delete_from_leaf() for each removed file
-                // This is deferred to future work as it requires a new delta log processor.
-            } else if log_start_version <= current_version {
-                let mut processor = ContentRootRebuildProcessor::new(
-                    snapshot_id,
+            let temp_mcs;
+            let manifest_commit_state = if let Some(mcs) = &self.manifest_commit_state {
+                mcs
+            } else {
+                temp_mcs = ManifestCommitState::new(
                     commit_version,
-                    physical_table_schema.clone(),
+                    snapshot_id,
+                    self.read_snapshot.clone(),
                 );
-                replay_log_commits_into(
-                    &mut processor,
-                    &mut metadata_builder,
-                    engine,
-                    self.read_snapshot.log_segment(),
-                    log_start_version,
-                )?;
-                if let Some(root_path_str) = root_manifest_path.as_deref() {
-                    replay_content_root_into(
-                        &mut processor,
-                        &mut metadata_builder,
-                        engine,
-                        root_path_str,
-                        &table_root,
-                    )?;
-                }
-            }
+                &temp_mcs
+            };
+            let mut metadata_builder =
+                manifest_commit_state.initialize_content_root_builder(engine)?;
 
             for add_metadata_result in self.add_files_metadata.iter() {
                 // Pre-convert stats from Delta JSON format to AMT struct format at batch level
-                let converted = crate::content_tree::stats::try_pre_convert_stats_column(
-                    engine,
-                    add_metadata_result.as_ref(),
-                    "stats",
-                    &physical_table_schema,
-                    &BASE_ADD_FILES_SCHEMA,
-                )?;
+                let converted: Option<Box<dyn EngineData>> =
+                    crate::content_tree::stats::try_pre_convert_stats_column(
+                        engine,
+                        add_metadata_result.as_ref(),
+                        "stats",
+                        &physical_table_schema,
+                        &BASE_ADD_FILES_SCHEMA,
+                    )?;
                 let data: &dyn EngineData = match &converted {
                     Some(c) => c.as_ref(),
                     None => add_metadata_result.as_ref(),
@@ -4164,7 +4025,8 @@ mod tests {
                 "partitionValues": {},
                 "size": 1024,
                 "modificationTime": 1677811178336u64,
-                "dataChange": true
+                "dataChange": true,
+                "defaultRowCommitVersion": version
             }
         });
 

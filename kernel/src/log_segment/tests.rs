@@ -1258,7 +1258,6 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
@@ -1337,7 +1336,6 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         let ActionsBatch {
             actions: batch,
             is_log_batch,
-            version: _,
         } = iter.next().unwrap()?;
         assert!(!is_log_batch);
         assert_batch_matches(
@@ -1406,7 +1404,6 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
@@ -1465,7 +1462,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     let mut visitor = AddVisitor::default();
@@ -1562,7 +1558,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     // TODO: per contract this batch is not required to have sidecars, but leaving this test in to
@@ -1581,7 +1576,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let ActionsBatch {
         actions: second_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
@@ -1593,7 +1587,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let ActionsBatch {
         actions: third_batch,
         is_log_batch,
-        version: _,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(

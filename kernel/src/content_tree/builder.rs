@@ -7,10 +7,11 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::{AddVisitor, RemoveVisitor};
+#[cfg(test)]
 use crate::actions::Add;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
 use crate::content_tree::stats::{
-    aggregate_content_stats, delta_json_stats_to_content_stats, merge_partition_values_into_stats,
+    aggregate_content_stats, merge_partition_values_into_stats, parse_delta_add_stats,
 };
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
@@ -459,60 +460,29 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
-        self.add_with_dedup(add, version, snapshot_id)
-    }
-
-    /// Add an entry with deduplication.
-    ///
-    /// Skips `add` if its path was already added (path-only deduplication). This is a simpler
-    /// deduplication than the spec-correct `(path, dv_location)` keying used by
-    /// [`ContentRootRebuildProcessor`] and is appropriate when building a content tree from a flat
-    /// file list where each path appears at most once.
+    /// Adds an [`Add`] action as a [`ContentTreeNodeEntry`], skipping duplicate paths.
     ///
     /// # Arguments
-    /// * `add` - The Add action to convert to a ContentTreeNodeEntry
+    /// * `add` - The Add action to convert to a [`ContentTreeNodeEntry`]
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    #[allow(dead_code)]
-    pub(crate) fn add_with_dedup(
-        &mut self,
-        add: Add,
-        version: Version,
-        snapshot_id: i64,
-    ) -> DeltaResult<()> {
-        // Check for duplicates and skip if already seen
+    #[cfg(test)]
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         if !self.values_seen.insert(add.path.clone()) {
-            // Already seen this file path - skip it
             return Ok(());
         }
 
-        // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
             .as_ref()
             .map(extract_deletion_vector_content)
             .transpose()?;
 
-        // TODO: Check if parsed_stats is set and prefer that over the JSON blob
-        // Convert Delta JSON stats to content_stats. When the file has a deletion vector and
-        // tightBounds is null/absent, treat bounds as not tight (safe for data skipping).
-        let content_stats = delta_json_stats_to_content_stats(
+        let (content_stats, record_count) = parse_delta_add_stats(
             add.stats.as_deref(),
             &self.table_schema,
             add.deletion_vector.is_some().then_some(false),
         )?;
-
-        // Merge partition values into content_stats. Delta JSON stats only cover data columns;
-        // partition column values live in add.partitionValues and need to be recorded as
-        // constant-value statistics in the AMT content_stats.
-        let record_count = add
-            .stats
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Stats>(s).ok())
-            .map(|s| s.num_records as i64)
-            .unwrap_or(0);
         let content_stats = merge_partition_values_into_stats(
             content_stats,
             &add.partition_values,
@@ -1740,12 +1710,10 @@ struct LeafRemove {
 ///   NOT seen in a prior log batch are emitted unchanged; seen entries are suppressed.
 ///
 /// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
-/// accumulated in [`leaf_removes`](Self::drain_leaf_removes) for a post-replay pass that applies
+/// accumulated in [`leaf_deletions`](Self::del) for a post-replay pass that applies
 /// them via [`ContentTreeNodeBuilder::delete_multiple_from_leaf`].
 pub(crate) struct ContentRootRebuildProcessor {
     snapshot_id: i64,
-    /// Version of the new commit being built. Used to stamp `sequence_number` on emitted entries.
-    batch_commit_version: Version,
     table_schema: Schema,
     seen_file_keys: HashSet<FileActionKey>,
     leaf_removes: Vec<LeafRemove>,
@@ -1756,18 +1724,11 @@ impl ContentRootRebuildProcessor {
     ///
     /// # Parameters
     /// - `snapshot_id`: Snapshot ID written into tracking info for each emitted entry.
-    /// - `batch_commit_version`: The new commit version being built. Used for sequence number
-    ///   stamping and status determination (`Added` vs `Existed`).
     /// - `table_schema`: Physical table schema with PARQUET:field_id metadata. Used for stats
     ///   conversion when building entries from `Add` actions.
-    pub(crate) fn new(
-        snapshot_id: i64,
-        batch_commit_version: Version,
-        table_schema: Schema,
-    ) -> Self {
+    pub(crate) fn new(snapshot_id: i64, table_schema: Schema) -> Self {
         Self {
             snapshot_id,
-            batch_commit_version,
             table_schema,
             seen_file_keys: HashSet::new(),
             leaf_removes: Vec::new(),
@@ -1779,10 +1740,6 @@ impl ContentRootRebuildProcessor {
     /// Remove actions mark the file key as seen. Add actions that are first-seen emit a new
     /// [`ContentTreeNodeEntry`] with tracking stamped from the batch version.
     fn process_log_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let version = batch.version.ok_or_else(|| {
-            Error::generic("ContentRootRebuildProcessor: log batch is missing version")
-        })?;
-
         let mut add_visitor = AddVisitor::default();
         let mut remove_visitor = RemoveVisitor::default();
         add_visitor.visit_rows_of(batch.actions.as_ref())?;
@@ -1827,17 +1784,11 @@ impl ContentRootRebuildProcessor {
             }
             self.seen_file_keys.insert(key);
 
-            let content_stats = delta_json_stats_to_content_stats(
+            let (content_stats, record_count) = parse_delta_add_stats(
                 add.stats.as_deref(),
                 &self.table_schema,
                 add.deletion_vector.is_some().then_some(false),
             )?;
-            let record_count = add
-                .stats
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Stats>(s).ok())
-                .map(|s| s.num_records as i64)
-                .unwrap_or(0);
             let content_stats = merge_partition_values_into_stats(
                 content_stats,
                 &add.partition_values,
@@ -1845,9 +1796,13 @@ impl ContentRootRebuildProcessor {
                 Some(record_count),
             )?;
 
+            let entry_version = add
+                .default_row_commit_version
+                .ok_or_else(|| Error::missing_data("defaultRowCommitVersion"))?
+                as Version;
             let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(add.path)
-                .with_tracking(version, self.batch_commit_version, self.snapshot_id)
+                .with_existed_tracking(entry_version, self.snapshot_id)
                 .dv_info_opt(dv_content)
                 .record_count(record_count)
                 .file_size_in_bytes(add.size)
@@ -1862,8 +1817,8 @@ impl ContentRootRebuildProcessor {
     /// Processes a content root batch (`is_log_batch = false`).
     ///
     /// Emits entries whose `(path, dv_location)` key was not seen in a prior log batch.
-    /// Entries at a version earlier than `batch_commit_version` that are still `Added` are
-    /// downgraded to `Existed`.
+    /// Any entry still marked `Added` is normalized to `Existed` — entries from the previous
+    /// root all predate the current commit by definition.
     fn process_content_root_batch(
         &mut self,
         batch: ActionsBatch,
@@ -1885,10 +1840,8 @@ impl ContentRootRebuildProcessor {
                 continue;
             }
 
-            // Downgrade Added -> Existed for entries that were written before the current commit.
-            let entry = if entry.tracking.status == TrackingStatus::Added
-                && entry.tracking.sequence_number != Some(self.batch_commit_version as i64)
-            {
+            // Mark previously "added" entries as "existing"
+            let entry = if entry.tracking.status == TrackingStatus::Added {
                 entry.with_status(TrackingStatus::Existed)
             } else {
                 entry
@@ -1900,13 +1853,12 @@ impl ContentRootRebuildProcessor {
         Ok(entries)
     }
 
-    /// Drains accumulated leaf manifest removals, grouped by leaf path.
-    ///
-    /// The caller must apply these removals via
-    /// [`ContentTreeNodeBuilder::delete_multiple_from_leaf`] after populating the builder with
-    /// the emitted entries.
-    pub(crate) fn drain_leaf_removes(&mut self) -> HashMap<String, roaring::RoaringTreemap> {
-        let mut result: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+    /// Drains accumulated leaf manifest deletions, grouped by leaf path.
+    pub(crate) fn deleted_leaf_positions_by_location(
+        &mut self,
+    ) -> HashMap<String, roaring::RoaringTreemap> {
+        let mut result: HashMap<String, roaring::RoaringTreemap> =
+            HashMap::with_capacity(self.leaf_removes.len());
         for lr in self.leaf_removes.drain(..) {
             result
                 .entry(lr.leaf_path)

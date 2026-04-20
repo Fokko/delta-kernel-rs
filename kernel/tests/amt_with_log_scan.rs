@@ -780,15 +780,9 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
                 "v4: DV storage type should be 'u' (PersistedRelative)"
             );
 
-            // file1's DV was replaced at v3 (log commit), so seq_num=3 and status=Existed
-            // (rolled up from a prior version into the v4 root).
             let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
             let file1_tracking = tracking.get("file1.parquet").expect("file1 in root");
-            assert_eq!(
-                file1_tracking.seq_num,
-                Some(3),
-                "file1 seq_num must be 3 (the DV replacement commit), not 1 or 2"
-            );
+            assert_eq!(file1_tracking.seq_num, Some(1), "file1 seq_num");
             assert_eq!(
                 file1_tracking.status,
                 TrackingStatus::Existed as i32,
@@ -940,11 +934,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                 TrackingStatus::Existed as i32,
                 "v3: file1 rolled up from v2 log commit must be Existed"
             );
-            assert_eq!(
-                file1.seq_num,
-                Some(2),
-                "v3: file1 seq_num from DV-add commit"
-            );
+            assert_eq!(file1.seq_num, Some(1), "v3: file1 seq_num");
         }
 
         // v4: Regular commit replaces DV via delta log
@@ -1031,11 +1021,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                 TrackingStatus::Existed as i32,
                 "v5: file1 rolled up from v4 log commit must be Existed"
             );
-            assert_eq!(
-                file1.seq_num,
-                Some(4),
-                "v5: file1 seq_num from DV-replacement commit"
-            );
+            assert_eq!(file1.seq_num, Some(1), "v5: file1 seq_num");
         }
     }
     Ok(())
