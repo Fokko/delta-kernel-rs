@@ -4583,10 +4583,10 @@ mod tests {
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(record_batch));
             {
-                txn.with_manifest_commit();
-                let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
                 leaf.add_files(engine.as_ref(), metadata_engine_data)?;
-                txn.add_leaf(leaf.finish(engine.as_ref())?)?;
+                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {
@@ -4627,8 +4627,8 @@ mod tests {
                 .with_operation("UPDATE".to_string());
 
             {
-                txn.with_manifest_commit();
-                let leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+                let mc = txn.with_manifest_commit();
+                let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
 
                 // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
                 // Previously used leaf.update_deletion_vectors(dv_updates) here.
@@ -4636,7 +4636,7 @@ mod tests {
                 // re-writing the data entry with updated dv_info.
                 let _ = (&file_locations, known_dv_size_in_bytes);
 
-                txn.add_leaf(leaf.finish(engine.as_ref())?)?;
+                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {

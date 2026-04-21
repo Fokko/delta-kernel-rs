@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::error::Error;
+use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Version};
@@ -37,6 +38,9 @@ pub struct ManifestCommitState {
     pub(super) leaf_manifests: Vec<ContentTreeNodeEntry>,
     pub(super) root_released: bool,
     pub(super) cached_root_manifest_url: OnceCell<Option<Url>>,
+    // Running cursor for row tracking first_row_id assignment across leaves.
+    // Lazily initialized from the snapshot HWM on first use. `None` until initialized.
+    pub(super) row_id_cursor: Option<i64>,
 }
 
 impl ManifestCommitState {
@@ -56,6 +60,7 @@ impl ManifestCommitState {
             leaf_manifests: Vec::new(),
             root_released: false,
             cached_root_manifest_url: OnceCell::new(),
+            row_id_cursor: None,
         }
     }
 
@@ -87,7 +92,7 @@ impl ManifestCommitState {
     /// Returns an error if called more than once per transaction.
     ///
     /// [`Scan`]: crate::scan::Scan
-    /// [`new_leaf_node_writer`]: crate::transaction::Transaction::new_leaf_node_writer
+    /// [`new_leaf_node_writer`]: ManifestCommitState::new_leaf_node_writer
     pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
         if self.root_released {
             return Err(Error::generic(
@@ -112,21 +117,20 @@ impl ManifestCommitState {
 
     /// Create a new [`LeafNodeWriter`] for this manifest commit.
     ///
+    /// The writer can be used to add files to a leaf manifest, which will be written and
+    /// incorporated into the root manifest when the transaction commits.
+    ///
     /// # Arguments
     ///
-    /// * `engine` - The engine to use for fetching the root manifest URL (only on first call;
-    ///   subsequent calls use the cached value).
-    /// * `starting_first_row_id` - The next available row ID for row tracking assignment.
+    /// * `engine` - The engine to use for I/O operations and fetching the root manifest URL
+    ///   (only on first call; subsequent calls use the cached value).
     ///
     /// # Returns
     ///
     /// A new [`LeafNodeWriter`] initialized with the transaction's table root, version, snapshot
     /// ID, and root manifest URL.
-    pub(super) fn new_leaf_node_writer(
-        &mut self,
-        engine: &dyn Engine,
-        starting_first_row_id: i64,
-    ) -> DeltaResult<LeafNodeWriter> {
+    pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
+        let starting_first_row_id = self.ensure_row_id_cursor(engine)?;
         let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
             url.clone()
         } else {
@@ -187,13 +191,14 @@ impl ManifestCommitState {
 
     /// Incorporate leaf writer results into this manifest commit.
     ///
-    /// Unions manifest deletion vectors (roaring bitmaps) across leaves and collects leaf
-    /// manifest entries to include in the root when the transaction commits.
+    /// Advances the row ID cursor and unions manifest deletion vectors (roaring bitmaps) across
+    /// leaves. Collects leaf manifest entries to include in the root when the transaction commits.
     ///
     /// # Arguments
     ///
     /// * `leaf_result` - The result from calling `finish()` on a [`LeafNodeWriter`].
-    pub(super) fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
+    pub fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
+        self.row_id_cursor = Some(leaf_result.final_cursor);
         self.aggregated_unreconciled
             .extend(leaf_result.root_entries_to_remove);
 
@@ -213,6 +218,17 @@ impl ManifestCommitState {
         }
 
         Ok(())
+    }
+
+    /// Lazily initializes and returns the row ID cursor from the snapshot's high water mark.
+    pub(super) fn ensure_row_id_cursor(&mut self, engine: &dyn Engine) -> DeltaResult<i64> {
+        if let Some(cursor) = self.row_id_cursor {
+            return Ok(cursor);
+        }
+        let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+        let cursor = hwm.unwrap_or(-1) + 1;
+        self.row_id_cursor = Some(cursor);
+        Ok(cursor)
     }
 
     /// Applies all accumulated manifest commit state to a [`crate::content_tree::builder::ContentTreeNodeBuilder`].

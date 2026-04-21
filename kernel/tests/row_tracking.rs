@@ -845,9 +845,10 @@ fn write_leaf<S>(
     schema: &SchemaRef,
     files: Vec<(&str, i64, i64, i64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut leaf = txn.new_leaf_node_writer(engine)?;
+    let mc = txn.with_manifest_commit();
+    let mut leaf = mc.new_leaf_node_writer(engine)?;
     leaf.add_files(engine, create_add_files_metadata(schema, files)?)?;
-    txn.add_leaf(leaf.finish(engine)?)?;
+    mc.add_leaf(leaf.finish(engine)?)?;
     Ok(())
 }
 
@@ -1198,37 +1199,38 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
     let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
 
-    txn.with_manifest_commit();
-
     // Simulate parallel leaf creation: each writer is created, populated, and finished
     // independently. The transaction-level cursor ensures non-overlapping row ID ranges.
+    {
+        let mc = txn.with_manifest_commit();
 
-    // Leaf A: 100 records -> row IDs [0, 100)
-    let mut leaf_a = txn.new_leaf_node_writer(engine.as_ref())?;
-    leaf_a.add_files(
-        engine.as_ref(),
-        create_add_files_metadata(schema, vec![("leaf-a.parquet", 4096, 1_000_000, 100)])?,
-    )?;
-    let result_a = leaf_a.finish(engine.as_ref())?;
-    txn.add_leaf(result_a)?;
+        // Leaf A: 100 records -> row IDs [0, 100)
+        let mut leaf_a = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_a.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(schema, vec![("leaf-a.parquet", 4096, 1_000_000, 100)])?,
+        )?;
+        let result_a = leaf_a.finish(engine.as_ref())?;
+        mc.add_leaf(result_a)?;
 
-    // Leaf B: 50 records -> row IDs [100, 150)
-    let mut leaf_b = txn.new_leaf_node_writer(engine.as_ref())?;
-    leaf_b.add_files(
-        engine.as_ref(),
-        create_add_files_metadata(schema, vec![("leaf-b.parquet", 2048, 1_000_001, 50)])?,
-    )?;
-    let result_b = leaf_b.finish(engine.as_ref())?;
-    txn.add_leaf(result_b)?;
+        // Leaf B: 50 records -> row IDs [100, 150)
+        let mut leaf_b = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_b.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(schema, vec![("leaf-b.parquet", 2048, 1_000_001, 50)])?,
+        )?;
+        let result_b = leaf_b.finish(engine.as_ref())?;
+        mc.add_leaf(result_b)?;
 
-    // Leaf C: 200 records -> row IDs [150, 350)
-    let mut leaf_c = txn.new_leaf_node_writer(engine.as_ref())?;
-    leaf_c.add_files(
-        engine.as_ref(),
-        create_add_files_metadata(schema, vec![("leaf-c.parquet", 8192, 1_000_002, 200)])?,
-    )?;
-    let result_c = leaf_c.finish(engine.as_ref())?;
-    txn.add_leaf(result_c)?;
+        // Leaf C: 200 records -> row IDs [150, 350)
+        let mut leaf_c = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_c.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(schema, vec![("leaf-c.parquet", 8192, 1_000_002, 200)])?,
+        )?;
+        let result_c = leaf_c.finish(engine.as_ref())?;
+        mc.add_leaf(result_c)?;
+    }
 
     let committed = match txn.commit(engine.as_ref())? {
         CommitResult::CommittedTransaction(c) => c,

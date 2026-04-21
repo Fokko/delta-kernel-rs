@@ -253,9 +253,6 @@ pub struct Transaction<S = ExistingTable> {
     // Manifest commit state. `Some` when the caller has opted in via
     // `with_manifest_commit()`. `None` for log commits.
     manifest_commit_state: Option<ManifestCommitState>,
-    // Running cursor for row tracking first_row_id assignment across leaves.
-    // Lazily initialized from the snapshot HWM on first use. `None` until initialized.
-    row_id_cursor: Option<i64>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -389,11 +386,12 @@ impl<S> Transaction<S> {
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
 
-        // Step 4: Determine if this is a manifest commit and pre-compute the row ID cursor
-        // while we still have &mut self access.
+        // Step 4: Determine if this is a manifest commit and pre-compute the row ID cursor.
+        // Auto-create ManifestCommitState for icebergNativeV4 (where is_manifest_commit() is true
+        // but with_manifest_commit() was never called by the user).
         let manifest_commit = self.is_manifest_commit();
         let row_id_cursor = if manifest_commit {
-            Some(self.ensure_row_id_cursor(engine)?)
+            Some(self.with_manifest_commit().ensure_row_id_cursor(engine)?)
         } else {
             None
         };
@@ -764,9 +762,8 @@ impl<S> Transaction<S> {
     /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
     /// The returned `&mut ManifestCommitState` provides tree-manipulation methods such as
-    /// [`ManifestCommitState::release_root_and_delta_actions`]. Use
-    /// [`Transaction::new_leaf_node_writer`] and [`Transaction::add_leaf`] for leaf operations
-    /// (these live on `Transaction` because they manage the transaction-level row ID cursor).
+    /// [`ManifestCommitState::release_root_and_delta_actions`],
+    /// [`ManifestCommitState::new_leaf_node_writer`], and [`ManifestCommitState::add_leaf`].
     ///
     /// # Example
     ///
@@ -774,10 +771,12 @@ impl<S> Transaction<S> {
     /// let mut txn = snapshot.transaction(committer, engine)?
     ///     .with_data_change(true);
     ///
-    /// txn.with_manifest_commit();
-    /// let mut leaf = txn.new_leaf_node_writer(engine)?;
-    /// leaf.add_files(engine, metadata)?;
-    /// txn.add_leaf(leaf.finish(engine)?)?;
+    /// {
+    ///     let mc = txn.with_manifest_commit();
+    ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
+    ///     leaf.add_files(engine, metadata)?;
+    ///     mc.add_leaf(leaf.finish(engine)?)?;
+    /// }
     ///
     /// txn.commit(engine)?;
     /// ```
@@ -789,54 +788,6 @@ impl<S> Transaction<S> {
                 self.read_snapshot.clone(),
             )
         })
-    }
-
-    /// Create a new [`LeafNodeWriter`] for this transaction.
-    ///
-    /// The writer can be used to add files to a leaf manifest, which will be written and
-    /// incorporated into the root manifest when the transaction commits.
-    ///
-    /// Requires [`with_manifest_commit`](Transaction::with_manifest_commit) to have been called
-    /// first.
-    ///
-    /// # Arguments
-    ///
-    /// * `engine` - The engine to use for I/O operations.
-    pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
-        let starting_first_row_id = self.ensure_row_id_cursor(engine)?;
-        let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
-            Error::generic(
-                "new_leaf_node_writer requires with_manifest_commit() to be called first",
-            )
-        })?;
-        mc.new_leaf_node_writer(engine, starting_first_row_id)
-    }
-
-    /// Incorporate leaf writer results into this transaction.
-    ///
-    /// Advances the transaction-level row ID cursor and delegates manifest bookkeeping
-    /// to [`ManifestCommitState`].
-    ///
-    /// # Arguments
-    ///
-    /// * `leaf_result` - The result from calling `finish()` on a [`LeafNodeWriter`].
-    pub fn add_leaf(&mut self, leaf_result: LeafNodeWriterResult) -> DeltaResult<()> {
-        self.row_id_cursor = Some(leaf_result.final_cursor);
-        let mc = self.manifest_commit_state.as_mut().ok_or_else(|| {
-            Error::generic("add_leaf requires with_manifest_commit() to be called first")
-        })?;
-        mc.add_leaf(leaf_result)
-    }
-
-    /// Lazily initializes and returns the row ID cursor from the snapshot's high water mark.
-    fn ensure_row_id_cursor(&mut self, engine: &dyn Engine) -> DeltaResult<i64> {
-        if let Some(cursor) = self.row_id_cursor {
-            return Ok(cursor);
-        }
-        let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-        let cursor = hwm.unwrap_or(-1) + 1;
-        self.row_id_cursor = Some(cursor);
-        Ok(cursor)
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -3170,10 +3121,10 @@ mod tests {
             let mc = txn.with_manifest_commit();
             // Step 3: Release root and delta actions
             scan = mc.release_root_and_delta_actions()?;
+            // Step 4: Create leaf writers
+            leaf1 = mc.new_leaf_node_writer(&engine)?;
+            leaf2 = mc.new_leaf_node_writer(&engine)?;
         }
-        // Step 4: Create leaf writers
-        leaf1 = txn.new_leaf_node_writer(&engine)?;
-        leaf2 = txn.new_leaf_node_writer(&engine)?;
 
         // Helper to create add metadata for testing
         // Note: stats are set to null (empty struct) because proper content_stats requires
@@ -3283,8 +3234,11 @@ mod tests {
         leaf2.add_files(&engine, leaf2_metadata)?;
 
         // Step 5: Finish leaf writers and add to manifest commit
-        txn.add_leaf(leaf1.finish(&engine)?)?;
-        txn.add_leaf(leaf2.finish(&engine)?)?;
+        {
+            let mc = txn.with_manifest_commit();
+            mc.add_leaf(leaf1.finish(&engine)?)?;
+            mc.add_leaf(leaf2.finish(&engine)?)?;
+        }
 
         // Exhaust the scan (required before commit)
         for _ in scan.scan_metadata(&engine)? {}

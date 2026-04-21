@@ -315,15 +315,15 @@ fn verify_stats(
 
 /// Helper to create and add a leaf node with files
 fn add_leaf_with_files(
-    txn: &mut delta_kernel::transaction::Transaction,
+    mc: &mut delta_kernel::transaction::ManifestCommitState,
     engine: &dyn delta_kernel::Engine,
     add_files_schema: &Arc<StructType>,
     files: Vec<TestFileStats<'_>>,
 ) -> DeltaResult<()> {
-    let mut leaf = txn.new_leaf_node_writer(engine)?;
+    let mut leaf = mc.new_leaf_node_writer(engine)?;
     let data = create_add_files_with_stats(add_files_schema, files)?;
     leaf.add_files(engine, data)?;
-    txn.add_leaf(leaf.finish(engine)?)?;
+    mc.add_leaf(leaf.finish(engine)?)?;
     Ok(())
 }
 
@@ -392,47 +392,49 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     );
 
     // Add files to leaves: leaf1 (files 1-2), leaf2 (file3)
-    txn.with_manifest_commit();
-    add_leaf_with_files(
-        &mut txn,
-        engine.as_ref(),
-        &add_files_schema,
-        vec![
-            TestFileStats {
-                path: file1,
+    {
+        let mc = txn.with_manifest_commit();
+        add_leaf_with_files(
+            mc,
+            engine.as_ref(),
+            &add_files_schema,
+            vec![
+                TestFileStats {
+                    path: file1,
+                    size: 100,
+                    num_records: 100,
+                    min_id: 1,
+                    max_id: 100,
+                    min_row_id: 5,
+                    max_row_id: 20,
+                },
+                TestFileStats {
+                    path: file2,
+                    size: 100,
+                    num_records: 200,
+                    min_id: 101,
+                    max_id: 200,
+                    min_row_id: 105,
+                    max_row_id: 120,
+                },
+            ],
+        )?;
+
+        add_leaf_with_files(
+            mc,
+            engine.as_ref(),
+            &add_files_schema,
+            vec![TestFileStats {
+                path: file3,
                 size: 100,
                 num_records: 100,
-                min_id: 1,
-                max_id: 100,
-                min_row_id: 5,
-                max_row_id: 20,
-            },
-            TestFileStats {
-                path: file2,
-                size: 100,
-                num_records: 200,
-                min_id: 101,
-                max_id: 200,
-                min_row_id: 105,
-                max_row_id: 120,
-            },
-        ],
-    )?;
-
-    add_leaf_with_files(
-        &mut txn,
-        engine.as_ref(),
-        &add_files_schema,
-        vec![TestFileStats {
-            path: file3,
-            size: 100,
-            num_records: 100,
-            min_id: 201,
-            max_id: 300,
-            min_row_id: 205,
-            max_row_id: 220,
-        }],
-    )?;
+                min_id: 201,
+                max_id: 300,
+                min_row_id: 205,
+                max_row_id: 220,
+            }],
+        )?;
+    }
 
     // Verify stats in leaf data
     let leaf1_data = create_add_files_with_stats(
