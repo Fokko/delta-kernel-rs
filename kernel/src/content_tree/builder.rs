@@ -317,10 +317,8 @@ impl ContentTreeNodeBuilder {
         let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
-            // Entries loaded from a prior root that carry `Added` status must be downgraded to
-            // `Existed` for the new version — they predate this commit. The one exception is the
-            // no-op rebuild case: if an entry's `sequence_number` equals `new_version`, the root
-            // was written at exactly this version and those entries are still legitimately `Added`.
+            // Preserve Added only for entries whose sequence_number matches new_version (no-op
+            // rebuild); everything else predates this commit and becomes Existed.
             let entry = if entry.tracking.status == TrackingStatus::Added
                 && entry.tracking.sequence_number != Some(new_version as i64)
             {
@@ -468,12 +466,7 @@ impl ContentTreeNodeBuilder {
     }
 
     /// Adds an [`Add`] action as a [`ContentTreeNodeEntry`] with an explicit tracking status,
-    /// skipping duplicate paths.
-    ///
-    /// `version` is stored as the entry's `sequence_number` and `file_sequence_number`.
-    /// Use this when the desired status is known independently of the builder's current version
-    /// — for example, when building a test fixture that includes files from historical versions
-    /// that should be marked [`TrackingStatus::Existed`].
+    /// skipping duplicate paths. `version` is stored as the entry's `sequence_number`.
     #[cfg(test)]
     pub(crate) fn add_with_status(
         &mut self,
@@ -516,11 +509,8 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Adds an [`Add`] action as a new file in the current version (status =
-    /// [`TrackingStatus::Added`]).
-    ///
-    /// `version` is stored as the entry's `sequence_number` and should equal the commit version
-    /// being written. Delegates to [`add_with_status`] with [`TrackingStatus::Added`].
+    /// Adds an [`Add`] action as a new file (status = [`TrackingStatus::Added`]).
+    /// `version` is stored as the entry's `sequence_number`.
     #[cfg(test)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_status(add, version, snapshot_id, TrackingStatus::Added)
@@ -1695,10 +1685,6 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// For rows with a DV: decodes path (base85 UUID → relative path), widens offset/sizeInBytes
 /// to LONG, adds 8 to sizeInBytes (Delta → Iceberg framing), stores cardinality.
 /// For rows without a DV: pushes Null scalars for all 4 columns.
-///
-/// Two column-name schemas are supported:
-/// - Scan rows (`is_log_batch = false`): DV fields are at `deletionVector.*`
-/// - Log batch rows (`is_log_batch = true`): DV fields are nested under `add.deletionVector.*`
 struct DecodedDvVisitor {
     decoded_paths: Vec<crate::expressions::Scalar>,
     decoded_offsets: Vec<crate::expressions::Scalar>,
@@ -1735,7 +1721,6 @@ impl DecodedDvVisitor {
 
 impl RowVisitor for DecodedDvVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        // Scan rows expose DV fields at `deletionVector.*`; log batch rows nest them under `add`.
         if self.is_log_batch {
             static LOG_BATCH: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
                 let names = vec![
@@ -1827,10 +1812,7 @@ struct LeafManifestIndex {
 // ===========================================================================================
 
 /// Parses `add.stats` JSON into `(record_count, content_stats)` for selected rows only.
-///
-/// Rows where `selection_vector[i]` is `false` are skipped — they won't survive the
-/// selection vector so parsing their stats is wasteful. Those rows get `0` / null pushed
-/// into the output vecs so all lengths stay consistent with `row_count`.
+/// Non-selected rows get `0` / null to keep output lengths consistent with `row_count`.
 struct LogBatchStatsVisitor<'a> {
     table_schema: &'a crate::schema::StructType,
     content_stats_type: DataType,
@@ -1883,11 +1865,9 @@ impl RowVisitor for LogBatchStatsVisitor<'_> {
     }
 }
 
-/// Single-pass visitor for AMT log replay deduplication.
-///  After the visit:
-/// - `selection_vector[i] = true` for first-seen Add rows (surviving entries).
-/// - `selection_vector[i] = false` for duplicate Adds, Removes, and all other action types.
-/// - `log_action_keys` and `leaf_removes` are updated for Remove rows.
+/// Single-pass visitor that deduplicates a log batch for AMT replay.
+/// Sets `selection_vector[i] = true` for first-seen Add rows; updates `log_action_keys`
+/// and `leaf_removes` for Remove rows.
 struct LogBatchDedupVisitor<'a> {
     log_action_keys: &'a mut HashSet<FileActionKey>,
     leaf_removes: &'a mut Vec<LeafManifestIndex>,
@@ -2153,7 +2133,6 @@ impl ContentRootRebuildProcessor {
     ) -> DeltaResult<Option<FilteredEngineData>> {
         let row_count = batch.actions.len();
 
-        // Visit the log batch, dedup, build selection vector, and collect leaf manifest removals.
         let mut dedup = LogBatchDedupVisitor {
             log_action_keys: &mut self.log_action_keys,
             leaf_removes: &mut self.leaf_removes,
@@ -2165,13 +2144,10 @@ impl ContentRootRebuildProcessor {
             return Ok(None);
         }
 
-        // Phase 2a: decode DV columns directly from the raw batch (add.deletionVector.*).
-        // z85 path decoding cannot be expressed as a kernel expression, so a visitor is used.
+        // Decode DV columns: z85 path decoding cannot be expressed as a kernel expression.
         let mut dv_decoder = DecodedDvVisitor::for_log_batch(row_count);
         dv_decoder.visit_rows_of(batch.actions.as_ref())?;
 
-        // Phase 2b: parse per-row stats from add.stats JSON, but only for selected rows.
-        // Non-selected rows (duplicates/superseded) get cheap 0/null without JSON parsing.
         let mut stats_visitor = LogBatchStatsVisitor {
             table_schema: &self.table_schema,
             content_stats_type: self.content_stats_type.clone(),
@@ -2181,7 +2157,7 @@ impl ContentRootRebuildProcessor {
         };
         stats_visitor.visit_rows_of(batch.actions.as_ref())?;
 
-        // Phase 3a: append decoded DV columns so the expression evaluator can read them.
+        // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
         let augmented_with_dv = batch.actions.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![
@@ -2204,7 +2180,6 @@ impl ContentRootRebuildProcessor {
             ],
         )?;
 
-        // Phase 3b: append pre-parsed stats columns so the expression evaluator can read them.
         let stats_decoded_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("_stats_record_count", DataType::LONG),
             StructField::nullable("_stats_content_stats", self.content_stats_type.clone()),
@@ -2223,7 +2198,6 @@ impl ContentRootRebuildProcessor {
             ],
         )?;
 
-        // Phase 4: evaluate expression → ContentTreeNodeEntry schema.
         let result = self.action_evaluator.evaluate(augmented.as_ref())?;
         FilteredEngineData::try_new(result, dedup.selection_vector).map(Some)
     }
@@ -4123,10 +4097,12 @@ mod tests {
         // Builder version is 5 (new root being built).
         let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
 
-        // Add file1 at version 2 (simulating a file from a delta log commit at v2).
-        // Use add_with_status to explicitly mark as Existed — this file predates the
-        // root being built (version 5).
-        builder.add_with_status(make_test_add("file1.parquet"), 2, 100, TrackingStatus::Existed)?;
+        builder.add_with_status(
+            make_test_add("file1.parquet"),
+            2,
+            100,
+            TrackingStatus::Existed,
+        )?;
 
         assert_eq!(builder.pending_entries.len(), 1);
         let entry = &builder.pending_entries[0];
