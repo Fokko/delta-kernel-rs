@@ -317,6 +317,10 @@ impl ContentTreeNodeBuilder {
         let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
+            // Entries loaded from a prior root that carry `Added` status must be downgraded to
+            // `Existed` for the new version — they predate this commit. The one exception is the
+            // no-op rebuild case: if an entry's `sequence_number` equals `new_version`, the root
+            // was written at exactly this version and those entries are still legitimately `Added`.
             let entry = if entry.tracking.status == TrackingStatus::Added
                 && entry.tracking.sequence_number != Some(new_version as i64)
             {
@@ -463,14 +467,21 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    /// Adds an [`Add`] action as a [`ContentTreeNodeEntry`], skipping duplicate paths.
+    /// Adds an [`Add`] action as a [`ContentTreeNodeEntry`] with an explicit tracking status,
+    /// skipping duplicate paths.
     ///
-    /// # Arguments
-    /// * `add` - The Add action to convert to a [`ContentTreeNodeEntry`]
-    /// * `version` - The version to use for tracking info
-    /// * `snapshot_id` - The snapshot ID for tracking info
+    /// `version` is stored as the entry's `sequence_number` and `file_sequence_number`.
+    /// Use this when the desired status is known independently of the builder's current version
+    /// — for example, when building a test fixture that includes files from historical versions
+    /// that should be marked [`TrackingStatus::Existed`].
     #[cfg(test)]
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
+    pub(crate) fn add_with_status(
+        &mut self,
+        add: Add,
+        version: Version,
+        snapshot_id: i64,
+        status: TrackingStatus,
+    ) -> DeltaResult<()> {
         if !self.values_seen.insert(add.path.clone()) {
             return Ok(());
         }
@@ -493,11 +504,6 @@ impl ContentTreeNodeBuilder {
             Some(record_count),
         )?;
 
-        let status = if version == self.version {
-            TrackingStatus::Added
-        } else {
-            TrackingStatus::Existed
-        };
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(add.path)
             .with_tracking(status, version, snapshot_id)
@@ -508,6 +514,16 @@ impl ContentTreeNodeBuilder {
             .build();
         self.pending_entries.push(entry);
         Ok(())
+    }
+
+    /// Adds an [`Add`] action as a new file in the current version (status =
+    /// [`TrackingStatus::Added`]).
+    ///
+    /// `version` is stored as the entry's `sequence_number` and should equal the commit version
+    /// being written. Delegates to [`add_with_status`] with [`TrackingStatus::Added`].
+    #[cfg(test)]
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
+        self.add_with_status(add, version, snapshot_id, TrackingStatus::Added)
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
@@ -1353,7 +1369,7 @@ impl ContentTreeNodeBuilder {
 
         // Step 1: Detect + decode DV columns in one pass from the original engine_data.
         // (Done first so we can use the original data's nullable DV fields directly.)
-        let mut dv_visitor = DecodedDvVisitor::with_capacity(engine_data.len());
+        let mut dv_visitor = DecodedDvVisitor::for_scan_rows(engine_data.len());
         dv_visitor.visit_rows_of(engine_data)?;
 
         // Step 2: Produce {path, size, stats_parsed} via coalesce(stats_parsed, parse_json(stats)).
@@ -1674,25 +1690,41 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Visits all scan-row rows in one pass, accumulating decoded DV columns.
+/// Visits rows in one pass, accumulating decoded DV columns.
 ///
 /// For rows with a DV: decodes path (base85 UUID → relative path), widens offset/sizeInBytes
 /// to LONG, adds 8 to sizeInBytes (Delta → Iceberg framing), stores cardinality.
 /// For rows without a DV: pushes Null scalars for all 4 columns.
+///
+/// Two column-name schemas are supported:
+/// - Scan rows (`is_log_batch = false`): DV fields are at `deletionVector.*`
+/// - Log batch rows (`is_log_batch = true`): DV fields are nested under `add.deletionVector.*`
 struct DecodedDvVisitor {
     decoded_paths: Vec<crate::expressions::Scalar>,
     decoded_offsets: Vec<crate::expressions::Scalar>,
     decoded_sizes: Vec<crate::expressions::Scalar>,
     decoded_cardinalities: Vec<crate::expressions::Scalar>,
+    is_log_batch: bool,
 }
 
 impl DecodedDvVisitor {
-    fn with_capacity(n: usize) -> Self {
+    fn for_scan_rows(n: usize) -> Self {
         Self {
             decoded_paths: Vec::with_capacity(n),
             decoded_offsets: Vec::with_capacity(n),
             decoded_sizes: Vec::with_capacity(n),
             decoded_cardinalities: Vec::with_capacity(n),
+            is_log_batch: false,
+        }
+    }
+
+    fn for_log_batch(n: usize) -> Self {
+        Self {
+            decoded_paths: Vec::with_capacity(n),
+            decoded_offsets: Vec::with_capacity(n),
+            decoded_sizes: Vec::with_capacity(n),
+            decoded_cardinalities: Vec::with_capacity(n),
+            is_log_batch: true,
         }
     }
 
@@ -1703,24 +1735,46 @@ impl DecodedDvVisitor {
 
 impl RowVisitor for DecodedDvVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("add.deletionVector.storageType"),
-                column_name!("add.deletionVector.pathOrInlineDv"),
-                column_name!("add.deletionVector.offset"),
-                column_name!("add.deletionVector.sizeInBytes"),
-                column_name!("add.deletionVector.cardinality"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::STRING,
-                DataType::INTEGER,
-                DataType::INTEGER,
-                DataType::LONG,
-            ];
-            (names, types).into()
-        });
-        NAMES_AND_TYPES.as_ref()
+        // Scan rows expose DV fields at `deletionVector.*`; log batch rows nest them under `add`.
+        if self.is_log_batch {
+            static LOG_BATCH: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                let names = vec![
+                    column_name!("add.deletionVector.storageType"),
+                    column_name!("add.deletionVector.pathOrInlineDv"),
+                    column_name!("add.deletionVector.offset"),
+                    column_name!("add.deletionVector.sizeInBytes"),
+                    column_name!("add.deletionVector.cardinality"),
+                ];
+                let types = vec![
+                    DataType::STRING,
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                ];
+                (names, types).into()
+            });
+            LOG_BATCH.as_ref()
+        } else {
+            static SCAN_ROW: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                let names = vec![
+                    column_name!("deletionVector.storageType"),
+                    column_name!("deletionVector.pathOrInlineDv"),
+                    column_name!("deletionVector.offset"),
+                    column_name!("deletionVector.sizeInBytes"),
+                    column_name!("deletionVector.cardinality"),
+                ];
+                let types = vec![
+                    DataType::STRING,
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                ];
+                (names, types).into()
+            });
+            SCAN_ROW.as_ref()
+        }
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -2113,7 +2167,7 @@ impl ContentRootRebuildProcessor {
 
         // Phase 2a: decode DV columns directly from the raw batch (add.deletionVector.*).
         // z85 path decoding cannot be expressed as a kernel expression, so a visitor is used.
-        let mut dv_decoder = DecodedDvVisitor::with_capacity(row_count);
+        let mut dv_decoder = DecodedDvVisitor::for_log_batch(row_count);
         dv_decoder.visit_rows_of(batch.actions.as_ref())?;
 
         // Phase 2b: parse per-row stats from add.stats JSON, but only for selected rows.
@@ -4070,7 +4124,9 @@ mod tests {
         let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
 
         // Add file1 at version 2 (simulating a file from a delta log commit at v2).
-        builder.add(make_test_add("file1.parquet"), 2, 100)?;
+        // Use add_with_status to explicitly mark as Existed — this file predates the
+        // root being built (version 5).
+        builder.add_with_status(make_test_add("file1.parquet"), 2, 100, TrackingStatus::Existed)?;
 
         assert_eq!(builder.pending_entries.len(), 1);
         let entry = &builder.pending_entries[0];
