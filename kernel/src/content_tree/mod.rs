@@ -1922,7 +1922,7 @@ impl HasSelectionVector for Vec<ContentTreeNodeEntry> {
 /// ```ignore
 /// ContentTreeNodeEntryBuilder::new(DataContentType::Data)
 ///     .location("path/to/file.parquet")
-///     .with_tracking(entry_version, current_version, snapshot_id)
+///     .with_tracking(TrackingStatus::Added, entry_version, snapshot_id)
 ///     .record_count(100)
 ///     .file_size_in_bytes(1024)
 ///     .build()
@@ -1979,39 +1979,16 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    /// Set tracking info by computing status from `entry_version` vs `current_version`.
-    /// If the file was written at `current_version`, its status is `Added`; otherwise `Existed`.
+    /// Set tracking info with the given `status`, `entry_version`, and `snapshot_id`.
     #[cfg(test)]
     pub(crate) fn with_tracking(
         mut self,
+        status: TrackingStatus,
         entry_version: Version,
-        current_version: Version,
         snapshot_id: i64,
     ) -> Self {
-        let status = if entry_version == current_version {
-            TrackingStatus::Added
-        } else {
-            TrackingStatus::Existed
-        };
         self.tracking = TrackingInfo {
             status,
-            snapshot_id: Some(snapshot_id),
-            sequence_number: Some(entry_version as i64),
-            file_sequence_number: Some(entry_version as i64),
-            first_row_id: None,
-            changes_dv: None,
-        };
-        self
-    }
-
-    /// Set tracking info with `Existed` status
-    pub(crate) fn with_existed_tracking(
-        mut self,
-        entry_version: Version,
-        snapshot_id: i64,
-    ) -> Self {
-        self.tracking = TrackingInfo {
-            status: TrackingStatus::Existed,
             snapshot_id: Some(snapshot_id),
             sequence_number: Some(entry_version as i64),
             file_sequence_number: Some(entry_version as i64),
@@ -2028,6 +2005,7 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn dv_info_opt(mut self, dv_info: Option<DvInfo>) -> Self {
         self.dv_info = dv_info;
         self

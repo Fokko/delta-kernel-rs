@@ -1192,6 +1192,7 @@ pub(crate) fn parse_delta_add_stats(
 /// - `null_value_count` = num_records if partition value is null, else 0
 /// - `lower_bound` / `upper_bound` = the parsed partition value (both equal)
 /// - `exact_bounds` = true (partition values are always exact)
+#[cfg(test)]
 fn build_partition_column_stats(
     stats_struct: &StructType,
     partition_value: Option<&Scalar>,
@@ -1252,6 +1253,7 @@ fn build_partition_column_stats(
 /// * `partition_values` - Map of physical partition column name to string-serialised value
 /// * `table_schema` - The physical table schema (including partition columns with field IDs)
 /// * `num_records` - Record count for this file (used for `value_count` / `null_value_count`)
+#[cfg(test)]
 pub(crate) fn merge_partition_values_into_stats(
     content_stats: Option<StructData>,
     partition_values: &HashMap<String, String>,

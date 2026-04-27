@@ -5,13 +5,13 @@ use std::sync::Arc;
 use url::Url;
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
-use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
-use crate::content_tree::builder::{ContentRootRebuildProcessor, ContentTreeNodeBuilder};
+use crate::content_tree::builder::{
+    log_replay_schema, ContentRootRebuildProcessor, ContentTreeNodeBuilder,
+};
 use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
 use crate::log_reader::commit::CommitReader;
-use crate::log_replay::{ActionsBatch, LogReplayProcessor as _};
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::log_replay::ActionsBatch;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, FileMeta, Version};
@@ -68,25 +68,34 @@ impl ExplicitRootManifestCommit {
     }
 }
 
-/// Replay delta log commit files at or after `from_version` through `processor` and returns
-/// the entries emitted.
+/// Replay delta log commit files at or after `from_version` through `processor`.
+///
+/// Returns pre-transformed [`EngineData`] batches in ContentTreeNodeEntry schema — one per
+/// non-empty surviving commit batch. The caller pushes these to a [`ContentTreeNodeBuilder`]
+/// via [`add_pre_built_log_batch`].
+///
+/// [`EngineData`]: crate::EngineData
+/// [`add_pre_built_log_batch`]: ContentTreeNodeBuilder::add_pre_built_log_batch
 fn replay_log_commits(
     processor: &mut ContentRootRebuildProcessor,
     engine: &dyn Engine,
     log_segment: &crate::log_segment::LogSegment,
     from_version: Version,
-) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-    ]));
+) -> DeltaResult<Vec<Box<dyn crate::EngineData>>> {
     let content_root_version = from_version.checked_sub(1);
-    let reader = CommitReader::try_new(engine, log_segment, schema, content_root_version)?;
-    let mut entries = Vec::new();
+    let reader = CommitReader::try_new(
+        engine,
+        log_segment,
+        log_replay_schema(),
+        content_root_version,
+    )?;
+    let mut batches = Vec::new();
     for batch in reader {
-        entries.extend(processor.process_actions_batch(batch?)?);
+        if let Some(fed) = processor.process_log_batch(batch?)? {
+            batches.push(fed.apply_selection_vector()?);
+        }
     }
-    Ok(entries)
+    Ok(batches)
 }
 
 /// Applies `processor` over the existing content root and returns the live entries.
@@ -108,7 +117,7 @@ fn replay_content_root(
     )?;
     let mut entries = Vec::new();
     for batch in content_root_iter {
-        entries.extend(processor.process_actions_batch(ActionsBatch::new(batch?, false))?);
+        entries.extend(processor.process_root_batch(ActionsBatch::new(batch?, false))?);
     }
     Ok(entries)
 }
@@ -391,15 +400,16 @@ impl ManifestCommitState {
             builder.clear_root_data_and_dv_entries();
             // TODO: Process incremental removes from delta log and mark them as DELETED in the
             // appropriate leaf manifests. This can be done by calling `replay_log_commits`,
-            // discarding the returned entries, and then applying `processor.deleted_leaf_positions_by_location()`
-            // to `builder`.
+            // discarding the returned batches, and then applying
+            // `processor.deleted_leaf_positions_by_location()` to `builder`.
             return Ok(builder);
         }
 
-        let mut processor = ContentRootRebuildProcessor::new(self.snapshot_id, physical_schema);
+        let mut processor =
+            ContentRootRebuildProcessor::new(engine, self.snapshot_id, physical_schema)?;
         let log_segment = self.read_snapshot.log_segment();
-        for entry in replay_log_commits(&mut processor, engine, log_segment, log_start_version)? {
-            builder.add_entry(entry);
+        for data in replay_log_commits(&mut processor, engine, log_segment, log_start_version)? {
+            builder.add_pre_built_log_batch(data)?;
         }
         if let Some(root_path) = root_path.as_deref() {
             for entry in replay_content_root(&mut processor, engine, root_path, &table_root)? {
