@@ -1139,11 +1139,12 @@ fn collect_root_manifest_tracking_info(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
 ) -> DeltaResult<HashMap<String, TrackingEntry>> {
+    use std::sync::LazyLock;
+
     use delta_kernel::engine_data::{GetData, RowVisitor};
     use delta_kernel::expressions::ColumnName;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::FileMeta;
-    use std::sync::LazyLock;
 
     let Some(checkpoint_action) = snapshot.checkpoint_action() else {
         return Ok(HashMap::new());

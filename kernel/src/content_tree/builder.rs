@@ -24,8 +24,10 @@ use crate::content_tree::{
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
 use crate::log_replay::{ActionsBatch, FileActionKey};
-use crate::schema::column_name;
-use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField, StructType};
+use crate::schema::{
+    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+    StructField, StructType,
+};
 use crate::utils::require;
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -1503,8 +1505,8 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// Projects only the fields used by [`LogBatchDedupVisitor`], [`DecodedDvVisitor`], and
 /// the `action_evaluator` in [`ContentRootRebuildProcessor`]:
 ///
-/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `deletionVector` (all 5 DV sub-fields
-///   for z85 decode)
+/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `deletionVector` (all 5 DV sub-fields for
+///   z85 decode)
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
 ///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
@@ -1832,7 +1834,6 @@ impl RowVisitor for LogBatchStatsVisitor<'_> {
 /// - `selection_vector[i] = true` for first-seen Add rows (surviving entries).
 /// - `selection_vector[i] = false` for duplicate Adds, Removes, and all other action types.
 /// - `log_action_keys` and `leaf_removes` are updated for Remove rows.
-///
 struct LogBatchDedupVisitor<'a> {
     log_action_keys: &'a mut HashSet<FileActionKey>,
     leaf_removes: &'a mut Vec<LeafManifestIndex>,
@@ -1958,12 +1959,12 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
 /// root. Uses spec-correct `(path, dv_location)` deduplication: first-seen wins, so the newest
 /// action for each logical file is authoritative.
 ///
-/// - Log batches (`is_log_batch = true`): [`LogBatchDedupVisitor`] is the single visitor pass;
-///   it builds a selection vector marking surviving Add rows. The surviving rows are then
-///   converted to ContentTreeNodeEntry schema via a pre-built expression evaluator and returned
-///   as a [`FilteredEngineData`].
-/// - Content root batches (`is_log_batch = false`): entries whose `(path, dv_location)` key was
-///   NOT seen in a prior log batch are emitted unchanged; seen entries are suppressed.
+/// - Log batches (`is_log_batch = true`): [`LogBatchDedupVisitor`] is the single visitor pass; it
+///   builds a selection vector marking surviving Add rows. The surviving rows are then converted to
+///   ContentTreeNodeEntry schema via a pre-built expression evaluator and returned as a
+///   [`FilteredEngineData`].
+/// - Content root batches (`is_log_batch = false`): entries whose `(path, dv_location)` key was NOT
+///   seen in a prior log batch are emitted unchanged; seen entries are suppressed.
 ///
 /// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
 /// accumulated for a post-replay pass via [`deleted_leaf_positions_by_location`].
@@ -1976,7 +1977,8 @@ pub(crate) struct ContentRootRebuildProcessor {
     table_schema: crate::schema::StructType,
     /// Type of the `content_stats` column; used to build null scalars for unselected rows.
     content_stats_type: DataType,
-    /// Pre-built evaluator: raw log batch + `_dv_*` + `_stats_*` columns → ContentTreeNodeEntry schema.
+    /// Pre-built evaluator: raw log batch + `_dv_*` + `_stats_*` columns → ContentTreeNodeEntry
+    /// schema.
     action_evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
@@ -2013,7 +2015,8 @@ impl ContentRootRebuildProcessor {
             StructField::nullable("_stats_content_stats", content_stats_type.clone()),
         ]));
 
-        // Input schema: add.{path, size, defaultRowCommitVersion} + decoded DV columns + stats columns.
+        // Input schema: add.{path, size, defaultRowCommitVersion} + decoded DV columns + stats
+        // columns.
         let action_input_schema = Arc::new(StructType::new_unchecked(
             [StructField::nullable(
                 "add",
