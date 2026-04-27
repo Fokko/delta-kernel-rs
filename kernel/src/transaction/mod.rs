@@ -6,7 +6,6 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
-use url::Url;
 
 #[cfg(feature = "iceberg-nativev4")]
 use crate::actions::get_log_domain_metadata_schema;
@@ -24,7 +23,6 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
-use crate::log_replay::{ActionsBatch, LogReplayProcessor as _};
 #[cfg(feature = "iceberg-nativev4")]
 use crate::iceberg_metadata::domain::{IcebergMetadataDomain, ICEBERG_METADATA_DOMAIN};
 use crate::log_segment::LogSegment;
@@ -38,9 +36,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{
-    ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema as _,
-};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;

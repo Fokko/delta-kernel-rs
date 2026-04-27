@@ -23,11 +23,9 @@ use crate::content_tree::{
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
-use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
-use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::state::Stats;
+use crate::log_replay::{ActionsBatch, FileActionKey};
 use crate::schema::column_name;
-use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, MapType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField, StructType};
 use crate::utils::require;
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -2237,7 +2235,6 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     use crate::content_tree::ContentTreeNode;
     use crate::expressions::StructData;
-    use serde_json::json;
 
     /// Helper: builds a root manifest, writes it to disk, and reads it back.
     fn build_and_read_root(
