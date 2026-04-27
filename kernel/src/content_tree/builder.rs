@@ -6,7 +6,7 @@ use tracing::instrument;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::visitors::{AddVisitor, RemoveVisitor};
+use crate::actions::visitors::visit_deletion_vector_at;
 #[cfg(test)]
 use crate::actions::Add;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
@@ -26,7 +26,8 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::Stats;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, MapType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::utils::require;
 #[cfg(test)]
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
@@ -1689,11 +1690,253 @@ impl RowVisitor for DecodedDvVisitor {
     }
 }
 
-/// A leaf manifest row that was removed by a delta log `Remove` action and must be applied as
-/// a deletion vector update after the replay loop.
-struct LeafRemove {
-    leaf_path: String,
+/// Identifies a specific row within a leaf manifest by its path and position.
+struct LeafManifestIndex {
+    /// Path to the leaf manifest file.
+    path: String,
+    /// Row position within the leaf manifest.
     position: i64,
+}
+
+// ===========================================================================================
+// AMT log replay helpers
+// ===========================================================================================
+
+/// Single-pass visitor for AMT log replay deduplication.
+///  After the visit:
+/// - `selection_vector[i] = true` for first-seen Add rows (surviving entries).
+/// - `selection_vector[i] = false` for duplicate Adds, Removes, and all other action types.
+/// - `log_action_keys` and `leaf_removes` are updated for Remove rows.
+///
+struct LogBatchDedupVisitor<'a> {
+    log_action_keys: &'a mut HashSet<FileActionKey>,
+    leaf_removes: &'a mut Vec<LeafManifestIndex>,
+    /// `true` for surviving Add rows; `false` for all other rows.
+    selection_vector: Vec<bool>,
+}
+
+impl LogBatchDedupVisitor<'_> {
+    const ADD_PATH: usize = 0;
+    const ADD_DV_ST: usize = 1;
+    const ADD_DV_PATH: usize = 2;
+    const REM_PATH: usize = 3;
+    const REM_DV_ST: usize = 4;
+    const REM_DV_PATH: usize = 5;
+    const REM_MANIFEST_PATH: usize = 6;
+    const REM_MANIFEST_POS: usize = 7;
+
+    /// Returns the DV location string from raw storage-type and path column getters, or `None`
+    /// when no DV is present (storageType is null).
+    ///
+    /// Uses the same decode logic as [`extract_deletion_vector_content`] so that
+    /// [`FileActionKey`] values built here match those built in [`process_content_root_batch`].
+    fn dv_location<'a>(
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        st_idx: usize,
+        path_idx: usize,
+    ) -> DeltaResult<Option<String>> {
+        let Some(storage_type): Option<String> =
+            getters[st_idx].get_opt(i, "deletionVector.storageType")?
+        else {
+            return Ok(None);
+        };
+        let path_or_inline: String = getters[path_idx].get(i, "deletionVector.pathOrInlineDv")?;
+        // Build a minimal descriptor to reuse existing location-decode logic.
+        let dv = DeletionVectorDescriptor {
+            storage_type: storage_type.parse()?,
+            path_or_inline_dv: path_or_inline,
+            offset: None,
+            size_in_bytes: 0,
+            cardinality: 0,
+        };
+        Ok(Some(extract_deletion_vector_content(&dv)?.location))
+    }
+}
+
+impl RowVisitor for LogBatchDedupVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::column_name;
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const LONG: DataType = DataType::LONG;
+            let types_and_names = vec![
+                (STRING, column_name!("add.path")),
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (STRING, column_name!("remove.path")),
+                (STRING, column_name!("remove.deletionVector.storageType")),
+                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+                (STRING, column_name!("remove.dataManifestPath")),
+                (LONG, column_name!("remove.dataManifestPosition")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 8,
+            Error::InternalError(format!(
+                "Wrong number of LogBatchDedupVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            let add_path: Option<String> = getters[Self::ADD_PATH].get_opt(i, "add.path")?;
+            if let Some(path) = add_path {
+                // Add row: check dedup and update selection_vector.
+                let dv_loc: Option<String> =
+                    Self::dv_location(i, getters, Self::ADD_DV_ST, Self::ADD_DV_PATH)?;
+                let key = FileActionKey::new(path, dv_loc);
+                if self.log_action_keys.contains(&key) {
+                    // Duplicate: superseded by a newer commit already processed.
+                    self.selection_vector[i] = false;
+                } else {
+                    self.log_action_keys.insert(key);
+                    self.selection_vector[i] = true;
+                }
+            } else {
+                let rem_path: Option<String> = getters[Self::REM_PATH].get_opt(i, "remove.path")?;
+                if let Some(path) = rem_path {
+                    // Remove row: mark as seen which will suppress the matching content root entry.
+                    let dv_loc = Self::dv_location(i, getters, Self::REM_DV_ST, Self::REM_DV_PATH)?;
+                    self.log_action_keys
+                        .insert(FileActionKey::new(path, dv_loc));
+                    // Collect leaf removes for post-replay DV bitmap updates.
+                    let leaf_path: Option<String> =
+                        getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.dataManifestPath")?;
+                    let position: Option<i64> = getters[Self::REM_MANIFEST_POS]
+                        .get_opt(i, "remove.dataManifestPosition")?;
+                    if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
+                        self.leaf_removes.push(LeafManifestIndex {
+                            path: leaf_path,
+                            position: pos,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Converts surviving Add rows (where `selection_vector[i] = true`) from a log batch to
+/// [`ContentTreeNodeEntry`] values.
+struct ContentRootEntryVisitor<'a> {
+    selection_vector: &'a [bool],
+    snapshot_id: i64,
+    table_schema: &'a Schema,
+    entries: Vec<ContentTreeNodeEntry>,
+}
+
+impl RowVisitor for ContentRootEntryVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::column_name;
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const INTEGER: DataType = DataType::INTEGER;
+            const LONG: DataType = DataType::LONG;
+            let types_and_names = vec![
+                (STRING, column_name!("add.path")),
+                // DV fields at indices 1-5; passed as a slice to visit_deletion_vector_at.
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("add.deletionVector.offset")),
+                (INTEGER, column_name!("add.deletionVector.sizeInBytes")),
+                (LONG, column_name!("add.deletionVector.cardinality")),
+                // Per-row version: required for all AMT tables (row tracking is mandatory).
+                (LONG, column_name!("add.defaultRowCommitVersion")),
+                (LONG, column_name!("add.size")),
+                (STRING, column_name!("add.stats")),
+                (
+                    MapType::new(STRING, STRING, true).into(),
+                    column_name!("add.partitionValues"),
+                ),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 10,
+            Error::InternalError(format!(
+                "Wrong number of ContentRootEntryVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            if !self.selection_vector[i] {
+                continue;
+            }
+            let path: String = getters[0].get(i, "add.path")?;
+            // DV columns at getters[1..6]; visit_deletion_vector_at reads 5 getters from the
+            // start of the slice (storageType, pathOrInlineDv, offset, sizeInBytes, cardinality).
+            let dv_descriptor = visit_deletion_vector_at(i, &getters[1..])?;
+            let dv_content = dv_descriptor
+                .as_ref()
+                .map(extract_deletion_vector_content)
+                .transpose()?;
+            let has_dv = dv_content.is_some();
+            let entry_version: i64 = getters[6].get(i, "add.defaultRowCommitVersion")?;
+            let size: i64 = getters[7].get(i, "add.size")?;
+            let stats: Option<String> = getters[8].get_opt(i, "add.stats")?;
+            let partition_values: HashMap<String, String> =
+                getters[9].get(i, "add.partitionValues")?;
+            let (content_stats, record_count) = parse_delta_add_stats(
+                stats.as_deref(),
+                self.table_schema,
+                has_dv.then_some(false),
+            )?;
+            let content_stats = merge_partition_values_into_stats(
+                content_stats,
+                &partition_values,
+                self.table_schema,
+                Some(record_count),
+            )?;
+            let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(path)
+                .with_existed_tracking(entry_version as Version, self.snapshot_id)
+                .dv_info_opt(dv_content)
+                .record_count(record_count)
+                .file_size_in_bytes(size)
+                .content_stats_opt(content_stats)
+                .build();
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+}
+
+/// Converts surviving Add rows from a log commit batch to [`ContentTreeNodeEntry`] values.
+///
+/// Uses [`ContentRootEntryVisitor`] which skips rows where `selection_vector[i]` is `false`,
+/// avoiding allocation for rows already filtered by deduplication.
+///
+/// # Parameters
+/// - `actions`: Engine data for one log commit batch.
+/// - `selection_vector`: Per-row filter from [`LogBatchDedupVisitor`]; `true` = surviving Add.
+/// - `snapshot_id`: Stamped into the tracking info of each emitted entry.
+/// - `table_schema`: Physical table schema for stats and partition value conversion.
+fn entries_from_log_batch(
+    actions: &dyn EngineData,
+    selection_vector: &[bool],
+    snapshot_id: i64,
+    table_schema: &Schema,
+) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+    let mut visitor = ContentRootEntryVisitor {
+        selection_vector,
+        snapshot_id,
+        table_schema,
+        entries: Vec::new(),
+    };
+    visitor.visit_rows_of(actions)?;
+    Ok(visitor.entries)
 }
 
 /// Log replay processor for AMT rollup that produces [`ContentTreeNodeEntry`] values directly.
@@ -1715,8 +1958,8 @@ struct LeafRemove {
 pub(crate) struct ContentRootRebuildProcessor {
     snapshot_id: i64,
     table_schema: Schema,
-    seen_file_keys: HashSet<FileActionKey>,
-    leaf_removes: Vec<LeafRemove>,
+    log_action_keys: HashSet<FileActionKey>,
+    leaf_removes: Vec<LeafManifestIndex>,
 }
 
 impl ContentRootRebuildProcessor {
@@ -1730,88 +1973,34 @@ impl ContentRootRebuildProcessor {
         Self {
             snapshot_id,
             table_schema,
-            seen_file_keys: HashSet::new(),
+            log_action_keys: HashSet::new(),
             leaf_removes: Vec::new(),
         }
     }
 
     /// Processes a log batch (`is_log_batch = true`).
     ///
-    /// Remove actions mark the file key as seen. Add actions that are first-seen emit a new
-    /// [`ContentTreeNodeEntry`] with tracking stamped from the batch version.
+    /// Uses a two-phase approach:
+    /// 1. [`LogBatchDedupVisitor`]: single pass over minimal columns to build a selection
+    ///    vector. L rows update `log_action_keys` and `leaf_removes`. Add rows are marked
+    ///    surviving (`true`) or duplicate (`false`).
+    /// 2. [`entries_from_log_batch`]: second pass over full Add columns, skipping non-surviving
+    ///    rows. `add.defaultRowCommitVersion` is read as an explicit column (not a struct field).
     fn process_log_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let mut add_visitor = AddVisitor::default();
-        let mut remove_visitor = RemoveVisitor::default();
-        add_visitor.visit_rows_of(batch.actions.as_ref())?;
-        remove_visitor.visit_rows_of(batch.actions.as_ref())?;
+        let row_count = batch.actions.len();
+        let mut dedup_visitor = LogBatchDedupVisitor {
+            log_action_keys: &mut self.log_action_keys,
+            leaf_removes: &mut self.leaf_removes,
+            selection_vector: vec![false; row_count],
+        };
+        dedup_visitor.visit_rows_of(batch.actions.as_ref())?;
 
-        // Process removes: mark (path, dv_loc) as seen so the corresponding content root entry
-        // is suppressed. Collect leaf removes for post-replay processing.
-        for remove in remove_visitor.removes {
-            let dv_loc = remove
-                .deletion_vector
-                .as_ref()
-                .map(extract_deletion_vector_content)
-                .transpose()?
-                .map(|dv| dv.location);
-            self.seen_file_keys
-                .insert(FileActionKey::new(remove.path.clone(), dv_loc));
-
-            if let (Some(leaf_path), Some(pos)) =
-                (remove.data_manifest_path, remove.data_manifest_position)
-            {
-                self.leaf_removes.push(LeafRemove {
-                    leaf_path,
-                    position: pos,
-                });
-            }
-        }
-
-        let mut entries = Vec::new();
-
-        // Process adds: emit entries for files not yet seen (first-seen = newest wins).
-        for add in add_visitor.adds {
-            let dv_content = add
-                .deletion_vector
-                .as_ref()
-                .map(extract_deletion_vector_content)
-                .transpose()?;
-            let dv_loc = dv_content.as_ref().map(|dv| dv.location.clone());
-            let key = FileActionKey::new(add.path.clone(), dv_loc);
-
-            if self.seen_file_keys.contains(&key) {
-                continue;
-            }
-            self.seen_file_keys.insert(key);
-
-            let (content_stats, record_count) = parse_delta_add_stats(
-                add.stats.as_deref(),
-                &self.table_schema,
-                add.deletion_vector.is_some().then_some(false),
-            )?;
-            let content_stats = merge_partition_values_into_stats(
-                content_stats,
-                &add.partition_values,
-                &self.table_schema,
-                Some(record_count),
-            )?;
-
-            let entry_version = add
-                .default_row_commit_version
-                .ok_or_else(|| Error::missing_data("defaultRowCommitVersion"))?
-                as Version;
-            let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-                .location(add.path)
-                .with_existed_tracking(entry_version, self.snapshot_id)
-                .dv_info_opt(dv_content)
-                .record_count(record_count)
-                .file_size_in_bytes(add.size)
-                .content_stats_opt(content_stats)
-                .build();
-            entries.push(entry);
-        }
-
-        Ok(entries)
+        entries_from_log_batch(
+            batch.actions.as_ref(),
+            &dedup_visitor.selection_vector,
+            self.snapshot_id,
+            &self.table_schema,
+        )
     }
 
     /// Processes a content root batch (`is_log_batch = false`).
@@ -1835,12 +2024,13 @@ impl ContentRootRebuildProcessor {
             let dv_loc = entry.dv_info.as_ref().map(|d| d.location.clone());
             let key = FileActionKey::new(path, dv_loc);
 
-            if self.seen_file_keys.contains(&key) {
+            if self.log_action_keys.contains(&key) {
                 // Superseded by a log action — skip.
                 continue;
             }
 
             // Mark previously "added" entries as "existing"
+            // ToDo: for DV replacements, "replaced" status?
             let entry = if entry.tracking.status == TrackingStatus::Added {
                 entry.with_status(TrackingStatus::Existed)
             } else {
@@ -1861,7 +2051,7 @@ impl ContentRootRebuildProcessor {
             HashMap::with_capacity(self.leaf_removes.len());
         for lr in self.leaf_removes.drain(..) {
             result
-                .entry(lr.leaf_path)
+                .entry(lr.path)
                 .or_default()
                 .insert(lr.position as u64);
         }
