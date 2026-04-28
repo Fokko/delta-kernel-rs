@@ -950,10 +950,7 @@ async fn generate_content_root(
     );
 
     // Process the scan and partition actions into leaves
-    let leaf_count = {
-        let mc = txn.with_manifest_commit();
-        partition_actions_into_leaves(mc, scan, engine.as_ref(), batch_size)?
-    };
+    let leaf_count = partition_actions_into_leaves(&mut txn, scan, engine.as_ref(), batch_size)?;
 
     println!("      ✓ Created {} leaf manifests", leaf_count);
 
@@ -982,7 +979,7 @@ async fn generate_content_root(
 }
 
 fn partition_actions_into_leaves(
-    mc: &mut delta_kernel::transaction::ManifestCommitState,
+    txn: &mut delta_kernel::transaction::Transaction,
     scan: delta_kernel::scan::Scan,
     engine: &dyn delta_kernel::Engine,
     batch_size: usize,
@@ -1005,6 +1002,8 @@ fn partition_actions_into_leaves(
     let mut actions_in_current_leaf: usize = 0;
     let mut leaf_count: usize = 0;
 
+    let mc = txn.with_manifest_commit();
+    
     // Scan metadata and count actions
     let scan_iter = scan.scan_metadata(engine)?;
 
