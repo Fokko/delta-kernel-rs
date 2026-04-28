@@ -1455,22 +1455,18 @@ impl ContentTreeNodeBuilder {
             }
 
             match entry.content_type {
-                DataContentType::Data => {
-                    if ti.first_row_id.is_none() {
-                        ti.first_row_id = Some(allocator.reserve_row_ids(entry.record_count));
-                    }
+                DataContentType::Data if ti.first_row_id.is_none() => {
+                    ti.first_row_id = Some(allocator.reserve_row_ids(entry.record_count));
                 }
-                DataContentType::CombinedManifest => {
-                    if ti.first_row_id.is_none() {
-                        let row_increment = entry
-                            .manifest_stats
-                            .as_ref()
-                            .map(|ms| ms.added_rows_count + ms.existing_rows_count)
-                            .unwrap_or(0);
-                        ti.first_row_id = Some(allocator.reserve_row_ids(row_increment));
-                    }
+                DataContentType::CombinedManifest if ti.first_row_id.is_none() => {
+                    let row_increment = entry
+                        .manifest_stats
+                        .as_ref()
+                        .map(|ms| ms.added_rows_count + ms.existing_rows_count)
+                        .unwrap_or(0);
+                    ti.first_row_id = Some(allocator.reserve_row_ids(row_increment));
                 }
-                // PositionDeletes, EqualityDeletes: no first_row_id assignment
+                // PositionDeletes, EqualityDeletes, or already assigned: no-op
                 _ => {}
             }
         }
