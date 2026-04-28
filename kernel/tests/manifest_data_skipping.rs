@@ -24,7 +24,6 @@ use delta_kernel::engine_data::{RowVisitor, TypedGetData};
 use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
-
 use test_utils::{create_table, engine_store_setup};
 
 mod common;
@@ -232,7 +231,8 @@ fn create_add_files_with_stats(
 /// Helper to verify stats in add file data
 fn verify_stats(
     data: &dyn EngineData,
-    expected: &HashMap<String, (i64, i64, i64, i64, i64)>, // path -> (num_records, min_id, max_id, min_row_id, max_row_id)
+    expected: &HashMap<String, (i64, i64, i64, i64, i64)>, /* path -> (num_records, min_id,
+                                                            * max_id, min_row_id, max_row_id) */
 ) -> DeltaResult<()> {
     use delta_kernel::expressions::ColumnName;
 
@@ -526,7 +526,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     assert_eq!(scanned_files, expected_files);
 
     // Verify using multi-phase scan planning counts
-    // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase planning API
+    // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase
+    // planning API
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let unfiltered_scan = snapshot.scan_builder().build()?;
     let (unfiltered_batches, unfiltered_files) =
@@ -582,7 +583,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     assert_eq!(scanned_files, expected_files);
 
     // Verify using multi-phase scan planning counts
-    // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase planning API
+    // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase
+    // planning API
     let unfiltered_metadata_scan = snapshot.clone().scan_builder().build()?;
     let (unfiltered_metadata_batches, unfiltered_files) =
         count_scan_metadata_and_files(unfiltered_metadata_scan, engine.as_ref())?;

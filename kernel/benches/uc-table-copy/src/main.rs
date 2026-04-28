@@ -18,11 +18,12 @@
 //! It uses separate engines with Read and ReadWrite credentials because UC scopes
 //! credentials per table and operation type.
 
+use std::sync::Arc;
+
 use bench_utils::{table_utils, uc_support};
 use clap::Parser;
 use futures::stream::StreamExt;
 use object_store::ObjectStoreExt as _;
-use std::sync::Arc;
 use tokio::sync::Semaphore;
 use unity_catalog_delta_client_api::Operation;
 

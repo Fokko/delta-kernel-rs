@@ -395,7 +395,8 @@ async fn generate_commit_0(
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     // Create table schema (matching the add_action_generator schema)
-    // Include column mapping metadata for each field (required for future column mapping enablement)
+    // Include column mapping metadata for each field (required for future column mapping
+    // enablement)
     let schema = json!({
         "type": "struct",
         "fields": [
@@ -497,8 +498,8 @@ async fn generate_commit_0(
         configuration,
     };
 
-    // Create protocol action for V2 checkpoint with column mapping (reader version 3, writer version 7)
-    // Optionally include metadataTree-experimental if content root will be generated
+    // Create protocol action for V2 checkpoint with column mapping (reader version 3, writer
+    // version 7) Optionally include metadataTree-experimental if content root will be generated
     let mut reader_features = vec!["v2Checkpoint".to_string(), "columnMapping".to_string()];
     let mut writer_features = vec!["v2Checkpoint".to_string(), "columnMapping".to_string()];
     if enable_metadata_tree {

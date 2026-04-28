@@ -1,9 +1,18 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use bytes::Bytes;
+use tracing::instrument;
+use url::Url;
+
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::Add;
 use crate::content_tree::stats::{
     aggregate_content_stats, delta_json_stats_to_content_stats, merge_partition_values_into_stats,
 };
 use crate::content_tree::writer::ContentTreeNodeWriter;
+#[cfg(test)]
+use crate::content_tree::ManifestStats;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
     DataContentType, DvInfo, TrackingInfo, TrackingStatus, DELTA_STATS_MAX_VALUES,
@@ -13,18 +22,11 @@ use crate::content_tree::{
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::row_tracking::CursorRowIdAllocator;
 
-#[cfg(test)]
-use crate::content_tree::ManifestStats;
 use crate::expressions::StructData;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
-use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, OnceLock};
-use tracing::instrument;
-use url::Url;
 
 /// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
 const ROARING_BITMAP_PORTABLE_MAGIC_BYTES: [u8; 4] = 1681511377u32.to_be_bytes();
@@ -63,14 +65,14 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 ///
 /// This function decodes the `path_or_inline_dv` field based on the storage type:
 ///
-/// - `PersistedRelative`: The format is `<random prefix - optional><base85 encoded uuid>`.
-///   The UUID is 20 characters (base85 encoded), and any characters before that are the
-///   optional random prefix. The function reconstructs the absolute path to the DV file.
+/// - `PersistedRelative`: The format is `<random prefix - optional><base85 encoded uuid>`. The UUID
+///   is 20 characters (base85 encoded), and any characters before that are the optional random
+///   prefix. The function reconstructs the absolute path to the DV file.
 ///
 /// - `PersistedAbsolute`: The `path_or_inline_dv` contains the absolute path to the DV file.
 ///
-/// - `Inline`: Currently not supported - returns an error. Inline DVs would need to be
-///   persisted first before being added to metadata.
+/// - `Inline`: Currently not supported - returns an error. Inline DVs would need to be persisted
+///   first before being added to metadata.
 ///
 /// # Format Differences: Delta vs Iceberg
 ///
@@ -277,10 +279,10 @@ impl ContentTreeNodeBuilder {
     /// * `table_root` - The root URL of the table
     /// * `version` - The version of the metadata being built
     /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion.
-    ///   This parameter is essential for converting Delta JSON stats (minValues, maxValues, nullCount)
-    ///   to the content_stats StructData format when adding entries via `add()`. The schema must
-    ///   match the schema used to write the files and must include PARQUET:field_id metadata on
-    ///   fields for proper stats field mapping
+    ///   This parameter is essential for converting Delta JSON stats (minValues, maxValues,
+    ///   nullCount) to the content_stats StructData format when adding entries via `add()`. The
+    ///   schema must match the schema used to write the files and must include PARQUET:field_id
+    ///   metadata on fields for proper stats field mapping
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
             table_root,
@@ -297,8 +299,9 @@ impl ContentTreeNodeBuilder {
 
     /// Creates a [`ContentTreeNodeBuilder`] by reading an existing content root parquet file.
     ///
-    /// This reads and validates the content root via [`ContentTreeNode::from_batches_with_version`],
-    /// then populates a builder from the validated entries.
+    /// This reads and validates the content root via
+    /// [`ContentTreeNode::from_batches_with_version`], then populates a builder from the
+    /// validated entries.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for reading the parquet file
@@ -866,8 +869,8 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Remove DV entries by DV location or referenced file. Only used when moving values in the root
-    /// to the leaves (otherwise mark deleted it should be used.
+    /// Remove DV entries by DV location or referenced file. Only used when moving values in the
+    /// root to the leaves (otherwise mark deleted it should be used.
     ///
     /// This removes entries where the location OR referenced_file matches the given path.
     /// This handles both standalone DV entries and DV entries that reference data files.
@@ -957,14 +960,14 @@ impl ContentTreeNodeBuilder {
     /// * `file_path` - Optional file path to match against entry locations
     /// * `dv_path` - Optional deletion vector path to match
     /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
-    ///
     pub(crate) fn mark_deleted(
         &mut self,
         file_path: Option<&str>,
         dv_path: Option<&str>,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
-        // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
+        // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this
+        // faster
         for entry in &mut self.pending_entries {
             // Check if this entry matches the file path or deletion vector path
             let matches = if let Some(path) = file_path {
@@ -992,12 +995,13 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_changes_dv` - If true, sets tracking.changes_dv (for actual deletions).
-    ///   If false, only updates manifest_dv (for leaf reorganization).
+    /// * `set_changes_dv` - If true, sets tracking.changes_dv (for actual deletions). If false,
+    ///   only updates manifest_dv (for leaf reorganization).
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of bounds, or serialization fails
+    /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of
+    ///   bounds, or serialization fails
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
         leaf_file_path: &str,
@@ -1055,7 +1059,8 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Writes the pending entries as a leaf manifest and returns a ContentTreeNodeEntry referencing it.
+    /// Writes the pending entries as a leaf manifest and returns a ContentTreeNodeEntry referencing
+    /// it.
     ///
     /// https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw/edit?tab=t.0#heading=h.unn922df0zzw
     ///
@@ -1310,9 +1315,10 @@ impl ContentTreeNodeBuilder {
     /// Build and evaluate a scan-row transformation expression.
     ///
     /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
-    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON format:
-    /// `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is converted to AMT
-    /// format for `content_stats` using [`build_content_stats_from_delta_stats_parsed`].
+    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON
+    /// format: `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is
+    /// converted to AMT format for `content_stats` using
+    /// [`build_content_stats_from_delta_stats_parsed`].
     ///
     /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
     /// `add_from_existing_scan_rows`), `dvInfo` is projected from those columns with a
@@ -1325,8 +1331,9 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
-        use crate::content_tree::stats;
-        use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
+        use crate::content_tree::{
+            stats, DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME,
+        };
         use crate::expressions::{Expression, Predicate, Scalar};
         use crate::schema::DataType;
 
@@ -1337,8 +1344,9 @@ impl ContentTreeNodeBuilder {
         // Detect whether flat decoded DV columns are present in the input schema.
         let has_decoded_dv = scan_row_input_schema.field("_dv_location").is_some();
 
-        // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta format).
-        // record_count reads numRecords directly; content_stats converts Delta→AMT via expressions.
+        // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta
+        // format). record_count reads numRecords directly; content_stats converts Delta→AMT
+        // via expressions.
         let record_count_expr = Expression::coalesce([
             Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS]),
             Expression::literal(Scalar::Long(0)),
@@ -1372,7 +1380,8 @@ impl ContentTreeNodeBuilder {
                 "dvInfo" => {
                     if has_decoded_dv {
                         // Flat decoded DV columns: project into dvInfo struct.
-                        // Nullability predicate: null struct for non-DV rows (_dv_location is null).
+                        // Nullability predicate: null struct for non-DV rows (_dv_location is
+                        // null).
                         if !matches!(field.data_type(), DataType::Struct(_)) {
                             return Err(crate::Error::generic(
                                 "dvInfo field should be a struct type",
@@ -1553,8 +1562,8 @@ impl ContentTreeNodeBuilder {
     ///
     /// The input data must include a `stats_parsed` column (added by `include_stats_columns()` in
     /// the scan). All rows are processed via a single expression-evaluator path:
-    /// 1. DV columns are decoded (base85 UUID → relative path, sizes widened to LONG, +8 bytes
-    ///    for Iceberg framing) by `DecodedDvVisitor`.
+    /// 1. DV columns are decoded (base85 UUID → relative path, sizes widened to LONG, +8 bytes for
+    ///    Iceberg framing) by `DecodedDvVisitor`.
     /// 2. `stats_parsed` is resolved via `coalesce(stats_parsed, parse_json(stats, schema))`:
     ///    prefers the already-parsed struct; falls back to parsing the raw JSON stats string.
     /// 3. The final transform maps the augmented schema → ContentTreeNodeEntry output.
@@ -1849,7 +1858,8 @@ fn build_content_stats_from_delta_stats_parsed(
 }
 
 /// Schema for the 4 flat DV columns appended to scan-row data before the final transform.
-/// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg framing).
+/// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg
+/// framing).
 static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     use crate::schema::{StructField, StructType};
     Arc::new(StructType::new_unchecked(vec![
@@ -2087,10 +2097,11 @@ impl RowVisitor for ScanRowToAddVisitor {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     use crate::content_tree::ContentTreeNode;
-    use serde_json::json;
 
     /// Helper: builds a root manifest, writes it to disk, and reads it back.
     fn build_and_read_root(
@@ -2671,11 +2682,12 @@ mod tests {
 
     #[test]
     fn test_write_leaf_aggregates_content_stats() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
         use crate::content_tree::stats::delta_json_stats_to_content_stats;
         use crate::engine::sync::SyncEngine;
         use crate::expressions::Scalar;
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-        use tempfile::tempdir;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -2803,8 +2815,9 @@ mod tests {
     #[test]
     fn test_write_leaf_no_content_stats_when_entries_have_none(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3004,9 +3017,10 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_single_entry() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3093,9 +3107,10 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_multiple_entries() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3165,9 +3180,10 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_all_entries_marks_deleted() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3218,9 +3234,10 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_index_out_of_bounds() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3283,9 +3300,10 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3342,9 +3360,10 @@ mod tests {
     #[test]
     fn test_delete_from_leaf_with_existing_deleted_entries(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3380,8 +3399,9 @@ mod tests {
         root_builder.add_entry(manifest_entry);
 
         // Delete all 3 active entries (indices 0, 1, 2)
-        // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be marked deleted
-        // With the NEW logic: cardinality (3) == active_entry_count (3), so manifest IS marked deleted
+        // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be
+        // marked deleted With the NEW logic: cardinality (3) == active_entry_count (3), so
+        // manifest IS marked deleted
         let mut indices = RoaringTreemap::new();
         indices.extend([0u64, 1, 2]);
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
@@ -3425,9 +3445,10 @@ mod tests {
 
     #[test]
     fn test_tracking_changes_dv_clearing() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3652,9 +3673,10 @@ mod tests {
     #[test]
     fn test_leaf_reorganization_does_not_set_changes_dv() -> Result<(), Box<dyn std::error::Error>>
     {
-        use crate::engine::sync::SyncEngine;
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
@@ -3690,7 +3712,8 @@ mod tests {
         // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
-        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf reorganization
+        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf
+        // reorganization
         let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()

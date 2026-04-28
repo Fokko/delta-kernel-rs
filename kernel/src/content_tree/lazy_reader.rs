@@ -5,12 +5,14 @@
 //! - Defers metadata construction until the iterator is consumed
 //! - Defers leaf manifest reading until root manifests are exhausted
 
+use std::sync::Arc;
+
+use tracing::instrument;
+use url::Url;
+
 use crate::log_replay::ActionsBatch;
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, EngineData, EvaluationHandler, ParquetHandler, PredicateRef, Version};
-use std::sync::Arc;
-use tracing::instrument;
-use url::Url;
 
 /// Lazy iterator that defers content root metadata construction until data is requested.
 ///
@@ -75,7 +77,8 @@ impl LazyContentRootIterator {
     /// - `data_predicate`: Optional predicate for manifest-level data skipping
     /// - `skip_leaf_manifests`: When true, only read root manifest
     /// - `stats_schema`: Optional stats schema (from table configuration or predicate columns)
-    /// - `table_schema`: Optional table physical schema (with field IDs) for AMT content_stats reading
+    /// - `table_schema`: Optional table physical schema (with field IDs) for AMT content_stats
+    ///   reading
     #[instrument(
         name = "content_tree.open_root",
         skip_all,
@@ -174,7 +177,8 @@ impl Iterator for LazyContentRootIterator {
                     } else {
                         let _span = tracing::info_span!("content_tree.get_leaves").entered();
                         // Lazily read leaf manifests now that root is exhausted
-                        // Construct manifest batch schema with filtered content_stats for data skipping
+                        // Construct manifest batch schema with filtered content_stats for data
+                        // skipping
                         let manifest_batch_schema = context
                             .table_schema
                             .as_ref()

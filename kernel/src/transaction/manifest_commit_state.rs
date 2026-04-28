@@ -4,14 +4,66 @@ use std::sync::Arc;
 
 use url::Url;
 
+use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::error::Error;
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, Version};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, FileMeta, Version};
 
-use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
+/// Commit mode that uses a caller-supplied root manifest instead of having kernel build one.
+///
+/// Constructed via [`crate::transaction::Transaction::with_explicit_root_manifest`]. On commit,
+/// the checkpoint action references the supplied file as the content root; kernel writes no new
+/// root manifest parquet file. This mode is mutually exclusive with [`ManifestCommitState`].
+pub struct ExplicitRootManifestCommit {
+    /// The caller-supplied root manifest file.
+    pub(super) file: FileMeta,
+}
+
+impl ExplicitRootManifestCommit {
+    /// Validates snapshot preconditions and file location, then constructs an
+    /// [`ExplicitRootManifestCommit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot has no existing checkpoint action, if the checkpoint
+    /// does not cover the snapshot version, or if `file.location` is not under the table root
+    /// (same scheme, host, and path prefix).
+    pub(super) fn new(file: FileMeta, read_snapshot: &SnapshotRef) -> DeltaResult<Self> {
+        let Some(checkpoint_action) = read_snapshot.checkpoint_action() else {
+            return Err(Error::invalid_transaction_state(
+                "explicit root manifest commit requires an existing checkpoint action on the table",
+            ));
+        };
+
+        require!(
+            checkpoint_action.version >= read_snapshot.version(),
+            Error::invalid_transaction_state(format!(
+                "explicit root manifest commit requires no delta log commits after the latest \
+                 checkpoint that are pending metadata-tree replay; checkpoint covers version {} \
+                 but snapshot is at {}",
+                checkpoint_action.version,
+                read_snapshot.version()
+            ))
+        );
+
+        let table_root = read_snapshot.table_root();
+        require!(
+            file.location.scheme() == table_root.scheme()
+                && file.location.host_str() == table_root.host_str()
+                && file.location.path().starts_with(table_root.path()),
+            Error::generic(format!(
+                "manifest location {:?} is not under the table root {:?}",
+                file.location, table_root
+            ))
+        );
+
+        Ok(ExplicitRootManifestCommit { file })
+    }
+}
 
 /// State for a manifest commit (content-tree update).
 ///
@@ -81,7 +133,8 @@ impl ManifestCommitState {
     /// # Returns
     ///
     /// A [`Scan`] that will return all Add actions from:
-    /// - The root manifest (if present in the checkpoint) -- entries where `dataManifestPath` is NULL.
+    /// - The root manifest (if present in the checkpoint) -- entries where `dataManifestPath` is
+    ///   NULL.
     /// - All delta log files since the checkpoint -- entries where `dataManifestPath` is NULL.
     ///
     /// The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is
@@ -129,6 +182,10 @@ impl ManifestCommitState {
     ///
     /// A new [`LeafNodeWriter`] initialized with the transaction's table root, version, snapshot
     /// ID, and root manifest URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root manifest URL cannot be constructed.
     pub fn new_leaf_node_writer(&mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
         let starting_first_row_id = self.ensure_row_id_cursor(engine)?;
         let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
@@ -231,7 +288,8 @@ impl ManifestCommitState {
         Ok(cursor)
     }
 
-    /// Applies all accumulated manifest commit state to a [`crate::content_tree::builder::ContentTreeNodeBuilder`].
+    /// Applies all accumulated manifest commit state to a
+    /// [`crate::content_tree::builder::ContentTreeNodeBuilder`].
     ///
     /// Called during commit to incorporate leaf manifests and deletions into the content tree
     /// before it is written out.

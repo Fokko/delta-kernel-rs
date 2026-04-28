@@ -14,8 +14,9 @@
 
 //! Parquet file analyzer to show size breakdown by column
 
-use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use std::fs::File;
+
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 
 pub fn analyze_parquet_file(path: &str) {
     let file = File::open(path).expect("Failed to open file");

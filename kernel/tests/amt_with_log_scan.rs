@@ -2,7 +2,6 @@
 //!
 //! These tests verify that when a root manifest exists at version N, subsequent log
 //! commits at N+1, N+2,... correctly interact with the root manifest during table scans.
-//!
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -136,7 +135,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         }
 
         // Verify v4: Scan should show all 4 files (2 from root + 2 from log)
-        // Tests: Log replay correctly merges files from root manifest (v2) + delta log commits (v3, v4)
+        // Tests: Log replay correctly merges files from root manifest (v2) + delta log commits (v3,
+        // v4)
         {
             let snapshot: Arc<Snapshot> =
                 Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -511,7 +511,8 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
         }
 
         // Final verification: v3 should show 4 files (3 rolled up + 1 new)
-        // Tests: New root correctly rolls up Remove action from delta log (file2 stays removed) + adds new file
+        // Tests: New root correctly rolls up Remove action from delta log (file2 stays removed) +
+        // adds new file
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let paths: HashSet<String> = collect_file_paths(snapshot, &engine)?;
@@ -543,7 +544,8 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
 /// - v4: Manifest commit creates new root
 ///
 /// Expected: v4 should have file with DV from v3 (replacement), not v2 (original)
-/// Actual: v4 has file with NO DV - BUG: manifest commit does not roll up DV replacements from delta log
+/// Actual: v4 has file with NO DV - BUG: manifest commit does not roll up DV replacements from
+/// delta log
 #[tokio::test]
 #[ignore = "BUG: Manifest commit at v4 does not roll up DV replacement from delta log - file has no DV"]
 async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {

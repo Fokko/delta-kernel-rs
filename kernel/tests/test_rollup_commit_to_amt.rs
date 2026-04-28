@@ -1,11 +1,12 @@
 //! Test root manifest filtering by writing a delta commit file with stats,
 //! then doing a manifest commit to convert those stats to content_stats.
 
+use std::sync::Arc;
+
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::Snapshot;
-use std::sync::Arc;
 use test_utils::{create_table, engine_store_setup};
 
 fn field_with_metadata(name: &str, data_type: DataType, field_id: i64) -> StructField {

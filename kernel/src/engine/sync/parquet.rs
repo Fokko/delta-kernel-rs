@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-
 use super::read_files;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
@@ -15,6 +13,7 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::parquet::build_writer_properties;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
@@ -94,8 +93,7 @@ impl ParquetHandler for SyncParquetHandler {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g., `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -166,13 +164,15 @@ impl ParquetHandler for SyncParquetHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+    use url::Url;
+
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::{DeltaResult, EngineData};
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    use url::Url;
 
     fn test_data_iter() -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(

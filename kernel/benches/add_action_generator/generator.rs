@@ -17,12 +17,13 @@
 //! Combines stats generation and deletion vector generation to create
 //! complete Add action metadata.
 
-use crate::deletion_vector::DeletionVectorGenerator;
-use crate::stats::{GeneratedStats, StatsGenerator};
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use uuid::Uuid;
+
+use crate::deletion_vector::DeletionVectorGenerator;
+use crate::stats::{GeneratedStats, StatsGenerator};
 
 /// Metadata for a single Add action
 #[derive(Debug, Clone)]

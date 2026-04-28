@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use crate::partition::serialization;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
@@ -356,6 +357,27 @@ impl Scalar {
         Some(result)
     }
 
+    /// Serializes this scalar to the Delta partition value string format.
+    ///
+    /// This delegates to [`serialization::serialize_partition_value`] so the
+    /// result matches the reference implementation (Java `Float`/`Double` string rules, ISO 8601
+    /// timestamps, UTF-8 binary semantics, empty string and empty binary as absent values, and
+    /// so on). Duplicating that logic here would risk drift; this method exists as a convenient
+    /// infallible wrapper for call sites that treat any non-serializable value as absent.
+    ///
+    /// Returns `None` for null values, empty string, empty binary, and unsupported complex types.
+    /// Returns `None` if the shared serializer returns an error (for example invalid UTF-8 in
+    /// binary, or struct/array/map partition types).
+    ///
+    /// This is intended to round-trip with [`PrimitiveType::parse_scalar`] for valid partition
+    /// column types; see [`serialization`] tests for Spark reference coverage.
+    /// Spec: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization>.
+    pub fn serialize_partition_value(&self) -> Option<String> {
+        serialization::serialize_partition_value(self)
+            .ok()
+            .flatten()
+    }
+
     /// Attempts to divide two scalars, returning None if they were incompatible.
     pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
         use Scalar::*;
@@ -508,10 +530,11 @@ impl Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
-            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            (Null(_), _) => None,
             (Struct(_), _) => None, // TODO: Support Struct?
-            (Array(_), _) => None, // TODO: Support Array?
-            (Map(_), _) => None,  // TODO: Support Map?
+            (Array(_), _) => None,  // TODO: Support Array?
+            (Map(_), _) => None,    // TODO: Support Map?
         }
     }
 }
@@ -754,9 +777,9 @@ impl PrimitiveType {
             // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
             // `1970-01-01T00:00:00.123456Z`.
             //
-            // The difference arises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
-            // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
-            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+            // The difference arises mostly in how they are to be handled on the engine side - i.e.
+            // timestampNTZ is not adjusted to UTC, this is just so we can
+            // (de-)serialize it as a date sting. https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
             TimestampNtz | Timestamp => {
                 let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
 
@@ -786,7 +809,8 @@ impl PrimitiveType {
     /// Parse a string as a scalar value, returning an error if the string is not parseable.
     ///
     /// The `f` function is used to convert the parsed value into a `Scalar`.
-    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type of `f`.
+    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type
+    /// of `f`.
     fn parse_str_as_scalar<T: std::str::FromStr>(
         &self,
         raw: &str,
@@ -843,11 +867,10 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
+    use super::*;
     use crate::expressions::{column_expr, BinaryPredicateOp};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
-
-    use super::*;
 
     #[test]
     fn test_bad_decimal() {
@@ -1345,5 +1368,154 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    #[test]
+    fn test_serialize_partition_value_null_returns_none() {
+        assert_eq!(
+            Scalar::Null(DataType::INTEGER).serialize_partition_value(),
+            None
+        );
+        assert_eq!(
+            Scalar::Null(DataType::STRING).serialize_partition_value(),
+            None
+        );
+        assert_eq!(
+            Scalar::Null(DataType::BOOLEAN).serialize_partition_value(),
+            None
+        );
+        assert_eq!(
+            Scalar::Null(DataType::DATE).serialize_partition_value(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_valid_utf8_roundtrips() {
+        let scalar = PrimitiveType::Binary.parse_scalar("hello").expect("parse");
+        let serialized = scalar
+            .serialize_partition_value()
+            .expect("valid UTF-8 binary should serialize");
+        assert_eq!(serialized, "hello");
+        let roundtrip = PrimitiveType::Binary
+            .parse_scalar(&serialized)
+            .expect("roundtrip parse");
+        assert_eq!(roundtrip, scalar);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_invalid_utf8_returns_none() {
+        assert_eq!(
+            Scalar::Binary(vec![0xFF, 0xFE]).serialize_partition_value(),
+            None
+        );
+    }
+
+    /// NaN does not compare equal to itself with derived [`PartialEq`], so round-trip equality is
+    /// checked via `is_nan` instead of `assert_eq!`.
+    #[test]
+    fn test_serialize_partition_value_float_double_nan_roundtrip_preserves_nan() {
+        for ptype in [PrimitiveType::Float, PrimitiveType::Double] {
+            let scalar = ptype.parse_scalar("NaN").expect("parse NaN");
+            let serialized = scalar
+                .serialize_partition_value()
+                .expect("NaN should serialize to a partition string");
+            assert_eq!(serialized, "NaN");
+            let roundtrip = ptype
+                .parse_scalar(&serialized)
+                .expect("parse serialized NaN");
+            match roundtrip {
+                Scalar::Float(v) => assert!(v.is_nan()),
+                Scalar::Double(v) => assert!(v.is_nan()),
+                other => panic!("expected float/double NaN, got {other:?}"),
+            }
+        }
+    }
+
+    /// Roundtrip: parse_scalar(raw) -> serialize_partition_value() -> parse_scalar(serialized)
+    /// must produce the same scalar, and the serialized string must match the original.
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::string(PrimitiveType::String, "hello")]
+    #[case::string_empty_space(PrimitiveType::String, " ")]
+    #[case::string_with_special_chars(PrimitiveType::String, "foo/bar=baz")]
+    #[case::boolean_true(PrimitiveType::Boolean, "true")]
+    #[case::boolean_false(PrimitiveType::Boolean, "false")]
+    #[case::byte_positive(PrimitiveType::Byte, "127")]
+    #[case::byte_negative(PrimitiveType::Byte, "-128")]
+    #[case::byte_zero(PrimitiveType::Byte, "0")]
+    #[case::short_positive(PrimitiveType::Short, "32767")]
+    #[case::short_negative(PrimitiveType::Short, "-32768")]
+    #[case::integer_positive(PrimitiveType::Integer, "2024")]
+    #[case::integer_negative(PrimitiveType::Integer, "-42")]
+    #[case::integer_zero(PrimitiveType::Integer, "0")]
+    #[case::long_large(PrimitiveType::Long, "9223372036854775807")]
+    #[case::long_negative(PrimitiveType::Long, "-100")]
+    #[case::float_positive(PrimitiveType::Float, "3.14")]
+    #[case::float_negative(PrimitiveType::Float, "-0.5")]
+    #[case::float_zero(PrimitiveType::Float, "0")]
+    #[case::double_positive(PrimitiveType::Double, "2.718281828")]
+    #[case::double_negative(PrimitiveType::Double, "-99.99")]
+    #[case::double_zero(PrimitiveType::Double, "0")]
+    #[case::date_epoch(PrimitiveType::Date, "1970-01-01")]
+    #[case::date_modern(PrimitiveType::Date, "2024-03-15")]
+    #[case::date_pre_epoch(PrimitiveType::Date, "1969-12-31")]
+    #[case::timestamp_ntz_basic(PrimitiveType::TimestampNtz, "2024-01-15 10:30:00")]
+    #[case::timestamp_ntz_fractional(PrimitiveType::TimestampNtz, "2024-01-15 10:30:00.123456")]
+    #[case::timestamp_ntz_epoch(PrimitiveType::TimestampNtz, "1970-01-01 00:00:00")]
+    #[case::timestamp_ntz_pre_epoch(PrimitiveType::TimestampNtz, "1969-12-31 00:00:00")]
+    #[case::timestamp_basic(PrimitiveType::Timestamp, "2024-01-15 10:30:00")]
+    #[case::timestamp_fractional(PrimitiveType::Timestamp, "2024-01-15 10:30:00.123456")]
+    #[case::timestamp_epoch(PrimitiveType::Timestamp, "1970-01-01 00:00:00")]
+    #[case::timestamp_pre_epoch(PrimitiveType::Timestamp, "1969-12-31 00:00:00")]
+    #[case::double_infinity(PrimitiveType::Double, "Infinity")]
+    #[case::double_neg_infinity(PrimitiveType::Double, "-Infinity")]
+    #[case::float_infinity(PrimitiveType::Float, "Infinity")]
+    #[case::float_neg_infinity(PrimitiveType::Float, "-Infinity")]
+    fn test_serialize_partition_value_roundtrip(#[case] ptype: PrimitiveType, #[case] raw: &str) {
+        let scalar = ptype
+            .parse_scalar(raw)
+            .expect("parse_scalar should succeed");
+        let serialized = scalar
+            .serialize_partition_value()
+            .expect("serialize_partition_value should produce a value");
+        let roundtrip = ptype
+            .parse_scalar(&serialized)
+            .expect("parse_scalar on serialized value should succeed");
+        assert_eq!(
+            roundtrip, scalar,
+            "roundtrip mismatch for {ptype:?} with input {raw:?}: serialized as {serialized:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::scale_0(42, 5, 0, "42")]
+    #[case::scale_2(12345, 10, 2, "123.45")]
+    #[case::scale_9(123456789, 10, 9, "0.123456789")]
+    #[case::negative(- 500, 10, 2, "-5.00")]
+    #[case::negative_fraction(-5, 10, 2, "-0.05")]
+    #[case::negative_one(-1, 10, 2, "-0.01")]
+    fn test_serialize_partition_value_decimal_roundtrip(
+        #[case] value: i128,
+        #[case] precision: u8,
+        #[case] scale: u8,
+        #[case] expected_str: &str,
+    ) {
+        let scalar = Scalar::decimal(value, precision, scale).unwrap();
+        let serialized = scalar.serialize_partition_value().expect("serialize");
+        assert_eq!(serialized, expected_str);
+
+        let ptype = PrimitiveType::decimal(precision, scale).unwrap();
+        let roundtrip = ptype.parse_scalar(&serialized).expect("roundtrip parse");
+        assert_eq!(roundtrip, scalar);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_empty_string_parses_to_null() {
+        let ptype = PrimitiveType::String;
+        let scalar = ptype.parse_scalar("").expect("parse");
+        assert!(scalar.is_null());
+        assert_eq!(scalar.serialize_partition_value(), None);
     }
 }

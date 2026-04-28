@@ -14,16 +14,18 @@ use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
-/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
-/// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
-/// than the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
+/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not
+/// deleted), while `false` means the row is logically deleted and should be ignored. If the
+/// selection vector is shorter than the number of rows in `data` then all rows not covered by the
+/// selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
     // The underlying engine data
     data: Box<dyn EngineData>,
     // The selection vector where `true` marks rows to include in results. N.B. this selection
-    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be selected.
+    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be
+    // selected.
     selection_vector: Vec<bool>,
 }
 
@@ -250,6 +252,8 @@ macro_rules! impl_default_get {
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -278,6 +282,8 @@ macro_rules! impl_null_get {
 impl<'a> GetData<'a> for () {
     impl_null_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -322,6 +328,8 @@ macro_rules! impl_typed_get_data {
 // Use get_date/get_timestamp directly instead of through TypedGetData.
 impl_typed_get_data!(
     (get_bool, bool),
+    (get_byte, i8),
+    (get_short, i16),
     (get_int, i32),
     (get_long, i64),
     (get_float, f32),
@@ -532,6 +540,9 @@ pub trait RowVisitor {
 ///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // filter out unselected rows and return the new set of data
 ///   }
+///   fn has_field(&self, name: &ColumnName) -> bool {
+///     todo!() // determine whether the field exists in the data
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
@@ -558,9 +569,10 @@ pub trait EngineData: AsAny {
     /// with the provided new columns. The original data remains unchanged.
     ///
     /// # Parameters
-    /// - `schema`: The schema of the columns being appended (not the entire resulting schema).
-    ///   This schema must describe exactly the columns being added in the `columns` parameter.
-    /// - `columns`: The column data to append. Each [`ArrayData`] corresponds to one field in the schema.
+    /// - `schema`: The schema of the columns being appended (not the entire resulting schema). This
+    ///   schema must describe exactly the columns being added in the `columns` parameter.
+    /// - `columns`: The column data to append. Each [`ArrayData`] corresponds to one field in the
+    ///   schema.
     ///
     /// # Returns
     /// A new `EngineData` instance containing both the original columns and the appended columns.
@@ -585,6 +597,12 @@ pub trait EngineData: AsAny {
         self: Box<Self>,
         selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
+    ///
+    /// For a top-level field named `"foo"`, use `ColumnName::new(["foo"])`. For nested fields,
+    /// each non-leaf element of the path must be a struct field at that level.
+    fn has_field(&self, name: &ColumnName) -> bool;
 }
 
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
@@ -609,14 +627,16 @@ pub(crate) fn filter_by_predicate(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
-    use rstest::rstest;
-    use std::sync::Arc;
 
     fn get_engine_data(rows: usize) -> Box<dyn EngineData> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

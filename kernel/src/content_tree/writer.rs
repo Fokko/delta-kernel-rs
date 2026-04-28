@@ -1,11 +1,11 @@
-use crate::content_tree::ContentTreeNode;
-use crate::path::ParsedLogPath;
-use crate::{DeltaResult, Engine, ParquetCompression, ParquetWriterConfig};
 use tracing::instrument;
 use url::Url;
 
+use crate::content_tree::ContentTreeNode;
+use crate::path::ParsedLogPath;
+use crate::{DeltaResult, Engine, ParquetCompression, ParquetWriterConfig};
+
 /// Orchestrates the process of creating a V3 checkpoint for a table.
-///
 pub(crate) struct ContentTreeNodeWriter {
     pub(crate) metadata: ContentTreeNode,
 }
@@ -36,7 +36,8 @@ impl ContentTreeNodeWriter {
     ///
     /// For example, if the table root is `s3://bucket/path` and the version is `10`:
     /// - Root: `s3://bucket/path/_delta_log/00000000000000000010.content.parquet`
-    /// - Leaf: `s3://bucket/path/_delta_log/00000000000000000010.content.550e8400-e29b-41d4-a716-446655440000.parquet`
+    /// - Leaf: `s3://bucket/path/_delta_log/00000000000000000010.content.
+    ///   550e8400-e29b-41d4-a716-446655440000.parquet`
     fn checkpoint_path(&self) -> DeltaResult<Url> {
         ParsedLogPath::new_content_metadata_path(
             &self.metadata.table_root,

@@ -6,25 +6,27 @@
 //! verified through the same code paths a real engine connector would exercise.
 //!
 //! Tests are organized by concern:
-//! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC,
-//!   and on-demand API calls like `get_domain_metadata`)
+//! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC, and
+//!   on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
 //!
 //! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need
 //! checkpoint, CRC, or log compaction features still use manual helpers until those
 //! [`LogState`] variants land.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::metrics::WithMetricsReporterLayer as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
+use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 mod scan;
@@ -32,17 +34,42 @@ mod snapshot_load;
 
 /// Build a `DefaultEngine` + `CountingReporter` backed by `store`, for use in the
 /// *measurement* phase (building a snapshot and asserting metric counters).
+///
+/// Returns the engine, the reporter, and a tracing `DefaultGuard` that must be kept alive
+/// for the duration of the test. When the guard is dropped the subscriber is uninstalled.
+///
+/// # Thread-safety note
+///
+/// This installs the reporter as a thread-local default subscriber (not global). Thread-local
+/// subscribers are not included in the global callsite interest cache, so when any thread-local
+/// subscriber's guard is dropped, `tracing` rebuilds the global callsite interest cache — and
+/// if no global subscriber is registered, all callsite interests are reset to `Never`, silently
+/// disabling new span creation on other threads.
+///
+/// To prevent this race, a minimal global subscriber (`tracing_subscriber::Registry` with no
+/// layers) is installed once per test binary. This keeps all callsite interests at `Always`,
+/// while each test's thread-local subscriber does the actual per-test event capture.
 fn measuring_engine(
     store: Arc<dyn delta_kernel::object_store::ObjectStore>,
 ) -> (
     DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
     Arc<CountingReporter>,
+    tracing::subscriber::DefaultGuard,
 ) {
+    static GLOBAL_TRACING_INIT: OnceLock<()> = OnceLock::new();
+    GLOBAL_TRACING_INIT.get_or_init(|| {
+        // A no-layer Registry keeps callsite interests at Always. Without it, dropping any
+        // thread-local subscriber guard triggers rebuild_interest_cache() which resets all
+        // interests to Never (no global subscriber = no interest), racing with other tests.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::Registry::default());
+    });
+
     let reporter = Arc::new(CountingReporter::default());
-    let engine = DefaultEngineBuilder::new(store)
-        .with_metrics_reporter(reporter.clone())
-        .build();
-    (engine, reporter)
+    let engine = DefaultEngineBuilder::new(store).build();
+    let guard = tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .set_default();
+    (engine, reporter, guard)
 }
 
 /// Build a minimal single-column INTEGER schema for test tables.

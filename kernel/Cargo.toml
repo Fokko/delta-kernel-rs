@@ -45,19 +45,22 @@ chrono = "0.4.41"
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
+percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
-# only for structured logging
 tracing = { version = "0.1", features = ["log"] }
 tracing-chrome = { version = "0.7", optional = true }
-tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
+async-trait = "0.1.88"
+async-stream = "0.3"
+
 iceberg = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", optional = true }
@@ -68,7 +71,7 @@ futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls). We disable `default-tls` to avoid
 # pulling in a second rustls crypto provider that conflicts with transitive deps (see
 # feature-tests for a regression test). Each default-engine-* feature selects its TLS backend.
-reqwest = { version = "0.13", default-features = false, optional = true, features = ["charset", "http2", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, optional = true, features = ["charset", "http2", "system-proxy", "query", "json"] }
 # optionally used with default engine (though not required)
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
@@ -129,7 +132,7 @@ schema-diff = []
 iceberg-nativev4 = ["dep:iceberg"]
 
 # Enables Chrome trace span capture for benchmarks (outputs .trace.json files)
-trace-spans = ["dep:tracing-chrome", "dep:tracing-subscriber"]
+trace-spans = ["dep:tracing-chrome"]
 
 # Enables Unity Catalog support in bench/backfill binary tools
 uc-bench-tools = ["dep:unity-catalog-delta-rest-client", "dep:unity-catalog-delta-client-api"]
@@ -143,8 +146,8 @@ clustered-table = []
 catalog-managed = []
 
 
-# this is an 'internal' feature flag which has all the shared bits from default-engine and
-# default-engine-rustls
+# this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
+# and default-engine-rustls
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",

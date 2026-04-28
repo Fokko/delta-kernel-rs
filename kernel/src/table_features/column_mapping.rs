@@ -3,7 +3,13 @@
 //! This module provides:
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use strum::EnumString;
+use uuid::Uuid;
 
 use super::TableFeature;
 use crate::actions::Protocol;
@@ -15,13 +21,6 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
-
-use std::borrow::Cow;
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
-use strum::EnumString;
-use uuid::Uuid;
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -258,8 +257,8 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// # Arguments
 ///
 /// * `schema` - The schema to transform
-/// * `max_id` - Tracks the highest column ID assigned. Updated in place. Should be initialized
-///   to 0 for a new table.
+/// * `max_id` - Tracks the highest column ID assigned. Updated in place. Should be initialized to 0
+///   for a new table.
 ///
 /// # Returns
 ///
@@ -397,11 +396,12 @@ pub(crate) fn get_any_level_column_physical_name(
 /// Translates a batch of physical [`ColumnName`]s back to logical. Supports nested columns.
 ///
 /// The `logical_schema` must be a **logical** schema whose fields carry the
-/// `delta.columnMapping.physicalName` and `delta.columnMapping.id` metadata when column mapping is enabled.
+/// `delta.columnMapping.physicalName` and `delta.columnMapping.id` metadata when column mapping is
+/// enabled.
 ///
 /// This is the batch reverse of [`get_any_level_column_physical_name`]. It pre-builds a flat
-/// `HashMap<physical_name, logical_name>` at each schema depth (up to the deepest [`ColumnName`] in `physical_cols`),
-/// so every level of every [`ColumnName`] resolves in O(1).
+/// `HashMap<physical_name, logical_name>` at each schema depth (up to the deepest [`ColumnName`] in
+/// `physical_cols`), so every level of every [`ColumnName`] resolves in O(1).
 #[allow(dead_code)] // used in tests
 pub(crate) fn get_any_level_columns_logical_names(
     logical_schema: &StructType,
@@ -479,14 +479,14 @@ pub(crate) fn physical_to_logical_column_name(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::make_test_tc;
-    use std::collections::{HashMap, HashSet};
-
     use crate::utils::test_utils::{
-        test_deep_nested_schema_missing_leaf_cm, test_schema_nested_with_column_mapping,
+        make_test_tc, test_deep_nested_schema_missing_leaf_cm,
+        test_schema_nested_with_column_mapping,
     };
 
     #[test]
@@ -562,7 +562,8 @@ mod tests {
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
     }
 
-    // Creates optional schema field annotations for column mapping id and physical name, as a string.
+    // Creates optional schema field annotations for column mapping id and physical name, as a
+    // string.
     fn create_annotations<'a>(
         id: impl Into<Option<&'a str>>,
         name: impl Into<Option<&'a str>>,
@@ -577,7 +578,8 @@ mod tests {
         annotations.join(", ")
     }
 
-    // Creates a generic schema with optional field annotations for column mapping id and physical name.
+    // Creates a generic schema with optional field annotations for column mapping id and physical
+    // name.
     fn create_schema<'a>(
         inner_id: impl Into<Option<&'a str>>,
         inner_name: impl Into<Option<&'a str>>,

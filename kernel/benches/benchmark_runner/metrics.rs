@@ -14,8 +14,9 @@
 
 //! Metrics collection for benchmarks
 
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 /// Collected benchmark metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]

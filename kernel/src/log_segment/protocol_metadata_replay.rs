@@ -3,12 +3,14 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
+use tracing::instrument;
+
+use super::LogSegment;
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::LazyCrc;
 use crate::log_replay::ActionsBatch;
+use crate::metrics::MetricId;
 use crate::{DeltaResult, Engine, Error};
-
-use super::LogSegment;
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -16,11 +18,14 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
+    // Span name must match `SEGMENT_READ_METADATA_SPAN` in `metrics::reporter`.
     #[allow(dead_code)]
+    #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         lazy_crc: &LazyCrc,
+        operation_id: MetricId,
     ) -> DeltaResult<(Metadata, Protocol)> {
         // TODO: Try CRC first when CRC support is implemented
         let _ = lazy_crc;

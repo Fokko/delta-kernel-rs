@@ -6,6 +6,8 @@
 //! then read back into a fresh builder via `from_content_root`, mirroring the
 //! production round-trip.
 
+use url::Url;
+
 use crate::actions::{Add, CheckpointAction, ContentRoot, Metadata, Protocol};
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::writer::ContentTreeNodeWriter;
@@ -15,9 +17,7 @@ use crate::content_tree::{
 };
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
-use crate::DeltaResult;
-use crate::Version;
-use url::Url;
+use crate::{DeltaResult, Version};
 
 /// Minimal table schema with the required PARQUET:field_id metadata.
 fn test_table_schema() -> Schema {

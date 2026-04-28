@@ -3,21 +3,25 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
+
 use crate::content_tree::{
     AVG_VALUE_SIZE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, EXACT_BOUNDS, LOWER_BOUND, MAX_VALUE_SIZE,
     NAN_VALUE_COUNT, NULL_VALUE_COUNT, UPPER_BOUND, VALUE_COUNT,
 };
-use crate::expressions::{Expression, ExpressionRef, Predicate, Scalar, StructData, Transform};
+use crate::expressions::{
+    Expression, ExpressionRef, MapData, Predicate, Scalar, StructData, Transform,
+};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, PrimitiveType,
     StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData};
-use serde_json::Value as JsonValue;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Number of supported stats per column.
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
@@ -42,8 +46,8 @@ const RESERVED_FIELD_IDS_START: i32 = i32::MAX - NUM_RESERVED_FIELD_IDS;
 ///
 /// Base stats field IDs are computed in different "spaces" depending on the input field ID:
 /// - Regular field IDs (0 to `RESERVED_FIELD_IDS_START - 1`) use the data space starting at 10,000
-/// - Reserved field IDs (`RESERVED_FIELD_IDS_START` to `i32::MAX`) use the metadata space
-///   starting at 2,147,000,000
+/// - Reserved field IDs (`RESERVED_FIELD_IDS_START` to `i32::MAX`) use the metadata space starting
+///   at 2,147,000,000
 ///
 /// # Arguments
 ///
@@ -506,8 +510,8 @@ impl DeltaJsonStats {
     /// Parse a JSON stats string from Delta Protocol format.
     ///
     /// When `tightBounds` is absent or null in the JSON, uses `tight_bounds_when_null` if provided
-    /// (e.g. `Some(false)` when the file has a deletion vector, so bounds are treated as not tight);
-    /// otherwise defaults to `true` for backwards compatibility.
+    /// (e.g. `Some(false)` when the file has a deletion vector, so bounds are treated as not
+    /// tight); otherwise defaults to `true` for backwards compatibility.
     fn parse(json_str: &str, tight_bounds_when_null: Option<bool>) -> Option<Self> {
         // TODO: We should delegate this to the engine.. at some point...
         let parsed: JsonValue = serde_json::from_str(json_str).ok()?;
@@ -766,7 +770,8 @@ fn build_struct_stats(
 ///
 /// # Arguments
 ///
-/// * `stats_list` - Iterator of Option<&StructData> representing content_stats from multiple entries
+/// * `stats_list` - Iterator of Option<&StructData> representing content_stats from multiple
+///   entries
 ///
 /// # Returns
 ///
@@ -1283,6 +1288,171 @@ pub(crate) fn merge_partition_values_into_stats(
     }
 
     Ok(Some(StructData::new_unchecked(fields, values)))
+}
+
+/// Returns `LOWER_BOUND` or `UPPER_BOUND` for `bound_field_name` () within per-column
+/// partition stats (`content_stats.<col>` as a struct).
+fn bound_from_partition_col_stats<'a>(
+    col_stats: &'a StructData,
+    bound_field_name: &str,
+) -> Option<&'a Scalar> {
+    col_stats
+        .fields()
+        .iter()
+        .position(|f| f.name() == bound_field_name)
+        .map(|idx| &col_stats.values()[idx])
+}
+
+/// Extracts partition values from AMT `content_stats` as a `HashMap<String, String>`.
+///
+/// A column is included when `lower_bound` and `upper_bound` are non-null, the two are equal,
+/// and the value serializes via [`Scalar::serialize_partition_value`].
+///
+/// # Arguments
+/// * `content_stats` - The AMT content_stats struct for a single file
+/// * `partition_columns` - The names of partition columns to extract
+#[allow(dead_code)]
+fn extract_partition_values_from_content_stats(
+    content_stats: &StructData,
+    partition_columns: &[String],
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+
+    // TODO: This is O(|partition_columns| * |content_stats fields|) due to repeated linear
+    // scans; consider indexing or a trie-style matcher if this becomes hot.
+    for col_name in partition_columns {
+        let Some(col_stats) = content_stats
+            .fields()
+            .iter()
+            .position(|f| f.name() == col_name)
+            .map(|idx| &content_stats.values()[idx])
+        else {
+            continue;
+        };
+
+        let Scalar::Struct(col_stats_struct) = col_stats else {
+            continue;
+        };
+
+        let lower = bound_from_partition_col_stats(col_stats_struct, LOWER_BOUND);
+        let upper = bound_from_partition_col_stats(col_stats_struct, UPPER_BOUND);
+
+        if let (Some(lb), Some(ub)) = (lower, upper) {
+            if !lb.is_null() && !ub.is_null() && lb == ub {
+                // TODO: Null partition values (lower_bound == upper_bound == null) and missing
+                // min/max from Delta JSON stats can both appear as null bounds; disambiguate before
+                // emitting partitionValues, and align with
+                // `build_partition_values_from_content_stats_expr`.
+                if let Some(s) = lb.serialize_partition_value() {
+                    result.insert(col_name.clone(), s);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Selects how [`build_partition_values_from_content_stats_expr`] materializes partition columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionValuesFromContentStats {
+    /// Delta `partitionValues` as `Map<String, String>` via
+    /// [`Expression::partition_values_to_map`].
+    AsMap,
+    /// Typed struct of `content_stats.<col>.lower_bound` fields (field order follows
+    /// `partition_columns`).
+    #[allow(dead_code)]
+    AsTypedStruct,
+}
+
+/// Builds an expression that reads partition column values from `content_stats`.
+///
+/// With [`PartitionValuesFromContentStats::AsMap`], wraps the result as a
+/// `Map<String, String>` matching Delta `partitionValues`. With
+/// [`PartitionValuesFromContentStats::AsTypedStruct`], returns a struct of typed `lower_bound`
+/// columns only.
+///
+/// For each partition column, the expression reads `content_stats.<col>.lower_bound` as
+/// the partition value. Partition columns always have `lower_bound == upper_bound` by
+/// construction (the write path sets both bounds to the constant partition value via
+/// [`merge_partition_values_into_stats`]). We read `lower_bound` directly rather than
+/// adding an equality guard because the expression system lacks per-field conditional
+/// expressions, and a struct-level nullability predicate would silently null out *all*
+/// partition values if any single column's bounds diverged.
+///
+/// When `partition_columns` is empty or `physical_table_schema` is `None`, returns an expression
+/// that produces an empty map literal (for [`PartitionValuesFromContentStats::AsMap`]) or
+/// an empty struct (for [`PartitionValuesFromContentStats::AsTypedStruct`]).
+///
+/// # Arguments
+///
+/// * `physical_table_schema` - Physical table schema (needed to confirm each partition column
+///   exists in the table before reading its stats)
+/// * `partition_columns` - Physical names of partition columns
+/// * `output` - Map output for Delta `partitionValues`, or a typed struct of `lower_bound` columns
+pub(crate) fn build_partition_values_from_content_stats_expr(
+    physical_table_schema: Option<&StructType>,
+    partition_columns: &[String],
+    output: PartitionValuesFromContentStats,
+) -> DeltaResult<Expression> {
+    let build_lower_bound_field_exprs = |physical_table_schema: &StructType| -> Vec<ExpressionRef> {
+        let mut field_exprs: Vec<ExpressionRef> = Vec::with_capacity(partition_columns.len());
+        for col_name in partition_columns {
+            if physical_table_schema.field(col_name).is_some() {
+                // Read `lower_bound` only. Partition columns are written with identical
+                // `lower_bound` and `upper_bound` (constant partition value); see
+                // `merge_partition_values_into_stats`.
+                field_exprs.push(Arc::new(Expression::Column(ColumnName::new([
+                    crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                    col_name,
+                    LOWER_BOUND,
+                ]))));
+            }
+        }
+        field_exprs
+    };
+
+    match output {
+        PartitionValuesFromContentStats::AsMap => {
+            let Some(physical_table_schema) = physical_table_schema else {
+                return empty_partition_values_map_expr();
+            };
+
+            let field_exprs = build_lower_bound_field_exprs(physical_table_schema);
+            if field_exprs.is_empty() {
+                return empty_partition_values_map_expr();
+            }
+
+            let struct_expr = Expression::struct_from(field_exprs);
+            Ok(Expression::partition_values_to_map(struct_expr))
+        }
+        PartitionValuesFromContentStats::AsTypedStruct => {
+            let Some(physical_table_schema) = physical_table_schema else {
+                return empty_partition_values_struct_expr();
+            };
+
+            let field_exprs = build_lower_bound_field_exprs(physical_table_schema);
+            if field_exprs.is_empty() {
+                return empty_partition_values_struct_expr();
+            }
+
+            Ok(Expression::struct_from(field_exprs))
+        }
+    }
+}
+
+/// Returns an expression that evaluates to an empty struct (no fields).
+pub(crate) fn empty_partition_values_struct_expr() -> DeltaResult<Expression> {
+    Ok(Expression::struct_from(Vec::<ExpressionRef>::new()))
+}
+
+/// Returns an expression that evaluates to an empty `Map<String, String>`.
+pub(crate) fn empty_partition_values_map_expr() -> DeltaResult<Expression> {
+    let empty_map = MapData::try_new(
+        MapType::new(DataType::STRING, DataType::STRING, false),
+        Vec::<(Scalar, Scalar)>::new(),
+    )?;
+    Ok(Expression::literal(Scalar::Map(empty_map)))
 }
 
 /// Checks if a schema's stats column is in Delta JSON format (has numRecords).
@@ -1921,7 +2091,8 @@ fn collect_stats_expressions_filtered(
         match table_field.data_type() {
             DataType::Struct(table_nested) | DataType::Variant(table_nested) => {
                 // For variants, only the "value" sub-field carries stats. Skip other
-                // variant inner fields (e.g. "metadata") so they don't generate spurious stat expressions.
+                // variant inner fields (e.g. "metadata") so they don't generate spurious stat
+                // expressions.
                 if matches!(table_field.data_type(), DataType::Variant(_))
                     && !is_variant_value_field(col_name)
                 {
@@ -2138,7 +2309,8 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
+        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound,
+        // upper_bound, exact_bounds
         assert_eq!(name_stats_struct.fields().count(), 7);
         assert!(name_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
         assert!(name_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
@@ -2443,7 +2615,8 @@ mod tests {
     }
 
     /// Helper function to get a column's stats field value in AMT format
-    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound, exact_bounds}}
+    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound,
+    /// exact_bounds}}
     fn get_column_stat<'a>(
         stats: &'a StructData,
         column: &str,
@@ -3661,8 +3834,9 @@ mod tests {
             Some(&Scalar::Boolean(false))
         );
 
-        // Expression should AND exact_bounds from columns; for one column that's just coalesce(cs.id.exact_bounds, true).
-        // So when evaluated with content_true we'd get true, with content_false we'd get false.
+        // Expression should AND exact_bounds from columns; for one column that's just
+        // coalesce(cs.id.exact_bounds, true). So when evaluated with content_true we'd get
+        // true, with content_false we'd get false.
         let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
         let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
             .expect("build expr");
@@ -3712,7 +3886,8 @@ mod tests {
             Expression::Struct(inner, _) => inner,
             _ => panic!("expected Struct expression"),
         };
-        // Output must have exactly 3 fields matching the stats_schema (numRecords, nullCount, tightBounds)
+        // Output must have exactly 3 fields matching the stats_schema (numRecords, nullCount,
+        // tightBounds)
         assert_eq!(
             exprs.len(),
             3,
@@ -4148,6 +4323,310 @@ mod tests {
             score_value,
             Some(&Scalar::Struct(expected_score)),
             "partition stats mismatch for 'score'"
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_values_roundtrip_string_partition() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("part", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json =
+            r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("part".to_string(), "hello".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(100),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        let extracted = extract_partition_values_from_content_stats(&merged, &["part".to_string()]);
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted.get("part"), Some(&"hello".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_values_roundtrip_integer_partition() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("data", DataType::STRING, true, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+        ]);
+
+        let stats_json = r#"{"numRecords":75,"minValues":{"data":"abc"},"maxValues":{"data":"xyz"},"nullCount":{"data":5}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("year".to_string(), "2024".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(75),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        let extracted = extract_partition_values_from_content_stats(&merged, &["year".to_string()]);
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted.get("year"), Some(&"2024".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_values_multiple_partition_columns() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("data", DataType::STRING, true, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+            field_with_id("region", DataType::STRING, true, 3),
+        ]);
+
+        let stats_json = r#"{"numRecords":30,"minValues":{"data":"a"},"maxValues":{"data":"z"},"nullCount":{"data":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([
+            ("year".to_string(), "2023".to_string()),
+            ("region".to_string(), "us-east".to_string()),
+        ]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(30),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        let extracted = extract_partition_values_from_content_stats(
+            &merged,
+            &["year".to_string(), "region".to_string()],
+        );
+
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.get("year"), Some(&"2023".to_string()));
+        assert_eq!(extracted.get("region"), Some(&"us-east".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_values_null_partition_not_included() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("region", DataType::STRING, true, 2),
+        ]);
+
+        // Include `region` in nullCount so the fixture resembles real per-file stats JSON.
+        let stats_json = r#"{"numRecords":50,"minValues":{"id":10},"maxValues":{"id":200},"nullCount":{"id":0,"region":50}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        // Merge with an empty string to simulate a null partition (parse_scalar returns Null for
+        // empty)
+        let partition_values = HashMap::from([("region".to_string(), "".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(50),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        let extracted =
+            extract_partition_values_from_content_stats(&merged, &["region".to_string()]);
+
+        // Follow-up (see TODO in `extract_partition_values_from_content_stats`): distinguish a
+        // deliberate null partition from ambiguous null bounds in stats before emitting map
+        // entries.
+        assert!(
+            extracted.is_empty(),
+            "null partition values are not extracted until null/missing-bound handling is implemented"
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_values_skips_non_partition_columns() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("part", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json =
+            r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("part".to_string(), "val".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(100),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        // "id" is a data column with min != max so it should not be extracted
+        let extracted = extract_partition_values_from_content_stats(
+            &merged,
+            &["id".to_string(), "part".to_string()],
+        );
+
+        assert_eq!(
+            extracted.len(),
+            1,
+            "only partition column should be extracted"
+        );
+        assert_eq!(extracted.get("part"), Some(&"val".to_string()));
+        assert!(!extracted.contains_key("id"));
+    }
+
+    #[test]
+    fn test_extract_partition_values_double_roundtrip() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("data", DataType::STRING, true, 1),
+            field_with_id("score", DataType::DOUBLE, true, 2),
+        ]);
+
+        let stats_json = r#"{"numRecords":10,"minValues":{"data":"x"},"maxValues":{"data":"x"},"nullCount":{"data":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("score".to_string(), "3.14".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(10),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        let extracted =
+            extract_partition_values_from_content_stats(&merged, &["score".to_string()]);
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted.get("score"), Some(&"3.14".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_values_divergent_bounds_not_extracted() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("region", DataType::STRING, true, 2),
+        ]);
+
+        // "region" has different min/max values -> lower_bound != upper_bound
+        let stats_json = r#"{"numRecords":100,"minValues":{"id":1,"region":"east"},"maxValues":{"id":50,"region":"west"},"nullCount":{"id":0,"region":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let extracted =
+            extract_partition_values_from_content_stats(&content_stats, &["region".to_string()]);
+
+        // No data loss to the protocol: we only skip emitting `partitionValues` for this column
+        // when min/max disagree. A caller must not treat missing map entries as proof the column
+        // is absent from the file; it means stats did not pin a single constant value.
+        assert!(
+            extracted.is_empty(),
+            "column with lower_bound != upper_bound should not be extracted as a partition value"
+        );
+    }
+
+    #[test]
+    fn test_build_partition_values_expr_empty_partitions_produces_empty_map() {
+        let expr = build_partition_values_from_content_stats_expr(
+            None,
+            &[],
+            PartitionValuesFromContentStats::AsMap,
+        )
+        .expect("should build expression");
+
+        assert!(
+            matches!(expr, Expression::Literal(Scalar::Map(_))),
+            "empty partitions should produce a literal empty map, got: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_partition_values_expr_with_partition_columns_produces_partition_values_to_map() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+            field_with_id("region", DataType::STRING, true, 3),
+        ]);
+
+        let partition_columns = vec!["year".to_string(), "region".to_string()];
+        let expr = build_partition_values_from_content_stats_expr(
+            Some(&table_schema),
+            &partition_columns,
+            PartitionValuesFromContentStats::AsMap,
+        )
+        .expect("should build expression");
+
+        assert!(
+            matches!(expr, Expression::PartitionValuesToMap(_)),
+            "should produce PartitionValuesToMap expression, got: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_partition_values_expr_typed_struct_emits_struct_expression() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+            field_with_id("region", DataType::STRING, true, 3),
+        ]);
+
+        let partition_columns = vec!["year".to_string(), "region".to_string()];
+        let expr = build_partition_values_from_content_stats_expr(
+            Some(&table_schema),
+            &partition_columns,
+            PartitionValuesFromContentStats::AsTypedStruct,
+        )
+        .expect("should build expression");
+
+        assert!(
+            matches!(expr, Expression::Struct(_, None)),
+            "typed struct output should be a plain struct expression, got: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_partition_values_expr_no_table_schema_produces_empty_map() {
+        let partition_columns = vec!["year".to_string()];
+        let expr = build_partition_values_from_content_stats_expr(
+            None,
+            &partition_columns,
+            PartitionValuesFromContentStats::AsMap,
+        )
+        .expect("should build expression");
+
+        assert!(
+            matches!(expr, Expression::Literal(Scalar::Map(_))),
+            "no table schema should produce a literal empty map, got: {expr:?}"
         );
     }
 }

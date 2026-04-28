@@ -6,14 +6,12 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
-
-use delta_kernel_derive::internal_api;
 
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
@@ -31,6 +29,8 @@ use crate::{
 };
 
 pub mod executor;
+#[cfg(feature = "default-engine-rustls")]
+pub mod file_api_http_client;
 pub mod file_stream;
 pub mod filesystem;
 pub mod json;
@@ -87,41 +87,41 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the iterator
-/// is either exhausted or dropped. Used by JSON and Parquet handlers to report the number of files
-/// and bytes requested per `read_*_files` call.
+/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
+/// iterator is either exhausted or dropped.
+///
+/// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
+/// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
+/// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
+/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
 pub(super) struct ReadMetricsIterator {
     inner: crate::FileDataReadResultIterator,
-    reporter: Arc<dyn crate::metrics::MetricsReporter>,
     num_files: u64,
     bytes_read: u64,
     emitted: bool,
-    make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+    emit_fn: fn(u64, u64),
 }
 
 impl ReadMetricsIterator {
     pub(super) fn new(
         inner: crate::FileDataReadResultIterator,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
         num_files: u64,
         bytes_read: u64,
-        make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+        emit_fn: fn(u64, u64),
     ) -> Self {
         Self {
             inner,
-            reporter,
             num_files,
             bytes_read,
             emitted: false,
-            make_event,
+            emit_fn,
         }
     }
 
     fn emit_once(&mut self) {
         if !self.emitted {
             self.emitted = true;
-            self.reporter
-                .report((self.make_event)(self.num_files, self.bytes_read));
+            (self.emit_fn)(self.num_files, self.bytes_read);
         }
     }
 }
@@ -192,12 +192,6 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
-    /// Set the metrics reporter for the engine.
-    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
-        self.metrics_reporter = Some(reporter);
-        self
-    }
-
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
@@ -278,16 +272,15 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                metrics_reporter.clone(),
             )),
-            json: Arc::new(
-                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
-            ),
-            parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
-            ),
+            json: Arc::new(DefaultJsonHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+            )),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -322,8 +315,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
-        _partition_values: HashMap<String, String>,
-        write_config: &crate::ParquetWriterConfig,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
@@ -334,26 +325,21 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
-        let write_dir = write_context.write_dir();
         self.parquet
-            .write_parquet_file(
-                &write_dir,
-                physical_data,
-                write_context.physical_partition_values(),
-                Some(write_context.stats_columns()),
-                write_config,
-            )
+            .write_parquet_file(write_context, physical_data, &Default::default())
             .await
     }
 }
 
-/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
-/// from the provided [`WriteContext`].
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
+/// table root from the provided [`WriteContext`].
+///
+/// Paths in the returned Add action metadata are stored relative to the table root.
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
-/// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
-/// should call this to produce the Add action metadata for [`Transaction::add_files`].
+/// Arrow-based engines that write parquet files themselves (bypassing
+/// [`DefaultEngine::write_parquet`]) should call this to produce the Add action metadata for
+/// [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
 /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
@@ -361,7 +347,8 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.physical_partition_values())
+    let add_path = write_context.resolve_file_path(file_metadata.location())?;
+    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -394,24 +381,25 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
+        // We search a URL query string for these keys to see if we should consider it a presigned
+        // URL:
+        // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+        // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+        // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+        // - Google Cloud Storage: https://cloud.google.com/storage/docs/authentication/signatures
+        // - Alibaba Cloud OSS: https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+        // - Databricks presigned URLs
+        const PRESIGNED_KEYS: &[&str] = &[
+            "X-Amz-Signature",
+            "sp",
+            "X-Goog-Credential",
+            "X-OSS-Credential",
+            "X-Databricks-Signature",
+        ];
         matches!(self.scheme(), "http" | "https")
-            && (
-                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
-                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-                self
+            && self
                 .query_pairs()
-                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
-                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
-                // note signed permission (sp) must always be present
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
-                // https://cloud.google.com/storage/docs/authentication/signatures
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
-                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
-            )
+                .any(|(k, _)| PRESIGNED_KEYS.iter().any(|p| k.eq_ignore_ascii_case(p)))
     }
 }
 
@@ -419,15 +407,7 @@ impl UrlExt for Url {
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
-
-    #[derive(Debug)]
-    struct TestMetricsReporter;
-
-    impl MetricsReporter for TestMetricsReporter {
-        fn report(&self, _event: MetricEvent) {}
-    }
 
     #[test]
     fn test_default_engine() {
@@ -444,19 +424,6 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_metrics_reporter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
@@ -492,13 +459,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
             .with_task_executor(executor)
             .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
@@ -514,6 +478,11 @@ mod tests {
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url =
+            Url::parse("https://example.com?X-Databricks-TTL=3599545&X-Databricks-Signature=bar")
+                .unwrap();
         assert!(url.is_presigned());
 
         // assert that query keys are case insensitive

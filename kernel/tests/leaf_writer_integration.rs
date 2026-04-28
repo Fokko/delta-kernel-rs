@@ -9,6 +9,7 @@
 //! - TXN-2: Multiple leaves in one transaction
 //! - TXN-5: Sequential commits with leaf writers
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -21,7 +22,6 @@ use delta_kernel::schema::{
 };
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, RowVisitor, Snapshot};
-use std::collections::HashSet;
 use test_utils::create_add_files_metadata;
 use url::Url;
 

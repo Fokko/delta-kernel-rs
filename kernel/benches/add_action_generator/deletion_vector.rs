@@ -154,8 +154,9 @@ impl Default for DeletionVectorGenerator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::SeedableRng;
+
+    use super::*;
 
     #[test]
     fn test_inline_dv_format() {

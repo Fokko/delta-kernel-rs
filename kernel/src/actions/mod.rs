@@ -4,6 +4,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use serde::{Deserialize, Serialize};
+use url::Url;
+use visitors::{CheckpointActionVisitor, MetadataVisitor, ProtocolVisitor};
+
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
@@ -17,13 +22,6 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, FileMeta, FileSize, IntoEngineData, RowVisitor as _,
     Version,
 };
-
-use url::Url;
-use visitors::{MetadataVisitor, ProtocolVisitor};
-
-use delta_kernel::actions::visitors::CheckpointActionVisitor;
-use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
-use serde::{Deserialize, Serialize};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
@@ -259,9 +257,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if there are any metadata columns in the schema.
-    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
@@ -503,15 +499,113 @@ impl Protocol {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        let protocol = Protocol {
+        // The protocol states that Reader features may be present if and only if the
+        // min_reader_version is 3
+        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
+            require!(
+                reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        } else {
+            require!(
+                reader_features.is_none(),
+                Error::invalid_protocol(
+                    "Reader features must not be present when minimum reader version != 3"
+                )
+            );
+        }
+
+        // The protocol states that Writer features may be present if and only if the
+        // min_writer_version is 7
+        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
+            require!(
+                writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        } else {
+            require!(
+                writer_features.is_none(),
+                Error::invalid_protocol(
+                    "Writer features must not be present when minimum writer version != 7"
+                )
+            );
+        }
+
+        // Self- and cross-validate the reader and writer feature lists.
+        match (&reader_features, &writer_features) {
+            (Some(reader_features), Some(writer_features)) => {
+                // Check all reader features are ReaderWriter and present in writer features.
+                // Unknown features are treated as potentially ReaderWriter for forward
+                // compatibility.
+                let check_r = reader_features.iter().all(|feature| {
+                    matches!(
+                        feature.feature_type(),
+                        FeatureType::ReaderWriter | FeatureType::Unknown
+                    ) && writer_features.contains(feature)
+                });
+                require!(
+                    check_r,
+                    Error::invalid_protocol(
+                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
+                    )
+                );
+
+                // Check all writer features that are ReaderWriter must also be in reader features
+                // Unknown features are treated as potentially Writer-only for forward
+                // compatibility.
+                let check_w = writer_features
+                    .iter()
+                    .all(|feature| match feature.feature_type() {
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => reader_features.contains(feature),
+                    });
+                require!(
+                    check_w,
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+            }
+            (None, None) => {}
+            (None, Some(writer_features)) => {
+                // Special case: reader version 2 implies ColumnMapping support.
+                // All other ReaderWriter features require explicit reader_features list (reader
+                // version 3). Unknown features are treated as potentially
+                // Writer-only for forward compatibility.
+                let is_valid = writer_features.iter().all(|feature| {
+                    match feature.feature_type() {
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => {
+                            // ColumnMapping is allowed when reader version is 2 (implied support)
+                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                        }
+                    }
+                });
+
+                require!(
+                    is_valid,
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+            }
+            (Some(_), None) => {
+                return Err(Error::invalid_protocol(
+                    "Reader features should be present in writer features",
+                ))
+            }
+        }
+
+        Ok(Protocol {
             min_reader_version,
             min_writer_version,
             reader_features,
             writer_features,
-        };
-        protocol.validate_table_features()?;
-
-        Ok(protocol)
+        })
     }
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
@@ -565,105 +659,6 @@ impl Protocol {
     pub(crate) fn has_writer_feature(&self, feature: &TableFeature) -> bool {
         self.writer_features()
             .is_some_and(|features| features.contains(feature))
-    }
-
-    /// Validates the relationship between reader features and writer features in the protocol.
-    pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
-        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
-        if self.min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
-            require!(
-                self.reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        } else {
-            require!(
-                self.reader_features.is_none(),
-                Error::invalid_protocol(
-                    "Reader features must not be present when minimum reader version != 3"
-                )
-            );
-        }
-
-        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
-        if self.min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
-            require!(
-                self.writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        } else {
-            require!(
-                self.writer_features.is_none(),
-                Error::invalid_protocol(
-                    "Writer features must not be present when minimum writer version != 7"
-                )
-            );
-        }
-
-        // Self- and cross-validate the reader and writer feature lists.
-        match (&self.reader_features, &self.writer_features) {
-            (Some(reader_features), Some(writer_features)) => {
-                // Check all reader features are ReaderWriter and present in writer features.
-                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
-                let check_r = reader_features.iter().all(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::ReaderWriter | FeatureType::Unknown
-                    ) && writer_features.contains(feature)
-                });
-                require!(
-                    check_r,
-                    Error::invalid_protocol(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-                );
-
-                // Check all writer features that are ReaderWriter must also be in reader features
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let check_w = writer_features
-                    .iter()
-                    .all(|feature| match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => reader_features.contains(feature),
-                    });
-                require!(
-                    check_w,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            (None, Some(writer_features)) => {
-                // Special case: reader version 2 implies ColumnMapping support.
-                // All other ReaderWriter features require explicit reader_features list (reader version 3).
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let is_valid = writer_features.iter().all(|feature| {
-                    match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => {
-                            // ColumnMapping is allowed when reader version is 2 (implied support)
-                            self.min_reader_version == 2 && feature == &TableFeature::ColumnMapping
-                        }
-                    }
-                });
-
-                require!(
-                    is_valid,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
-                Ok(())
-            }
-            (Some(_), None) => Err(Error::invalid_protocol(
-                "Reader features should be present in writer features",
-            )),
-        }
     }
 
     #[cfg(test)]
@@ -800,8 +795,8 @@ pub(crate) struct Add {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
 
-    /// A map from partition column to value for this logical file. This map can contain null in the
-    /// values meaning a partition is null. We drop those values from this map, due to the
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
     /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
@@ -820,7 +815,8 @@ pub(crate) struct Add {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -912,7 +908,8 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -1103,8 +1100,8 @@ pub(crate) struct Cdc {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
 
-    /// A map from partition column to value for this logical file. This map can contain null in the
-    /// values meaning a partition is null. We drop those values from this map, due to the
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
     /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
@@ -1198,7 +1195,8 @@ impl Sidecar {
     }
 }
 
-/// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
+/// The CheckpointMetadata action describes details about a checkpoint following the V2
+/// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1277,26 +1275,26 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use rstest::rstest;
+    use serde_json::json;
 
     use super::set_transaction::is_set_txn_expired;
     use super::*;
+    use crate::arrow::array::{
+        BooleanArray, Int64Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
+        StringBuilder,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use crate::arrow::json::ReaderBuilder;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{
-        arrow::{
-            array::{
-                BooleanArray, Int64Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-                StringBuilder,
-            },
-            datatypes::{DataType as ArrowDataType, Field, Schema},
-            json::ReaderBuilder,
-        },
-        engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
-        schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
-    use serde_json::json;
-    use std::collections::HashSet;
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);

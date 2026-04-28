@@ -1,11 +1,12 @@
 //! Commit phase for log replay - processes JSON commit files.
 
+use delta_kernel::Version;
+use itertools::Itertools;
+
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine};
-use delta_kernel::Version;
-use itertools::Itertools;
 
 /// Phase that processes JSON commit files into [`ActionsBatch`]s
 pub(crate) struct CommitReader {
@@ -60,14 +61,16 @@ impl Iterator for CommitReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use itertools::Itertools;
+
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::log_reader::commit::CommitReader;
     use crate::log_replay::ActionsBatch;
     use crate::scan::COMMIT_READ_SCHEMA;
     use crate::utils::test_utils::load_test_table;
-    use itertools::Itertools;
-    use std::sync::Arc;
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {

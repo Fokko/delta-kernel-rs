@@ -18,6 +18,7 @@
 //! to get table locations and credentials for S3 access.
 
 use std::sync::Arc;
+
 use unity_catalog_delta_client_api::Operation;
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;

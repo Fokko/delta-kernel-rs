@@ -17,8 +17,9 @@
 //! This module provides common functionality for working with Delta table files,
 //! including cleanup and copy operations used by benchmarking tools.
 
-use object_store::{ObjectStore, ObjectStoreExt as _};
 use std::sync::Arc;
+
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use tokio::sync::Semaphore;
 use url::Url;
 

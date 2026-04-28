@@ -1,12 +1,14 @@
 // Tests for checkpoint action validation and optimization
+use std::sync::Arc;
+
+use url::Url;
+
 use super::*;
 use crate::engine::default::DefaultEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::DeltaResult;
-use std::sync::Arc;
-use url::Url;
 
 /// Shared P+M JSON suffix for checkpoint action test payloads.
 const CHECKPOINT_PM_SUFFIX: &str = concat!(

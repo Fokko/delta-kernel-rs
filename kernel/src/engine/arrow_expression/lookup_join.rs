@@ -1,7 +1,6 @@
 //! Lookup join implementation for efficient key-based joins with cached data.
 
 use std::collections::HashMap;
-
 use std::sync::Arc;
 
 use crate::arrow::array::cast::AsArray;
@@ -12,8 +11,7 @@ use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_expression::evaluate_expression::extract_column;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
-use crate::EngineData;
-use crate::{DeltaResult, Error, EvaluationHandler, LookupJoiner};
+use crate::{DeltaResult, EngineData, Error, EvaluationHandler, LookupJoiner};
 
 /// Helper function to look up a field in a schema by path.
 /// For nested paths, navigates through struct types.
@@ -96,7 +94,8 @@ pub(crate) struct ArrowLookupJoiner {
 }
 
 impl ArrowLookupJoiner {
-    /// Create a new ArrowLookupJoiner with the given schema, column configuration, and initial data.
+    /// Create a new ArrowLookupJoiner with the given schema, column configuration, and initial
+    /// data.
     ///
     /// This constructor validates the schema, creates a null row, and populates the joiner
     /// with the provided initial lookup data.
@@ -165,7 +164,8 @@ impl ArrowLookupJoiner {
     /// Extract keys from a batch and populate the HashMap, respecting the selection vector.
     ///
     /// Only selected rows with non-null keys are added to the HashMap.
-    /// Uses latest-version-wins semantics: for duplicate keys, keeps the entry with the highest version.
+    /// Uses latest-version-wins semantics: for duplicate keys, keeps the entry with the highest
+    /// version.
     fn populate_key_map(
         batch: &RecordBatch,
         key_column: &ColumnName,
@@ -373,8 +373,9 @@ impl LookupJoiner for ArrowLookupJoiner {
                 let input_version = input_version_array.value(row_idx);
 
                 if let Some(loc) = self.key_to_location.get(key) {
-                    // If input version is greater than lookup version, use null row (stale lookup data)
-                    // DV applies if DV sequence number >= data sequence number
+                    // If input version is greater than lookup version, use null row (stale lookup
+                    // data) DV applies if DV sequence number >= data sequence
+                    // number
                     if input_version > loc.version {
                         (0, 0) // Stale lookup data -> null row
                     } else {

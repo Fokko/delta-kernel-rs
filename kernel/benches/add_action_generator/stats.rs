@@ -19,9 +19,10 @@
 //! - 6 int64 columns with random values
 //! - 1 int64 column with deterministic values (min=max, incrementing)
 
+use std::cell::Cell;
+
 use rand::rngs::StdRng;
 use rand::Rng;
-use std::cell::Cell;
 
 /// NATO phonetic alphabet (26 values)
 const PHONETIC_ALPHABET: &[&str] = &[
@@ -265,8 +266,9 @@ impl StatsGenerator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::SeedableRng;
+
+    use super::*;
 
     #[test]
     fn test_reproducible_with_seed() {

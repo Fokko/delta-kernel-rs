@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
+use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
+use super::super::arrow_utils::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use crate::arrow::datatypes::Schema as ArrowSchema;
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-
-use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
-use super::super::arrow_utils::make_arrow_error;
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -192,6 +192,19 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype)?),
+        // Variants are physically stored as structs in both unshredded (metadata+value) and
+        // shredded (metadata+value+...) forms. Accept any struct without further validation here;
+        // the parquet reader enforces the unshredded constraint via validate_parquet_variant on
+        // read, and reorder_struct_array canonicalizes the field order.
+        Variant(_) => {
+            if !matches!(array.data_type(), ArrowDataType::Struct(_)) {
+                return Err(make_arrow_error(format!(
+                    "Variant data must be stored as a struct, got {:?}",
+                    array.data_type()
+                )));
+            }
+            array.clone()
+        }
         _ => {
             ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
             array.clone()
@@ -202,10 +215,9 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 
 #[cfg(test)]
 mod apply_schema_validation_tests {
-    use super::*;
-
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::array::{Int32Array, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{

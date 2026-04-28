@@ -1,12 +1,8 @@
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::Snapshot;
-use url::Url;
-
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
-
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -14,12 +10,14 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
+use delta_kernel::Snapshot;
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use test_utils::{collect_file_paths, create_table, engine_store_setup, read_scan};
+use url::Url;
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
 /// when row tracking is enabled on the table when a remove action is generated for a
@@ -111,12 +109,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     let engine_arc = Arc::new(engine);
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let add_files_metadata = engine_arc
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            Default::default(),
-            &Default::default(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
 
     txn.add_files(add_files_metadata);

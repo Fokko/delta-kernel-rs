@@ -4,12 +4,6 @@ mod write_context;
 
 use std::sync::Arc;
 
-use crate::error::{ExternResult, IntoExternResult};
-use crate::handle::Handle;
-use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
-use crate::{DeltaResult, ExternEngine, Snapshot, Url};
-use crate::{ExclusiveEngineData, SharedExternEngine};
-use crate::{KernelStringSlice, SharedSchema, SharedSnapshot};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
@@ -17,6 +11,16 @@ use delta_kernel::transaction::create_table::{
 };
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
+
+use crate::engine_funcs::FileMeta as FfiFileMeta;
+use crate::error::{ExternResult, IntoExternResult};
+use crate::handle::Handle;
+use crate::scan::EngineSchema;
+use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
+use crate::{
+    unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
+    KernelStringSlice, SharedExternEngine, SharedSnapshot, Snapshot, TryFromStringSlice, Url,
+};
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
 ///
@@ -366,6 +370,10 @@ pub struct ExclusiveCreateTableBuilder;
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
+/// The schema is provided via the engine's visitor callback pattern ([`EngineSchema`]): the
+/// kernel allocates a [`KernelSchemaVisitorState`], calls the engine's visitor function to
+/// populate it via `visit_field_*` downcalls, then extracts the final schema.
+///
 /// The returned builder can be configured with [`create_table_builder_with_table_property`]
 /// before building with [`create_table_builder_build`]. The engine is only used for error
 /// reporting at this stage.
@@ -373,29 +381,30 @@ pub struct ExclusiveCreateTableBuilder;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
-/// Does NOT consume the `schema` handle -- the caller is still responsible for freeing it.
 #[no_mangle]
 pub unsafe extern "C" fn get_create_table_builder(
     path: KernelStringSlice,
-    schema: Handle<SharedSchema>,
+    schema: &EngineSchema,
     engine_info: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
     let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    let schema = unsafe { schema.clone_as_arc() };
     get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
 }
 
 fn get_create_table_builder_impl(
     path: DeltaResult<&str>,
-    schema: Arc<delta_kernel::schema::Schema>,
+    schema: &EngineSchema,
     engine_info: DeltaResult<&str>,
 ) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
     let builder = delta_kernel::transaction::create_table::create_table(
         path?,
-        schema,
+        Arc::new(schema),
         engine_info?.to_string(),
     );
     Ok(Box::new(builder).into())
@@ -550,53 +559,112 @@ pub unsafe extern "C" fn remove_files(
     result.into_extern_result(&engine)
 }
 
+/// Set an explicit root manifest for this transaction.
+///
+/// On commit, the checkpoint action references `file` as the content root; kernel writes no
+/// new root manifest parquet file. This is mutually exclusive with `with_manifest_commit`.
+///
+/// Returns `true` on success. The boolean return value exists only because the C FFI boundary
+/// cannot represent a void/unit success value; the value itself carries no meaning.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and a valid `file` pointer. Does NOT consume
+/// the `txn` handle.
+#[no_mangle]
+pub unsafe extern "C" fn with_explicit_root_manifest(
+    mut txn: Handle<ExclusiveTransaction>,
+    file: &crate::engine_funcs::FileMeta,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<bool> {
+    let engine = unsafe { engine.as_ref() };
+    let txn = unsafe { txn.as_mut() };
+    with_explicit_root_manifest_impl(txn, file).into_extern_result(&engine)
+}
+
+fn with_explicit_root_manifest_impl(
+    txn: &mut Transaction,
+    file: &FfiFileMeta,
+) -> DeltaResult<bool> {
+    let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let location = Url::parse(path)?;
+    let kernel_file = delta_kernel::FileMeta {
+        location,
+        last_modified: file.last_modified,
+        size: file
+            .size
+            .try_into()
+            .map_err(|_| delta_kernel::Error::generic_err("unable to convert to FileSize"))?,
+    };
+    txn.with_explicit_root_manifest(kernel_file)?;
+    Ok(true)
+}
+
+/// Opt this transaction into the manifest commit path.
+///
+/// On commit, add/remove actions are recorded in the metadata content tree rather than written
+/// to the delta log directly. Any incremental actions accumulated since the last manifest commit
+/// are automatically added to the tree root on commit.
+///
+/// Requires the `metadataTree-experimental` writer feature on the table. This mode is mutually
+/// exclusive with [`with_explicit_root_manifest`]; calling both on the same transaction causes
+/// [`commit`] to return an error.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `txn` handle. Does NOT consume the handle.
+#[no_mangle]
+pub unsafe extern "C" fn with_manifest_commit(mut txn: Handle<ExclusiveTransaction>) {
+    let txn = unsafe { txn.as_mut() };
+    txn.with_manifest_commit();
+}
+
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::table_features::TableFeature;
+    use std::os::raw::c_void;
+    use std::sync::Arc;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
-
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-
-    use delta_kernel_ffi::engine_data::get_engine_data;
-    use delta_kernel_ffi::engine_data::ArrowFFIData;
-
+    use delta_kernel::schema::{
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
+    use delta_kernel::table_features::TableFeature;
+    use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
         ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
-
-    use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice};
-    use crate::{logical_schema, version};
+    use itertools::Itertools;
+    use serde_json::{json, Deserializer};
+    use tempfile::tempdir;
+    use test_utils::{
+        create_table, engine_store_setup, set_json_value, setup_test_tables, test_read,
+    };
     use write_context::{
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
 
-    use test_utils::{set_json_value, setup_test_tables, test_read};
-
-    use itertools::Itertools;
-    use serde_json::json;
-    use serde_json::Deserializer;
-
-    use std::sync::Arc;
+    use super::*;
+    use crate::schema_visitor::{
+        visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
+    };
+    use crate::{
+        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
+    };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
-
-    use super::*;
-
-    use tempfile::tempdir;
 
     fn check_txn_id_exists(commit_info: &serde_json::Value) {
         commit_info["txnId"]
@@ -1091,15 +1159,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer,
-            tests::{cast_test_context, get_test_context, recover_test_context},
-            CommitRequest,
-        };
-        use crate::{Handle, NullableCvoid, OptionalValue};
         use delta_kernel_ffi::{
             get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
         };
+
+        use crate::delta_kernel_unity_catalog::tests::{
+            cast_test_context, get_test_context, recover_test_context,
+        };
+        use crate::delta_kernel_unity_catalog::{
+            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+        };
+        use crate::{Handle, NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -1307,6 +1377,57 @@ mod tests {
         Ok(())
     }
 
+    /// Schema visitor callback for tests: encodes the schema stored in the `schema` pointer
+    /// (which points to a `Vec<StructField>`) into the kernel's `KernelSchemaVisitorState`.
+    /// Only supports primitive fields (no nested structs/arrays/maps) -- sufficient for tests.
+    extern "C" fn visit_test_schema(
+        schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let fields = unsafe { &*(schema_ptr as *const Vec<StructField>) };
+        let field_ids: Vec<usize> = fields
+            .iter()
+            .map(|field| {
+                let name = field.name.as_str();
+                let nullable = field.nullable;
+                unsafe {
+                    ok_or_panic(match field.data_type {
+                        DataType::INTEGER => visit_field_integer(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        DataType::STRING => visit_field_string(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        DataType::LONG => visit_field_long(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        _ => panic!("Unsupported test field type: {:?}", field.data_type),
+                    })
+                }
+            })
+            .collect();
+        let root = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(root),
+                field_ids.as_ptr(),
+                field_ids.len(),
+                false,
+                allocate_err,
+            ))
+        }
+    }
+
     /// Create a [`CreateTableTransactionBuilder`] handle via the FFI, using the given schema
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
@@ -1319,20 +1440,20 @@ mod tests {
         Handle<ExclusiveCreateTableBuilder>,
     ) {
         let table_path = tmp_dir.path().to_str().unwrap().to_string();
-        let schema = Arc::new(StructType::try_new(fields).unwrap());
         let engine = get_default_engine(&table_path);
-        let schema_handle: Handle<SharedSchema> = schema.into();
         let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
         let builder = ok_or_panic(unsafe {
             get_create_table_builder(
                 kernel_string_slice!(table_path),
-                schema_handle.shallow_copy(),
+                &schema_arg,
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
-        // get_create_table_builder does NOT consume the schema handle -- free it
-        unsafe { free_schema(schema_handle) };
         (table_path, engine, builder)
     }
 
@@ -1564,26 +1685,27 @@ mod tests {
         tmp_dir: &tempfile::TempDir,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
         let table_path = tmp_dir.path().to_str().unwrap();
-        let schema = Arc::new(StructType::try_new(vec![
+        let fields = vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
-        ])?);
+        ];
 
         let engine = get_default_engine(table_path);
-        let schema_handle: Handle<SharedSchema> = schema.into();
 
         // Create the table
         let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
         let builder = ok_or_panic(unsafe {
             get_create_table_builder(
                 kernel_string_slice!(table_path),
-                schema_handle.shallow_copy(),
+                &schema_arg,
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
-        // get_create_table_builder does NOT consume the schema handle -- free it
-        unsafe { free_schema(schema_handle) };
         build_and_commit(builder, &engine);
 
         // Write a parquet file and commit it
@@ -1788,6 +1910,222 @@ mod tests {
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
         unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // === with_explicit_root_manifest tests ===
+
+    /// Build a catalog-managed table (metadataTree-experimental + columnMapping) with a v2
+    /// manifest commit so that `snap.checkpoint_action().is_some()`, then return the table URL
+    /// string and a FFI engine handle backed by the same local filesystem path.
+    ///
+    /// Sequence: v0 create → v1 data append → v2 manifest commit (produces checkpoint).
+    async fn setup_manifest_commit_table(
+        tmp_dir: &tempfile::TempDir,
+    ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
+        let tmp_url = Url::from_directory_path(tmp_dir.path().canonicalize()?).unwrap();
+        let (store, kernel_engine, table_url) = engine_store_setup("mt_table", Some(&tmp_url));
+        let kernel_engine = Arc::new(kernel_engine);
+
+        // Create a catalog-managed table with column mapping + metadataTree-experimental.
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-1".to_string()),
+            ),
+        ])])?);
+        create_table(
+            store,
+            table_url.clone(),
+            schema.clone(),
+            &[],
+            true,
+            vec!["columnMapping", "metadataTree-experimental"],
+            vec!["columnMapping", "metadataTree-experimental"],
+        )
+        .await?;
+
+        // v1: append some data.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .with_engine_info("test");
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let file_meta = kernel_engine
+            .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+            .await?;
+        txn.add_files(file_meta);
+        let _ = txn.commit(kernel_engine.as_ref())?;
+
+        // v2: manifest commit — this produces a checkpoint action in the log.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .with_engine_info("manifest commit");
+        txn.with_manifest_commit();
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let file_meta = kernel_engine
+            .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+            .await?;
+        txn.add_files(file_meta);
+        match txn.commit(kernel_engine.as_ref())? {
+            CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 2),
+            other => panic!("unexpected commit result: {other:?}"),
+        }
+
+        // Verify the checkpoint action is present before returning.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        assert!(
+            snap.checkpoint_action().is_some(),
+            "v2 should have a checkpoint action"
+        );
+
+        let table_path_str = table_url.as_str().to_string();
+        let ffi_engine = get_default_engine(&table_path_str);
+        Ok((table_path_str, ffi_engine))
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_explicit_root_manifest_happy_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+        let engine_info = "test-engine/1.0";
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Point the manifest at a (hypothetical) file under the table root.
+        let manifest_path = format!("{table_path_str}custom-root.bin");
+        let manifest_path_str = manifest_path.as_str();
+        let file = FfiFileMeta {
+            path: kernel_string_slice!(manifest_path_str),
+            last_modified: 1_700_000_000_000,
+            size: 1024,
+        };
+
+        ok_or_panic(unsafe {
+            with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+        });
+
+        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+
+        // Reload the snapshot and verify the checkpoint action reflects the supplied manifest.
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snap =
+            Snapshot::builder_for(Url::parse(table_path_str)?).build(kernel_engine.as_ref())?;
+        assert_eq!(snap.version(), 3);
+        let ca = snap
+            .checkpoint_action()
+            .expect("v3 manifest commit should include a checkpoint action");
+        assert!(ca.path().ends_with("custom-root.bin"));
+        assert_eq!(ca.content_root_size_in_bytes(), 1024_u64);
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_explicit_root_manifest_double_call_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+        let engine_info = "test-engine/1.0";
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        let manifest_path = format!("{table_path_str}custom-root.bin");
+        let manifest_path_str = manifest_path.as_str();
+        let file = FfiFileMeta {
+            path: kernel_string_slice!(manifest_path_str),
+            last_modified: 1_700_000_000_000,
+            size: 1024,
+        };
+
+        // First call: succeeds.
+        ok_or_panic(unsafe {
+            with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+        });
+
+        // Second call on the same transaction: must fail.
+        assert_extern_result_error_with_message(
+            unsafe {
+                with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+            },
+            KernelError::UnknownError,
+            None,
+        );
+
+        unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // === with_manifest_commit tests ===
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_manifest_commit_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        unsafe { with_manifest_commit(txn.shallow_copy()) };
+
+        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+
+        // Reload the snapshot and verify a new checkpoint action was written by the kernel.
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snap =
+            Snapshot::builder_for(Url::parse(table_path_str)?).build(kernel_engine.as_ref())?;
+        assert_eq!(snap.version(), 3);
+        assert!(
+            snap.checkpoint_action().is_some(),
+            "v3 manifest commit should include a checkpoint action"
+        );
+
         unsafe { free_engine(engine) };
         Ok(())
     }

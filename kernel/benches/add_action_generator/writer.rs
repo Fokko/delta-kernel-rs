@@ -17,7 +17,9 @@
 //! Writes Add actions to parquet with structured stats (stats_parsed) following
 //! the Delta checkpoint schema specification.
 
-use crate::generator::AddActionMetadata;
+use std::fs::File;
+use std::sync::Arc;
+
 use delta_kernel::actions::deletion_vector::DeletionVectorStorageType;
 use delta_kernel::arrow::array::builder::{
     Int32Builder, Int64Builder, MapBuilder, MapFieldNames, StringBuilder,
@@ -29,8 +31,8 @@ use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::ColumnMetadataKey;
 use delta_kernel::DeltaResult;
-use std::fs::File;
-use std::sync::Arc;
+
+use crate::generator::AddActionMetadata;
 
 /// Write Add actions to a parquet file in checkpoint format
 pub fn write_checkpoint_parquet(

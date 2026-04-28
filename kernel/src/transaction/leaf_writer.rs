@@ -1,3 +1,9 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+use roaring::RoaringTreemap;
+use url::Url;
+
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
@@ -5,10 +11,6 @@ use crate::expressions::ColumnName;
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::DataType;
 use crate::{DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version};
-use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
-use url::Url;
 
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
@@ -16,8 +18,9 @@ use url::Url;
 /// This is an opaque type - use it by passing to [`crate::transaction::Transaction::add_leaf`].
 #[derive(Debug)]
 pub struct LeafNodeWriterResult {
-    /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries are deleted.
-    /// These are manifest deletion vectors that need to be applied to existing manifests.
+    /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries
+    /// are deleted. These are manifest deletion vectors that need to be applied to existing
+    /// manifests.
     pub(crate) manifest_dvs: HashMap<String, RoaringTreemap>,
 
     /// Written data file manifest (if any data files were added).
@@ -358,11 +361,12 @@ impl LeafNodeWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::schema::{
         ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
-    use std::sync::Arc;
 
     /// Helper to create a test engine, table root URL, and schema
     fn test_setup() -> (Arc<dyn Engine>, Url, SchemaRef) {
@@ -401,7 +405,8 @@ mod tests {
     /// format with numRecords, minValues, maxValues, nullCount, and tightBounds.
     /// The stats will be automatically converted to AMT format by the builder.
     ///
-    /// Parameters for each file: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
+    /// Parameters for each file: (path, size, mod_time, num_records, id_min, id_max, id_null_count,
+    /// value_min, value_max, value_null_count)
     #[allow(clippy::type_complexity)]
     fn create_test_add_metadata_with_delta_json_stats(
         files: Vec<(
@@ -479,7 +484,8 @@ mod tests {
         ));
 
         // Build stats struct in Delta JSON format (like engine produces):
-        // { numRecords, nullCount: {id, value}, minValues: {id, value}, maxValues: {id, value}, tightBounds }
+        // { numRecords, nullCount: {id, value}, minValues: {id, value}, maxValues: {id, value},
+        // tightBounds }
         let num_records = Int64Array::from(
             files
                 .iter()
@@ -950,7 +956,8 @@ mod tests {
 
         // Add files with Delta JSON format stats (like the engine produces when writing parquet).
         // The stats will be automatically converted to AMT format by the builder.
-        // Parameters: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
+        // Parameters: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min,
+        // value_max, value_null_count)
         let metadata = create_test_add_metadata_with_delta_json_stats(vec![(
             "file1.parquet",
             1024,          // size
@@ -995,12 +1002,14 @@ mod tests {
         let manifest_location = manifest_entry.location.as_ref().unwrap();
         let manifest_url = table_root.join(manifest_location)?;
 
-        // Use the engine's parquet handler to read the file with a schema that includes content_stats
+        // Use the engine's parquet handler to read the file with a schema that includes
+        // content_stats
         use crate::arrow::array::Array;
         use crate::engine::arrow_data::ArrowEngineData;
         use crate::FileMeta;
 
-        // Get actual manifest file size from the filesystem so parquet reader can locate the footer.
+        // Get actual manifest file size from the filesystem so parquet reader can locate the
+        // footer.
         let manifest_path = manifest_url.to_file_path().unwrap();
         let manifest_file_size = std::fs::metadata(&manifest_path)?.len();
         let file_meta = FileMeta {
@@ -1012,7 +1021,8 @@ mod tests {
         let parquet_handler = engine.parquet_handler();
 
         // Use the production schema to ensure test matches actual behavior
-        // This generates the full ContentTreeNodeEntry schema with content_stats based on table schema
+        // This generates the full ContentTreeNodeEntry schema with content_stats based on table
+        // schema
         let delta_stats = crate::content_tree::builder::build_delta_stats_schema(&schema);
         let read_schema = Arc::new(
             crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
@@ -1306,7 +1316,8 @@ mod tests {
             "Data manifest should be written"
         );
 
-        // Verify the manifest contains exactly 2 files (the selected ones: file0.parquet and file2.parquet)
+        // Verify the manifest contains exactly 2 files (the selected ones: file0.parquet and
+        // file2.parquet)
         let manifest_entry = result.data_file_manifest_written.unwrap();
         let manifest_location = manifest_entry
             .location
@@ -1348,7 +1359,8 @@ mod tests {
             .iter()
             .filter_map(|entry| {
                 entry.location.as_ref().map(|loc| {
-                    // Extract just the filename from the path (handles both relative paths and URLs)
+                    // Extract just the filename from the path (handles both relative paths and
+                    // URLs)
                     loc.rsplit('/').next().unwrap_or(loc).to_string()
                 })
             })
@@ -1357,7 +1369,8 @@ mod tests {
         // Should have exactly 2 paths
         assert_eq!(paths.len(), 2, "Should have collected 2 file paths");
 
-        // The paths should be file0.parquet and file2.parquet (rows 0 and 2 from the selection vector)
+        // The paths should be file0.parquet and file2.parquet (rows 0 and 2 from the selection
+        // vector)
         assert!(
             paths.contains(&"file0.parquet".to_string()),
             "Manifest should contain file0.parquet, but got: {:?}",

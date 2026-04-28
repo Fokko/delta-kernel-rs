@@ -5,8 +5,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+
 use tracing::{debug, error};
 
+use super::stats::create_content_stats_to_stats_parsed_expr;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::expressions::{Expression, PredicateRef};
 use crate::kernel_predicates::KernelPredicateEvaluator;
@@ -16,8 +18,6 @@ use crate::{
     DeltaResult, EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
     RowVisitor as _,
 };
-
-use super::stats::create_content_stats_to_stats_parsed_expr;
 
 /// Filter that applies data skipping to manifest entries during parquet reading.
 ///
@@ -56,7 +56,8 @@ impl ManifestDataSkippingFilter {
     /// * `predicate` - The predicate to evaluate for data skipping
     /// * `stats_schema` - The expected stats schema (from table configuration or predicate columns)
     /// * `table_schema` - The table's physical schema with field ID metadata
-    /// * `manifest_batch_schema` - The schema of the manifest EngineData batches (contains content_stats column)
+    /// * `manifest_batch_schema` - The schema of the manifest EngineData batches (contains
+    ///   content_stats column)
     ///
     /// # Returns
     ///
@@ -79,7 +80,8 @@ impl ManifestDataSkippingFilter {
             .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)?;
 
         // Step 1: Create transform expression (content_stats → stats_parsed)
-        // Only create transforms for columns present in stats_schema (may be subset of table columns)
+        // Only create transforms for columns present in stats_schema (may be subset of table
+        // columns)
         let transform_expr = create_content_stats_to_stats_parsed_expr(table_schema, stats_schema)
             .inspect_err(|e| {
                 error!("Failed to create content_stats transform expression: {e}");
@@ -96,7 +98,8 @@ impl ManifestDataSkippingFilter {
             DataType::Struct(Box::new((*flat_stats_schema).clone())),
         )]));
 
-        // Create evaluator for the transform expression: manifest batch -> { stats_parsed: { ... } }
+        // Create evaluator for the transform expression: manifest batch -> { stats_parsed: { ... }
+        // }
         let transform_evaluator = evaluation_handler
             .new_expression_evaluator(
                 manifest_batch_schema.clone(),

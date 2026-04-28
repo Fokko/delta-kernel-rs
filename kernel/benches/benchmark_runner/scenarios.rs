@@ -14,7 +14,9 @@
 
 //! Benchmark scenario implementations
 
-use crate::metrics::{BenchmarkMetrics, ScanMetrics, WriteMetrics};
+use std::sync::Arc;
+use std::time::Instant;
+
 use delta_kernel::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -23,12 +25,11 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 // Note: PredicateRef is still used for scan predicate parameter
-
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Engine, EngineData, PredicateRef};
-use std::sync::Arc;
-use std::time::Instant;
 use url::Url;
+
+use crate::metrics::{BenchmarkMetrics, ScanMetrics, WriteMetrics};
 
 /// Context for counting scan files using the callback pattern
 struct ScanFileCounter {
@@ -202,7 +203,8 @@ fn create_add_files_metadata(
         .map_err(|e| delta_kernel::Error::generic(format!("Failed to find stats field: {}", e)))?;
 
     // Build the stats struct to match the expected schema
-    // The stats field is a struct with fields: numRecords, nullCount, minValues, maxValues, tightBounds
+    // The stats field is a struct with fields: numRecords, nullCount, minValues, maxValues,
+    // tightBounds
     let stats_struct = if let ArrowDataType::Struct(stats_fields) = stats_field.data_type() {
         let mut field_arrays: Vec<(Arc<Field>, ArrayRef)> = Vec::new();
 
@@ -216,7 +218,8 @@ fn create_add_files_metadata(
                     ));
                 }
                 _ => {
-                    // For all other fields (nullCount, minValues, maxValues, tightBounds), use null arrays
+                    // For all other fields (nullCount, minValues, maxValues, tightBounds), use null
+                    // arrays
                     let null_array = new_null_array(field.data_type(), num_files);
                     field_arrays.push((field.clone(), null_array));
                 }
@@ -443,8 +446,8 @@ pub fn vacuum_delete(
                     let is_selected = if i < old_selection.len() {
                         old_selection[i]
                     } else {
-                        // Per FilteredEngineData contract: if selection vector is shorter than data,
-                        // remaining rows are assumed to be selected
+                        // Per FilteredEngineData contract: if selection vector is shorter than
+                        // data, remaining rows are assumed to be selected
                         true
                     };
 

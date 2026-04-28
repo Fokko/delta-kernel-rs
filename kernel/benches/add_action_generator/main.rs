@@ -26,8 +26,9 @@ mod generator;
 mod stats;
 mod writer;
 
-use clap::Parser;
 use std::process;
+
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "add-action-generator")]

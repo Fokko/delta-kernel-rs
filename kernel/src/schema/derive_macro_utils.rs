@@ -1,11 +1,12 @@
 //! Utility traits that support the [`delta_kernel_derive::ToSchema`] macro.
-use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
-use bytes::Bytes;
-///
-/// Not intended for use by normal code.
+//!
+//! Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
 use delta_kernel_derive::internal_api;
+
+use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -135,8 +136,9 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use delta_kernel_derive::ToSchema;
+
+    use super::*;
 
     #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
     pub(crate) struct TestFieldId {

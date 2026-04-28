@@ -21,10 +21,11 @@ mod metrics;
 mod output;
 mod scenarios;
 
-use clap::{Parser, Subcommand};
-use delta_kernel::expressions::{column_expr, Expression, Scalar};
 use std::process;
 use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use delta_kernel::expressions::{column_expr, Expression, Scalar};
 use unity_catalog_delta_client_api::Operation;
 use url::Url;
 
@@ -132,7 +133,8 @@ enum Scenario {
 #[cfg(feature = "trace-spans")]
 fn setup_span_capture(path: &str) -> impl Drop {
     use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::{filter::LevelFilter, prelude::*};
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::prelude::*;
     let (chrome_layer, guard) = ChromeLayerBuilder::new().file(path).build();
     tracing_subscriber::registry()
         .with(chrome_layer.with_filter(LevelFilter::INFO))
@@ -171,7 +173,7 @@ fn run_scenario(
     engine: Arc<dyn delta_kernel::Engine>,
 ) -> delta_kernel::DeltaResult<crate::metrics::BenchmarkMetrics> {
     match scenario {
-        Scenario::FullTableScan => scenarios::scan(table_url, engine, /*predicate=*/ None),
+        Scenario::FullTableScan => scenarios::scan(table_url, engine, /* predicate= */ None),
         Scenario::NeedleInHaystack { partition_id } => {
             let predicate = Some(Arc::new(
                 column_expr!("id").eq(Expression::Literal(Scalar::Long(*partition_id))),

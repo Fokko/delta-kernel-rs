@@ -1,14 +1,15 @@
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::{DeltaResult, Error};
-use bytes::Bytes;
 use std::str::FromStr;
 use std::sync::LazyLock;
+
+use bytes::Bytes;
 
 use super::{
     ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestStats, TrackingInfo,
     TrackingStatus,
 };
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::{DeltaResult, Error};
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
@@ -35,8 +36,8 @@ impl RowVisitor for ContentTreeNodeEntryVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // The number of getters should match the number of leaf fields in ContentTreeNodeEntry schema
-        // We'll validate this implicitly by accessing each field
+        // The number of getters should match the number of leaf fields in ContentTreeNodeEntry
+        // schema We'll validate this implicitly by accessing each field
 
         for i in 0..row_count {
             let entry = visit_metadata_entry_at(i, getters)?;
@@ -54,9 +55,9 @@ fn visit_metadata_entry_at<'a>(
     // 0: content_type
     // 1: location
     // 2: file_format
-    // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
-    // 9-12: dv_info fields (location, offset, size_in_bytes, cardinality)
-    // 13: partition_spec_id
+    // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number,
+    // first_row_id, changes_dv) 9-12: dv_info fields (location, offset, size_in_bytes,
+    // cardinality) 13: partition_spec_id
     // 14: sort_order_id
     // 15: record_count
     // 16: file_size_in_bytes
