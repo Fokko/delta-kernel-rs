@@ -63,6 +63,9 @@ mod ffi_test_utils;
 pub mod test_ffi;
 pub mod transaction;
 
+#[cfg(feature = "default-engine-base")]
+pub mod filesystem_client;
+
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
