@@ -16,17 +16,15 @@ use delta_kernel::{DeltaResult, Error, Snapshot};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 
 use test_utils::{
-    collect_file_paths, create_add_files_metadata, create_table, engine_store_setup, read_scan,
-    test_read, test_table_setup,create_default_engine_mt_executor
+    collect_file_paths, create_add_files_metadata, create_default_engine_mt_executor, create_table,
+    engine_store_setup, read_scan, test_read, test_table_setup,
 };
-
 
 use delta_kernel::engine::to_json_bytes;
 use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use url::Url;
-
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -913,7 +911,6 @@ async fn verify_batch_commit_hwm(
     assert_eq!(
         hwm, expected_hwm,
         "rowIdHighWaterMark should match expected value"
-
     );
 
     Ok(())
@@ -1054,7 +1051,6 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
 
     Ok(())
 }
-
 
 /// A batch commit with leaf writers assigns sequential first_row_id values (surfaced as
 /// baseRowId in Delta) and writes the correct row ID high water mark domain metadata.

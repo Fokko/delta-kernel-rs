@@ -1094,9 +1094,9 @@ impl ContentTreeNodeBuilder {
         // Capture the starting row ID before build_leaf advances the allocator
         let starting_first_row_id = allocator.current();
         // Build the leaf metadata with a UUID
-        let node = self.build_leaf(engine, snapshot_id, allocator)?;
+        let leaf_metadata = self.build_leaf(engine, snapshot_id, allocator)?;
 
-        let write_result = ContentTreeNodeWriter::try_new(node)?.write(engine)?;
+        let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root)?;
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
         // ParquetObjectReader::with_file_size when reading the leaf manifest back.
@@ -1166,26 +1166,26 @@ impl ContentTreeNodeBuilder {
                 .map(|e| e.content_stats.as_ref()),
         );
 
-        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-            .location(manifest_path)
-            .tracking(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(snapshot_id),
-                // TODO: Manifest entries in root should have sequence_number and file_sequence_number
-                // set to self.version so that leaf entries can inherit them when null.
-                sequence_number: None,
-                file_sequence_number: None,
-                // Set to the starting row ID used for data entries in this leaf
-                first_row_id: Some(starting_first_row_id),
-                changes_dv: None,
-            })
-            .record_count(record_count)
-            .file_size_in_bytes(manifest_file_size)
-            .content_stats_opt(content_stats)
-            .manifest_stats_opt(manifest_stats)
-            .build();
-
-        Ok(manifest_entry)
+        Ok(
+            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+                .location(manifest_path)
+                .tracking(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(snapshot_id),
+                    // TODO: Manifest entries in root should have sequence_number and file_sequence_number
+                    // set to self.version so that leaf entries can inherit them when null.
+                    sequence_number: None,
+                    file_sequence_number: None,
+                    // Set to the starting row ID used for data entries in this leaf
+                    first_row_id: Some(starting_first_row_id),
+                    changes_dv: None,
+                })
+                .record_count(record_count)
+                .file_size_in_bytes(manifest_file_size)
+                .content_stats_opt(content_stats)
+                .manifest_stats_opt(manifest_stats)
+                .build(),
+        )
     }
 
     /// Builds a root ContentTreeNode instance (leaf is `None`).

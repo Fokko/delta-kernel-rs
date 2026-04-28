@@ -1004,7 +1004,7 @@ fn partition_actions_into_leaves(
     let mut leaf_count: usize = 0;
 
     let mc = txn.with_manifest_commit();
-    
+
     // Scan metadata and count actions
     let scan_iter = scan.scan_metadata(engine)?;
 

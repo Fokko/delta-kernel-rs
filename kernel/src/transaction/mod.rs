@@ -300,7 +300,7 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(mut self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -396,15 +396,7 @@ impl<S> Transaction<S> {
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
 
-        // Step 4: Determine if this is a manifest commit and pre-compute the row ID cursor.
-        // Auto-create ManifestCommitState for icebergNativeV4 (where is_manifest_commit() is true
-        // but with_manifest_commit() was never called by the user).
         let manifest_commit = self.is_manifest_commit();
-        let row_id_cursor = if manifest_commit {
-            Some(self.with_manifest_commit().ensure_row_id_cursor(engine)?)
-        } else {
-            None
-        };
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
@@ -433,7 +425,6 @@ impl<S> Transaction<S> {
             snapshot_id,
             commit_info_action,
             set_transaction_actions,
-            row_id_cursor,
         )?;
 
         let filtered_actions = actions
@@ -536,7 +527,6 @@ impl<S> Transaction<S> {
         snapshot_id: i64,
         commit_info_action: DeltaResult<Box<dyn EngineData>>,
         set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
-        row_id_cursor: Option<i64>,
     ) -> DeltaResult<(Vec<DeltaResult<FilteredEngineData>>, Vec<DomainMetadata>)> {
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking
         // high watermark)
@@ -734,10 +724,20 @@ impl<S> Transaction<S> {
                 }
             }
 
-            // Row ID cursor was pre-computed before entering generate_log_actions.
-            let starting_first_row_id = row_id_cursor.ok_or_else(|| {
-                Error::generic("row_id_cursor must be set when manifest commit is active")
-            })?;
+            // Compute the row ID cursor: start from the manifest commit state's cached
+            // cursor if a leaf writer already advanced it, otherwise from the snapshot's
+            // high water mark + 1.
+            let starting_first_row_id = if let Some(Some(cursor)) = self
+                .manifest_commit_state
+                .as_ref()
+                .map(|mc| mc.row_id_cursor)
+            {
+                cursor
+            } else {
+                let hwm =
+                    RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+                hwm.unwrap_or(-1) + 1
+            };
 
             let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
             let root_node = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
