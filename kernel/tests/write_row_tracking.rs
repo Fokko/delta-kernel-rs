@@ -15,7 +15,6 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-
 use test_utils::{collect_file_paths, create_table, engine_store_setup, read_scan};
 use url::Url;
 

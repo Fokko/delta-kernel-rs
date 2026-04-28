@@ -20,9 +20,8 @@ use crate::content_tree::{
     DELTA_STATS_TIGHT_BOUNDS,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::row_tracking::CursorRowIdAllocator;
-
 use crate::expressions::StructData;
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -1172,8 +1171,9 @@ impl ContentTreeNodeBuilder {
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
                     snapshot_id: Some(snapshot_id),
-                    // TODO: Manifest entries in root should have sequence_number and file_sequence_number
-                    // set to self.version so that leaf entries can inherit them when null.
+                    // TODO: Manifest entries in root should have sequence_number and
+                    // file_sequence_number set to self.version so that leaf
+                    // entries can inherit them when null.
                     sequence_number: None,
                     file_sequence_number: None,
                     // Set to the starting row ID used for data entries in this leaf

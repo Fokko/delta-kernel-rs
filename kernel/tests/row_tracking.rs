@@ -8,22 +8,20 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{CommitResult, CreateTable};
 use delta_kernel::{DeltaResult, Error, Snapshot};
-
-use delta_kernel::transaction::create_table::create_table as kernel_create_table;
-
+use itertools::Itertools;
+use serde_json::{Deserializer, Value};
+use tempfile::{tempdir, TempDir};
 use test_utils::{
     collect_file_paths, create_add_files_metadata, create_default_engine_mt_executor, create_table,
     engine_store_setup, read_scan, test_read, test_table_setup,
 };
-
-use delta_kernel::engine::to_json_bytes;
-use itertools::Itertools;
-use serde_json::{Deserializer, Value};
-use tempfile::{tempdir, TempDir};
 use url::Url;
 
 /// Helper function to create a simple table with row tracking enabled.

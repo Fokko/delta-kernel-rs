@@ -175,8 +175,8 @@ impl ManifestCommitState {
     ///
     /// # Arguments
     ///
-    /// * `engine` - The engine to use for I/O operations and fetching the root manifest URL
-    ///   (only on first call; subsequent calls use the cached value).
+    /// * `engine` - The engine to use for I/O operations and fetching the root manifest URL (only
+    ///   on first call; subsequent calls use the cached value).
     ///
     /// # Returns
     ///

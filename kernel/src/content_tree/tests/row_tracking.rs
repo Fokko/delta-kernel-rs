@@ -6,8 +6,6 @@
 
 use std::sync::Arc;
 
-use crate::Engine;
-
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
@@ -19,7 +17,7 @@ use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::object_store::local::LocalFileSystem;
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
-use crate::DeltaResult;
+use crate::{DeltaResult, Engine};
 
 fn test_table_schema() -> Schema {
     Schema::new_unchecked([
