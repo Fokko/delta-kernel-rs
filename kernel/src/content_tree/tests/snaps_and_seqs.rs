@@ -90,7 +90,7 @@ fn write_root_manifest(
     let root_url = ContentTreeNodeWriter::try_new(root)?
         .write(engine)?
         .location;
-    absolute_to_relative_path(&root_url, table_root)
+    Ok(absolute_to_relative_path(&root_url, table_root))
 }
 
 /// Builds a root manifest, writes it to parquet, reads it back, and returns the entries.
@@ -104,7 +104,7 @@ fn build_and_read_root(
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -124,7 +124,7 @@ fn build_and_read_leaf(
     let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?
         .write(engine)?
         .location;
-    let leaf_path = absolute_to_relative_path(&leaf_url, &table_root)?;
+    let leaf_path = absolute_to_relative_path(&leaf_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &leaf_url, leaf_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;

@@ -1472,10 +1472,7 @@ fn parse_manifest_dv_to_selection_vector(
 /// table root's path prefix, the table root prefix is stripped and the remaining relative
 /// portion is returned. Otherwise the full absolute URL string is returned so it can be
 /// stored as-is and later parsed back by [`parse_or_join_url`].
-pub(crate) fn absolute_to_relative_path(
-    absolute_url: &Url,
-    table_root: &Url,
-) -> DeltaResult<String> {
+pub(crate) fn absolute_to_relative_path(absolute_url: &Url, table_root: &Url) -> String {
     // Scheme, host, or port mismatch means the URL is not under the table root (e.g.
     // cross-bucket or cross-provider). Return the full absolute URL so it can be stored
     // as-is and resolved back via parse_or_join_url.
@@ -1483,16 +1480,16 @@ pub(crate) fn absolute_to_relative_path(
         || absolute_url.host() != table_root.host()
         || absolute_url.port() != table_root.port()
     {
-        return Ok(absolute_url.to_string());
+        return absolute_url.to_string();
     }
 
     let full_path = absolute_url.path();
     let root_path = table_root.path();
 
     match full_path.strip_prefix(root_path) {
-        Some(relative) => Ok(relative.trim_start_matches('/').to_string()),
+        Some(relative) => relative.trim_start_matches('/').to_string(),
         // Same host but path is not under the table root -- return absolute URL.
-        None => Ok(absolute_url.to_string()),
+        None => absolute_url.to_string(),
     }
 }
 
@@ -2298,25 +2295,25 @@ mod tests {
         // Test with memory:// URLs
         let table_root = Url::parse("memory:///").unwrap();
         let absolute_url = Url::parse("memory:///part-content-root.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "part-content-root.parquet");
 
         // Test with s3:// URLs
         let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
         let absolute_url = Url::parse("s3://my-bucket/my-table/data/part-00000.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "data/part-00000.parquet");
 
         // Test with nested paths
         let table_root = Url::parse("s3://bucket/table/").unwrap();
         let absolute_url = Url::parse("s3://bucket/table/year=2023/month=10/part.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "year=2023/month=10/part.parquet");
 
         // Test with file:// URLs
         let table_root = Url::parse("file:///path/to/table/").unwrap();
         let absolute_url = Url::parse("file:///path/to/table/data/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "data/file.parquet");
     }
 
@@ -2325,7 +2322,7 @@ mod tests {
         // Different S3 bucket: must return the full absolute URL, not a truncated path
         let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
         let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "s3://bucket-a/table-a/file.parquet");
     }
 
@@ -2334,7 +2331,7 @@ mod tests {
         // Different scheme (s3 vs gs): must return the full absolute URL
         let table_root = Url::parse("s3://bucket/table/").unwrap();
         let absolute_url = Url::parse("gs://bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "gs://bucket/table/file.parquet");
     }
 
@@ -2343,7 +2340,7 @@ mod tests {
         // Same host, different port: must return full absolute URL
         let table_root = Url::parse("http://localhost:9000/bucket/table/").unwrap();
         let absolute_url = Url::parse("http://localhost:4566/bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "http://localhost:4566/bucket/table/file.parquet");
     }
 
@@ -2352,7 +2349,7 @@ mod tests {
         // Same bucket but path is not under the table root
         let table_root = Url::parse("s3://bucket/table-a/").unwrap();
         let absolute_url = Url::parse("s3://bucket/table-b/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(result, "s3://bucket/table-b/file.parquet");
     }
 
@@ -2362,21 +2359,21 @@ mod tests {
 
         // Relative path round-trips through parse_or_join_url
         let absolute_url = Url::parse("s3://bucket/table/data/file.parquet").unwrap();
-        let relative = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
+        let relative = absolute_to_relative_path(&absolute_url, &table_root);
         assert_eq!(relative, "data/file.parquet");
         let resolved = parse_or_join_url(&relative, &table_root).unwrap();
         assert_eq!(resolved, absolute_url);
 
         // Cross-bucket absolute URL round-trips through parse_or_join_url
         let external_url = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&external_url, &table_root).unwrap();
+        let preserved = absolute_to_relative_path(&external_url, &table_root);
         assert_eq!(preserved, "s3://other-bucket/ext/file.parquet");
         let resolved = parse_or_join_url(&preserved, &table_root).unwrap();
         assert_eq!(resolved, external_url);
 
         // Round-trip via Url::join (as used by content_root.path consumers)
         let cross_bucket = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&cross_bucket, &table_root).unwrap();
+        let preserved = absolute_to_relative_path(&cross_bucket, &table_root);
         let resolved = table_root.join(&preserved).unwrap();
         assert_eq!(resolved, cross_bucket);
     }
@@ -3686,7 +3683,7 @@ mod tests {
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?
             .location;
-        let path_in_log = absolute_to_relative_path(&written_path, table_root_url)?;
+        let path_in_log = absolute_to_relative_path(&written_path, table_root_url);
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &written_path,

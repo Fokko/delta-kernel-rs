@@ -198,12 +198,9 @@ impl ManifestCommitState {
 
         let track_root_removals = !self.root_released;
 
-        let root_manifest_path = root_manifest_url
-            .as_ref()
-            .map(|url| {
-                crate::content_tree::absolute_to_relative_path(url, self.read_snapshot.table_root())
-            })
-            .transpose()?;
+        let root_manifest_path = root_manifest_url.as_ref().map(|url| {
+            crate::content_tree::absolute_to_relative_path(url, self.read_snapshot.table_root())
+        });
 
         let column_mapping_mode = self
             .read_snapshot

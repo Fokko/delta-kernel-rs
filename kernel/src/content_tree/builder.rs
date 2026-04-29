@@ -1096,7 +1096,7 @@ impl ContentTreeNodeBuilder {
         let leaf_metadata = self.build_leaf(engine, snapshot_id, allocator)?;
 
         let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
-        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root)?;
+        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root);
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
         // ParquetObjectReader::with_file_size when reading the leaf manifest back.
         let manifest_file_size = write_result.size_in_bytes as i64;
@@ -2111,7 +2111,7 @@ mod tests {
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
             .location;
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root);
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &root_url,
