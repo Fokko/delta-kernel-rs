@@ -724,36 +724,13 @@ impl<S> Transaction<S> {
                 }
             }
 
-            // Compute the row ID cursor: start from the manifest commit state's cached
-            // cursor if a leaf writer already advanced it, otherwise from the snapshot's
-            // high water mark + 1.
-            let starting_first_row_id = if let Some(Some(cursor)) = self
-                .manifest_commit_state
-                .as_ref()
-                .map(|mc| mc.row_id_cursor)
-            {
-                cursor
-            } else {
-                let hwm =
-                    RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-                hwm.unwrap_or(-1) + 1
-            };
-
-            let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
-            let root_node = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
-
-            // The allocator's cursor is the first *unassigned* row ID, but the high water
-            // mark records the last *assigned* one (i.e. the inclusive upper bound), so we
-            // subtract 1.
-            {
-                let new_hwm = allocator.current() - 1;
-                let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
-                let dm_action: DomainMetadata = rt_dm.try_into()?;
-                let schema = get_log_domain_metadata_schema().clone();
-                let dm_data = dm_action.clone().into_engine_data(schema, engine)?;
-                actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(dm_data)));
-                dm_changes.push(dm_action);
-            }
+            let (root_node, dm_action, dm_data) = self.build_manifest_root_with_row_tracking(
+                engine,
+                &mut metadata_builder,
+                snapshot_id,
+            )?;
+            actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(dm_data)));
+            dm_changes.push(dm_action);
 
             let ContentTreeWriteResult {
                 location: content_metadata_path,
@@ -844,10 +821,12 @@ impl<S> Transaction<S> {
     ///
     /// {
     ///     let mc = txn.with_manifest_commit();
+    ///     let scan = mc.release_root_and_delta_actions()?;
+    ///     // ...process scan...
     ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
     ///     leaf.add_files(engine, metadata)?;
     ///     mc.add_leaf(leaf.finish(engine)?)?;
-    /// }
+    /// } // mc borrow released
     ///
     /// txn.commit(engine)?;
     /// ```
@@ -1121,6 +1100,49 @@ impl<S> Transaction<S> {
                     ca.version < self.read_snapshot.version()
                 });
         can_manifest_commit && has_work_to_do
+    }
+
+    /// Builds the manifest root node with row tracking, returning the root node and the
+    /// row tracking high water mark domain metadata action.
+    ///
+    /// Computes the starting row ID from either the manifest commit state's cached cursor
+    /// (if a leaf writer already advanced it) or the snapshot's high water mark + 1.
+    /// After building, the allocator's final cursor becomes the new high water mark.
+    fn build_manifest_root_with_row_tracking(
+        &self,
+        engine: &dyn Engine,
+        metadata_builder: &mut crate::content_tree::builder::ContentTreeNodeBuilder,
+        snapshot_id: i64,
+    ) -> DeltaResult<(
+        crate::content_tree::ContentTreeNode,
+        DomainMetadata,
+        Box<dyn EngineData>,
+    )> {
+        let starting_first_row_id = if let Some(Some(cursor)) = self
+            .manifest_commit_state
+            .as_ref()
+            .map(|mc| mc.row_id_cursor)
+        {
+            cursor
+        } else {
+            let hwm =
+                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+            hwm.unwrap_or(-1) + 1
+        };
+
+        let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
+        let root_node = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
+
+        // The allocator's cursor is the first *unassigned* row ID, but the high water
+        // mark records the last *assigned* one (i.e. the inclusive upper bound), so we
+        // subtract 1.
+        let new_hwm = allocator.current() - 1;
+        let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
+        let dm_action: DomainMetadata = rt_dm.try_into()?;
+        let schema = get_log_domain_metadata_schema().clone();
+        let dm_data = dm_action.clone().into_engine_data(schema, engine)?;
+
+        Ok((root_node, dm_action, dm_data))
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting

@@ -12,9 +12,12 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::create_table::create_table as kernel_create_table;
-use delta_kernel::transaction::{CommitResult, CreateTable};
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
+
+#[path = "support/manifest_commit_setup.rs"]
+mod manifest_commit_setup;
+use manifest_commit_setup::create_manifest_commit_table;
 use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
@@ -818,29 +821,6 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
 
 // --- Batch commit (content tree / V4 metadata tree) row tracking tests ---
 
-/// Helper to create a table with both metadataTree-experimental and rowTracking enabled,
-/// suitable for batch commit tests.
-fn create_batch_commit_table(
-    table_path: &str,
-    engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<delta_kernel::transaction::Transaction<CreateTable>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("value", DataType::STRING, true),
-    ])?);
-
-    // Row tracking is always required for content trees (metadataTree-experimental).
-    // It's implicitly enabled -- no explicit property needed.
-    let txn = kernel_create_table(table_path, schema, "TestEngine/1.0")
-        .with_table_properties([
-            ("delta.columnMapping.mode", "id"),
-            ("delta.feature.metadataTree-experimental", "supported"),
-        ])
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
-
-    Ok(txn)
-}
-
 /// Write files into a single leaf manifest and add it to the transaction.
 fn write_leaf<S>(
     txn: &mut delta_kernel::transaction::Transaction<S>,
@@ -864,6 +844,77 @@ fn commit_at<S: std::fmt::Debug>(
     let committed = txn.commit(engine)?.unwrap_committed();
     assert_eq!(committed.commit_version(), expected_version);
     Ok(())
+}
+
+/// Collect `(path, baseRowId)` pairs from scan metadata, sorted by baseRowId.
+///
+/// Works for both regular commits (baseRowId in JSON add actions) and batch commits
+/// (first_row_id in the content tree, surfaced as baseRowId in scan metadata).
+fn collect_base_row_ids(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<Vec<(String, i64)>> {
+    use std::sync::LazyLock;
+
+    use delta_kernel::engine_data::{GetData, TypedGetData as _};
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::RowVisitor;
+
+    struct BaseRowIdCollector<'a> {
+        entries: Vec<(String, i64)>,
+        selection_vector: &'a [bool],
+    }
+
+    impl<'a> RowVisitor for BaseRowIdCollector<'a> {
+        fn selected_column_names_and_types(
+            &self,
+        ) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| {
+                    (
+                        vec![
+                            ColumnName::new(["path"]),
+                            ColumnName::new(["fileConstantValues", "baseRowId"]),
+                        ],
+                        vec![DataType::STRING, DataType::LONG],
+                    )
+                });
+            (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+        }
+
+        fn visit<'b>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'b dyn GetData<'b>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                if i < self.selection_vector.len() && !self.selection_vector[i] {
+                    continue;
+                }
+                let path: String = getters[0].get(i, "path")?;
+                let base_row_id: i64 =
+                    getters[1].get(i, "fileConstantValues.baseRowId")?;
+                self.entries.push((path, base_row_id));
+            }
+            Ok(())
+        }
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut all_entries = Vec::new();
+
+    for scan_metadata_result in scan.scan_metadata(engine)? {
+        let scan_metadata = scan_metadata_result?;
+        let mut collector = BaseRowIdCollector {
+            entries: Vec::new(),
+            selection_vector: scan_metadata.scan_files.selection_vector(),
+        };
+        collector.visit_rows_of(scan_metadata.scan_files.data())?;
+        all_entries.extend(collector.entries);
+    }
+
+    all_entries.sort_by_key(|(_, row_id)| *row_id);
+    Ok(all_entries)
 }
 
 /// Verify the row ID high water mark in a batch commit's domain metadata.
@@ -1056,7 +1107,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
 async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1080,10 +1131,14 @@ async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn st
     let table_url = Url::from_directory_path(&table_path).unwrap();
     verify_batch_commit_hwm(&table_url, 0, 59).await?;
 
-    // Verify all files are visible via scan
+    // Verify all files are visible and have correct baseRowId assignments.
+    // Leaf 1: file1 (10 records) -> baseRowId=0, file2 (20 records) -> baseRowId=10
+    // Leaf 2: file3 (30 records) -> baseRowId=30
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let paths = collect_file_paths(snapshot, engine.as_ref())?;
-    assert_eq!(paths.len(), 3, "Should have 3 data files");
+    let base_row_ids = collect_base_row_ids(snapshot, engine.as_ref())?;
+    assert_eq!(base_row_ids.len(), 3, "Should have 3 data files");
+    let row_ids: Vec<i64> = base_row_ids.iter().map(|(_, id)| *id).collect();
+    assert_eq!(row_ids, vec![0, 10, 30]);
 
     Ok(())
 }
@@ -1095,7 +1150,7 @@ async fn test_batch_commit_row_tracking_consecutive_commits(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // First commit: create table with 2 files (10 + 20 = 30 records)
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1143,7 +1198,7 @@ async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn 
 {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1179,7 +1234,7 @@ async fn test_batch_commit_row_tracking_multiple_files_per_leaf(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1209,7 +1264,7 @@ async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // First commit: create the table with some data
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1268,7 +1323,7 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     // Commit 0: 10 + 20 = 30 records -> HWM = 29, Iceberg next-row-id = 30
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
     txn.with_manifest_commit();
     write_leaf(
@@ -1319,10 +1374,13 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     commit_at(txn3, engine.as_ref(), 2)?;
     verify_batch_commit_hwm(&table_url, 2, 59).await?;
 
-    // Verify all 5 files visible
+    // Verify all 5 files have contiguous, non-overlapping baseRowId assignments:
+    // file1(10)=0, file2(20)=10, file3(15)=30, file4(5)=45, file5(10)=50
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let paths = collect_file_paths(snapshot, engine.as_ref())?;
-    assert_eq!(paths.len(), 5, "Should have 5 data files total");
+    let base_row_ids = collect_base_row_ids(snapshot, engine.as_ref())?;
+    assert_eq!(base_row_ids.len(), 5, "Should have 5 data files total");
+    let row_ids: Vec<i64> = base_row_ids.iter().map(|(_, id)| *id).collect();
+    assert_eq!(row_ids, vec![0, 10, 30, 45, 50]);
 
     Ok(())
 }
@@ -1335,7 +1393,7 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let mut txn = create_batch_commit_table(&table_path, engine.as_ref())?;
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
     let schema = txn.add_files_schema();
 
     // Simulate parallel leaf creation: each writer is created, populated, and finished

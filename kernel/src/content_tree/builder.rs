@@ -20,9 +20,12 @@ use crate::content_tree::{
     DELTA_STATS_TIGHT_BOUNDS,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::StructData;
+use crate::expressions::{ArrayData, Expression, StructData, Transform};
 use crate::row_tracking::CursorRowIdAllocator;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+use crate::schema::{
+    ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField,
+    StructType,
+};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
@@ -1476,15 +1479,12 @@ impl ContentTreeNodeBuilder {
     ///
     /// Uses a visitor to read `recordCount` per row, computes sequential `first_row_id` values
     /// via the given `allocator`, then uses `append_columns` + expression evaluator to replace
-    /// `trackingInfo.firstRowId`.
+    /// `tracking.firstRowId`.
     fn assign_first_row_ids_pre_built(
         &mut self,
         engine: &dyn crate::Engine,
         allocator: &mut CursorRowIdAllocator,
     ) -> DeltaResult<()> {
-        use crate::expressions::{ArrayData, Expression};
-        use crate::schema::{ArrayType, StructField, StructType};
-
         if self.pre_built_data.is_empty() {
             return Ok(());
         }
@@ -1497,10 +1497,19 @@ impl ContentTreeNodeBuilder {
             let mut record_counts_visitor = RecordCountVisitor::with_capacity(batch.len());
             record_counts_visitor.visit_rows_of(batch.as_ref())?;
 
-            // Step 2: Compute first_row_id for each row using the allocator
+            // Step 2: Compute first_row_id for each row, preserving existing non-null values.
+            // This mirrors `assign_first_row_ids` which checks `is_none()` before allocating.
             let mut first_row_ids = Vec::with_capacity(record_counts_visitor.record_counts.len());
-            for rc in &record_counts_visitor.record_counts {
-                first_row_ids.push(allocator.reserve_row_ids(*rc));
+            for (rc, existing_id) in record_counts_visitor
+                .record_counts
+                .iter()
+                .zip(record_counts_visitor.first_row_ids.iter())
+            {
+                if let Some(id) = existing_id {
+                    first_row_ids.push(*id);
+                } else {
+                    first_row_ids.push(allocator.reserve_row_ids(*rc));
+                }
             }
 
             // Step 3: Append _first_row_id column to the batch
@@ -1512,32 +1521,30 @@ impl ContentTreeNodeBuilder {
                 ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
             let augmented = batch.append_columns(append_schema, vec![first_row_id_array])?;
 
-            // Step 4: Build expression that replaces trackingInfo.firstRowId with _first_row_id
+            // Step 4: Use a Transform to replace tracking.firstRowId with _first_row_id,
+            // preserving existing non-null values via coalesce, then drop the helper column.
             // Input schema = output_schema + _first_row_id
             let mut input_fields: Vec<StructField> =
                 output_schema.fields().cloned().collect::<Vec<_>>();
             input_fields.push(StructField::nullable("_first_row_id", DataType::LONG));
             let input_schema = Arc::new(StructType::new_unchecked(input_fields));
 
-            let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
-            for field in output_schema.fields() {
-                let expr = if field.name() == "trackingInfo" {
-                    // Rebuild trackingInfo struct, replacing firstRowId with the appended column
-                    Expression::struct_from([
-                        Expression::column(["trackingInfo", "status"]),
-                        Expression::column(["trackingInfo", "snapshotId"]),
-                        Expression::column(["trackingInfo", "sequenceNumber"]),
-                        Expression::column(["trackingInfo", "fileSequenceNumber"]),
-                        Expression::column(["_first_row_id"]),
-                        Expression::column(["trackingInfo", "changesDv"]),
-                    ])
-                } else {
-                    Expression::column([field.name().as_str()])
-                };
-                field_exprs.push(Arc::new(expr));
-            }
-
-            let transform_expr = Expression::struct_from(field_exprs);
+            let transform_expr = Expression::transform(
+                Transform::new_top_level()
+                    .with_replaced_field(
+                        "tracking",
+                        Arc::new(Expression::transform(
+                            Transform::new_nested(["tracking"]).with_replaced_field(
+                                "firstRowId",
+                                Arc::new(Expression::coalesce([
+                                    Expression::column(["tracking", "firstRowId"]),
+                                    Expression::column(["_first_row_id"]),
+                                ])),
+                            ),
+                        )),
+                    )
+                    .with_dropped_field("_first_row_id"),
+            );
             let evaluator = engine.evaluation_handler().new_expression_evaluator(
                 input_schema,
                 Arc::new(transform_expr),
@@ -1571,9 +1578,6 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
-        use crate::expressions::{ArrayData, Expression};
-        use crate::schema::{ArrayType, StructField, StructType};
-
         if engine_data.is_empty() {
             return Ok(());
         }
@@ -1703,16 +1707,19 @@ impl RowVisitor for TransformedAggregateVisitor {
     }
 }
 
-/// Visitor that reads per-row record counts from pre-built EngineData batches.
-/// Used by `assign_first_row_ids_pre_built` to compute sequential first_row_id values.
+/// Visitor that reads per-row record counts and existing `firstRowId` values from pre-built
+/// EngineData batches. Used by `assign_first_row_ids_pre_built` to compute sequential
+/// first_row_id values while preserving any already-assigned IDs.
 struct RecordCountVisitor {
     record_counts: Vec<i64>,
+    first_row_ids: Vec<Option<i64>>,
 }
 
 impl RecordCountVisitor {
     fn with_capacity(cap: usize) -> Self {
         Self {
             record_counts: Vec::with_capacity(cap),
+            first_row_ids: Vec::with_capacity(cap),
         }
     }
 }
@@ -1721,8 +1728,11 @@ impl RowVisitor for RecordCountVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         use crate::schema::column_name;
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![column_name!("recordCount")];
-            let types = vec![DataType::LONG];
+            let names = vec![
+                column_name!("recordCount"),
+                column_name!("tracking.firstRowId"),
+            ];
+            let types = vec![DataType::LONG, DataType::LONG];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
@@ -1732,6 +1742,9 @@ impl RowVisitor for RecordCountVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.record_counts.push(record_count);
+            let first_row_id: Option<i64> =
+                getters[1].get_opt(i, "tracking.firstRowId")?;
+            self.first_row_ids.push(first_row_id);
         }
         Ok(())
     }
