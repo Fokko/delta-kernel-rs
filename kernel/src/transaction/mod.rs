@@ -7,8 +7,6 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
-#[cfg(feature = "iceberg-nativev4")]
-use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
