@@ -17,8 +17,8 @@ use delta_kernel::{DeltaResult, Error, Snapshot};
 
 #[path = "support/manifest_commit_setup.rs"]
 mod manifest_commit_setup;
-use manifest_commit_setup::create_manifest_commit_table;
 use itertools::Itertools;
+use manifest_commit_setup::create_manifest_commit_table;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use test_utils::{
@@ -866,9 +866,7 @@ fn collect_base_row_ids(
     }
 
     impl<'a> RowVisitor for BaseRowIdCollector<'a> {
-        fn selected_column_names_and_types(
-            &self,
-        ) -> (&'static [ColumnName], &'static [DataType]) {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
             static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
                 LazyLock::new(|| {
                     (
@@ -892,8 +890,7 @@ fn collect_base_row_ids(
                     continue;
                 }
                 let path: String = getters[0].get(i, "path")?;
-                let base_row_id: i64 =
-                    getters[1].get(i, "fileConstantValues.baseRowId")?;
+                let base_row_id: i64 = getters[1].get(i, "fileConstantValues.baseRowId")?;
                 self.entries.push((path, base_row_id));
             }
             Ok(())

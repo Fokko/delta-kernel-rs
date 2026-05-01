@@ -1742,8 +1742,7 @@ impl RowVisitor for RecordCountVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.record_counts.push(record_count);
-            let first_row_id: Option<i64> =
-                getters[1].get_opt(i, "tracking.firstRowId")?;
+            let first_row_id: Option<i64> = getters[1].get_opt(i, "tracking.firstRowId")?;
             self.first_row_ids.push(first_row_id);
         }
         Ok(())

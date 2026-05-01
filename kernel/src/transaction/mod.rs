@@ -1244,8 +1244,7 @@ impl<S> Transaction<S> {
         {
             cursor
         } else {
-            let hwm =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+            let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
             hwm.unwrap_or(-1) + 1
         };
 
