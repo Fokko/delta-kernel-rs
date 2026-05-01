@@ -93,7 +93,7 @@ fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -134,7 +134,7 @@ fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -176,7 +176,7 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -261,7 +261,7 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -313,7 +313,7 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(&engine)?
         .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root)?;
+    let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
