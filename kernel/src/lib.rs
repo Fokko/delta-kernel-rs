@@ -167,6 +167,9 @@ pub(crate) mod log_segment_files;
 pub mod history_manager;
 
 pub(crate) mod content_tree;
+#[cfg(feature = "iceberg-nativev4")]
+#[allow(dead_code)] // TODO: remove once wired into the commit path
+pub(crate) mod iceberg_metadata;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 // Export metadata types needed for testing

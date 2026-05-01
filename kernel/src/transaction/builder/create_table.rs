@@ -36,9 +36,10 @@ use crate::table_features::{
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL,
+    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CreateTable, Transaction};
@@ -65,6 +66,10 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::VacuumProtocolCheck,
     // CatalogManaged enables catalog-managed table support
     TableFeature::CatalogManaged,
+    // IcebergNativeV4Experimental enables icebergNativeV4 support
+    TableFeature::IcebergNativeV4Experimental,
+    // RowTracking enables row tracking (required by icebergNativeV4)
+    TableFeature::RowTracking,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -102,6 +107,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     ENABLE_CHANGE_DATA_FEED,
     ENABLE_TYPE_WIDENING,
     APPEND_ONLY,
+    // IcebergNativeV4 enablement property
+    ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL,
     ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
@@ -504,6 +511,31 @@ fn maybe_enable_ict_for_catalog_managed(
     Ok(())
 }
 
+/// Conditionally enables the icebergNativeV4 feature during table creation.
+///
+/// When `delta.enableIcebergNativeV4Experimental` is set to `"true"`, adds the
+/// `IcebergNativeV4Experimental` feature to the protocol. RowTracking is auto-enabled
+/// via `maybe_auto_enable_property_driven_features` when `delta.enableRowTracking` is set.
+fn maybe_enable_iceberg_native_v4(validated: &mut ValidatedTableProperties) {
+    let enabled = validated
+        .properties
+        .get(ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL)
+        .is_some_and(|v| v == "true");
+    if enabled {
+        add_feature_to_lists(
+            TableFeature::IcebergNativeV4Experimental,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        // RowTracking is a required dependency of icebergNativeV4
+        add_feature_to_lists(
+            TableFeature::RowTracking,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -833,6 +865,9 @@ impl CreateTableTransactionBuilder {
 
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
+
+        // Auto-enable icebergNativeV4 feature if property is set
+        maybe_enable_iceberg_native_v4(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =

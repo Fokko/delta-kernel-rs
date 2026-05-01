@@ -1688,7 +1688,7 @@ impl From<TrackingStatus> for Scalar {
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct DvInfo {
     /// Path to location that DV is stored in.
-    #[field_id = 152]
+    #[field_id = 155]
     pub(crate) location: String,
 
     /// The offset in the file where the content starts.
@@ -1700,7 +1700,7 @@ pub(crate) struct DvInfo {
     #[field_id = 145]
     pub(crate) size_in_bytes: i64,
 
-    #[field_id = 154]
+    #[field_id = 156]
     pub(crate) cardinality: i64,
 }
 
@@ -1830,7 +1830,7 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) dv_info: Option<DvInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
-    #[field_id = 149]
+    #[field_id = 141]
     pub(crate) partition_spec_id: i64,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
@@ -3123,10 +3123,10 @@ mod tests {
 
         // Verify DvInfo field IDs
         let dv_info_schema = DvInfo::to_schema();
-        assert_field_id(&dv_info_schema, "location", 152);
+        assert_field_id(&dv_info_schema, "location", 155);
         assert_field_id(&dv_info_schema, "offset", 144);
         assert_field_id(&dv_info_schema, "sizeInBytes", 145);
-        assert_field_id(&dv_info_schema, "cardinality", 154);
+        assert_field_id(&dv_info_schema, "cardinality", 156);
 
         // Verify top-level ContentTreeNodeEntry field IDs
         let metadata_entry_schema = ContentTreeNodeEntry::to_schema();
@@ -3135,7 +3135,7 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
         assert_field_id(&metadata_entry_schema, "tracking", 147);
         assert_field_id(&metadata_entry_schema, "dvInfo", 148);
-        assert_field_id(&metadata_entry_schema, "partitionSpecId", 149);
+        assert_field_id(&metadata_entry_schema, "partitionSpecId", 141);
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
         assert_field_id(&metadata_entry_schema, "fileSizeInBytes", 104);
