@@ -1,4 +1,6 @@
 //! Shared helpers for manifest-commit integration tests (metadata tree).
+// Each test binary includes this file via `#[path]` but only uses a subset of helpers.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
