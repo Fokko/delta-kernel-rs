@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 
 use super::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestStats, TrackingInfo,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestInfo, TrackingInfo,
     TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -62,7 +62,7 @@ fn visit_metadata_entry_at<'a>(
     // 15: record_count
     // 16: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 17-23: manifest_stats fields (7 fields)
+    // 17-23: manifest_info fields (7 fields)
     // 24: key_metadata
     // (split_offsets excluded - array type not supported by GetData)
     // (equality_ids excluded - array type not supported by GetData)
@@ -151,23 +151,23 @@ fn visit_metadata_entry_at<'a>(
 
     // content_stats has no fields, so no getters
 
-    // Extract manifest_stats fields
+    // Extract manifest_info fields
     let ms_added_files_count: Option<i64> =
-        getters[17].get_opt(row_index, "manifest_stats.added_files_count")?;
+        getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
     let ms_existing_files_count: Option<i64> =
-        getters[18].get_opt(row_index, "manifest_stats.existing_files_count")?;
+        getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
     let ms_deletes_files_count: Option<i64> =
-        getters[19].get_opt(row_index, "manifest_stats.deletes_files_count")?;
+        getters[19].get_opt(row_index, "manifest_info.deletes_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_stats.added_rows_count")?;
+        getters[20].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_stats.existing_rows_count")?;
+        getters[21].get_opt(row_index, "manifest_info.existing_rows_count")?;
     let ms_delete_rows_count: Option<i64> =
-        getters[22].get_opt(row_index, "manifest_stats.delete_rows_count")?;
+        getters[22].get_opt(row_index, "manifest_info.delete_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[23].get_opt(row_index, "manifest_stats.min_sequence_number")?;
+        getters[23].get_opt(row_index, "manifest_info.min_sequence_number")?;
 
-    let manifest_stats = ms_added_files_count.map(|added_files_count| ManifestStats {
+    let manifest_info = ms_added_files_count.map(|added_files_count| ManifestInfo {
         added_files_count,
         existing_files_count: ms_existing_files_count.unwrap_or(0),
         deletes_files_count: ms_deletes_files_count.unwrap_or(0),
@@ -198,7 +198,7 @@ fn visit_metadata_entry_at<'a>(
         record_count,
         file_size_in_bytes,
         content_stats: None, // Requires table schema to read - not included in base schema
-        manifest_stats,
+        manifest_info,
         key_metadata: key_metadata_bytes,
         split_offsets: None, // Array type not supported by GetData
         equality_ids: None,  // Array type not supported by GetData

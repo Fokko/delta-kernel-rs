@@ -12,7 +12,7 @@ use crate::content_tree::stats::{
 };
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
-use crate::content_tree::ManifestStats;
+use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
     DataContentType, DvInfo, TrackingInfo, TrackingStatus, DELTA_STATS_MAX_VALUES,
@@ -175,7 +175,7 @@ struct DvCache {
     dirty: bool,
 
     /// Total number of entries in the manifest (for bounds checking)
-    /// Cached from manifest_stats to avoid O(n) scans
+    /// Cached from manifest_info to avoid O(n) scans
     total_entry_count: i64,
 }
 
@@ -408,9 +408,9 @@ impl ContentTreeNodeBuilder {
 
                 // Update tracking status based on DV cardinality
                 // If all active entries are deleted, mark manifest as Deleted
-                if let Some(ref manifest_stats) = entry.manifest_stats {
+                if let Some(ref manifest_info) = entry.manifest_info {
                     let active_entry_count =
-                        manifest_stats.added_files_count + manifest_stats.existing_files_count;
+                        manifest_info.added_files_count + manifest_info.existing_files_count;
                     let cardinality = manifest_dv.len() as i64;
 
                     if cardinality == active_entry_count {
@@ -739,7 +739,7 @@ impl ContentTreeNodeBuilder {
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestStats" => Expression::null_literal(field.data_type().clone()),
+                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
                 "referencedFile" => Expression::null_literal(DataType::STRING),
                 "manifestDv" => Expression::null_literal(DataType::BINARY),
                 _ => Expression::null_literal(field.data_type().clone()),
@@ -817,11 +817,11 @@ impl ContentTreeNodeBuilder {
                 | DataContentType::CombinedManifest
         ) {
             if let Some(ref location) = entry.location {
-                // Get total entry count from manifest_stats for bounds checking
-                let total_entry_count = if let Some(ref manifest_stats) = entry.manifest_stats {
-                    manifest_stats.added_files_count
-                        + manifest_stats.existing_files_count
-                        + manifest_stats.deletes_files_count
+                // Get total entry count from manifest_info for bounds checking
+                let total_entry_count = if let Some(ref manifest_info) = entry.manifest_info {
+                    manifest_info.added_files_count
+                        + manifest_info.existing_files_count
+                        + manifest_info.deletes_files_count
                 } else {
                     0
                 };
@@ -998,7 +998,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of
+    /// * `Err` if the leaf manifest is not found, missing manifest_info, any index is out of
     ///   bounds, or serialization fails
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
@@ -1138,7 +1138,7 @@ impl ContentTreeNodeBuilder {
             min_sequence_number = 0;
         }
 
-        let manifest_stats = Some(crate::content_tree::ManifestStats {
+        let manifest_info = Some(crate::content_tree::ManifestInfo {
             added_files_count,
             existing_files_count,
             deletes_files_count,
@@ -1172,7 +1172,7 @@ impl ContentTreeNodeBuilder {
                 .record_count(record_count)
                 .file_size_in_bytes(manifest_file_size)
                 .content_stats_opt(content_stats)
-                .manifest_stats_opt(manifest_stats)
+                .manifest_info_opt(manifest_info)
                 .build(),
         )
     }
@@ -1382,7 +1382,7 @@ impl ContentTreeNodeBuilder {
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestStats" => Expression::null_literal(field.data_type().clone()),
+                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
                 "referencedFile" => Expression::null_literal(DataType::STRING),
                 "manifestDv" => Expression::null_literal(DataType::BINARY),
                 _ => Expression::null_literal(field.data_type().clone()),
@@ -3189,7 +3189,7 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Create a manifest entry with manifest_stats showing:
+        // Create a manifest entry with manifest_info showing:
         // - 2 added files (indices 0, 1)
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
@@ -3199,7 +3199,7 @@ mod tests {
             .with_tracking(1, 1, 1)
             .record_count(5) // Total entries in the leaf
             .file_size_in_bytes(2048)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 2,
                 existing_files_count: 1,
                 deletes_files_count: 2, // 2 entries are already deleted

@@ -1556,14 +1556,14 @@ pub(crate) fn metadata_entry_to_scalars(
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "manifestStats" => match &entry.manifest_stats {
+            "manifestInfo" => match &entry.manifest_info {
                 Some(ms) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
                             st.fields().cloned().collect::<Vec<_>>()
                         } else {
                             return Err(crate::Error::generic(
-                                "manifestStats field should be a struct",
+                                "manifestInfo field should be a struct",
                             ));
                         };
                     let values = vec![
@@ -1763,7 +1763,7 @@ impl From<TrackingInfo> for Scalar {
 }
 
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct ManifestStats {
+pub(crate) struct ManifestInfo {
     #[field_id = 504]
     pub(crate) added_files_count: i64,
     #[field_id = 505]
@@ -1782,12 +1782,12 @@ pub(crate) struct ManifestStats {
     pub(crate) min_sequence_number: i64,
 }
 
-impl From<ManifestStats> for Scalar {
-    fn from(value: ManifestStats) -> Self {
+impl From<ManifestInfo> for Scalar {
+    fn from(value: ManifestInfo) -> Self {
         use crate::expressions::StructData;
         use crate::schema::ToSchema;
 
-        let fields = ManifestStats::to_schema().into_fields().collect();
+        let fields = ManifestInfo::to_schema().into_fields().collect();
         let values = vec![
             value.added_files_count.into(),
             value.existing_files_count.into(),
@@ -1852,7 +1852,7 @@ pub(super) struct ContentTreeNodeEntry {
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
     #[field_id = 150]
-    pub(crate) manifest_stats: Option<ManifestStats>,
+    pub(crate) manifest_info: Option<ManifestInfo>,
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete
@@ -1911,7 +1911,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     record_count: i64,
     file_size_in_bytes: Option<i64>,
     content_stats: Option<StructData>,
-    manifest_stats: Option<ManifestStats>,
+    manifest_info: Option<ManifestInfo>,
     manifest_dv: Option<Bytes>,
     key_metadata: Option<Bytes>,
     split_offsets: Option<Vec<i64>>,
@@ -1941,7 +1941,7 @@ impl ContentTreeNodeEntryBuilder {
             record_count: 0,
             file_size_in_bytes: None,
             content_stats: None,
-            manifest_stats: None,
+            manifest_info: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2005,8 +2005,8 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    pub(crate) fn manifest_stats_opt(mut self, manifest_stats: Option<ManifestStats>) -> Self {
-        self.manifest_stats = manifest_stats;
+    pub(crate) fn manifest_info_opt(mut self, manifest_info: Option<ManifestInfo>) -> Self {
+        self.manifest_info = manifest_info;
         self
     }
 
@@ -2041,8 +2041,8 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn manifest_stats(mut self, manifest_stats: ManifestStats) -> Self {
-        self.manifest_stats = Some(manifest_stats);
+    pub(crate) fn manifest_info(mut self, manifest_info: ManifestInfo) -> Self {
+        self.manifest_info = Some(manifest_info);
         self
     }
 
@@ -2065,7 +2065,7 @@ impl ContentTreeNodeEntryBuilder {
             record_count: self.record_count,
             file_size_in_bytes: self.file_size_in_bytes,
             content_stats: self.content_stats,
-            manifest_stats: self.manifest_stats,
+            manifest_info: self.manifest_info,
             manifest_dv: self.manifest_dv,
             key_metadata: self.key_metadata,
             split_offsets: self.split_offsets,
@@ -2382,7 +2382,7 @@ mod tests {
 
         // Schema should have all the top-level fields (excluding content_stats)
         // Fields: contentType, location, fileFormat, tracking, dvInfo, partitionSpecId,
-        // sortOrderId, recordCount, fileSizeInBytes, manifestStats, keyMetadata,
+        // sortOrderId, recordCount, fileSizeInBytes, manifestInfo, keyMetadata,
         // splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
         assert_eq!(schema.fields().len(), 14);
 
@@ -2981,40 +2981,40 @@ mod tests {
             "file_size_in_bytes mismatch"
         );
 
-        // Compare manifest_stats
-        match (&expected.manifest_stats, &actual.manifest_stats) {
+        // Compare manifest_info
+        match (&expected.manifest_info, &actual.manifest_info) {
             (Some(exp_ms), Some(act_ms)) => {
                 assert_eq!(
                     exp_ms.added_files_count, act_ms.added_files_count,
-                    "manifest_stats.added_files_count mismatch"
+                    "manifest_info.added_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_files_count, act_ms.existing_files_count,
-                    "manifest_stats.existing_files_count mismatch"
+                    "manifest_info.existing_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.deletes_files_count, act_ms.deletes_files_count,
-                    "manifest_stats.deletes_files_count mismatch"
+                    "manifest_info.deletes_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.added_rows_count, act_ms.added_rows_count,
-                    "manifest_stats.added_rows_count mismatch"
+                    "manifest_info.added_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_rows_count, act_ms.existing_rows_count,
-                    "manifest_stats.existing_rows_count mismatch"
+                    "manifest_info.existing_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.delete_rows_count, act_ms.delete_rows_count,
-                    "manifest_stats.delete_rows_count mismatch"
+                    "manifest_info.delete_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.min_sequence_number, act_ms.min_sequence_number,
-                    "manifest_stats.min_sequence_number mismatch"
+                    "manifest_info.min_sequence_number mismatch"
                 );
             }
             (None, None) => {}
-            _ => panic!("manifest_stats presence mismatch"),
+            _ => panic!("manifest_info presence mismatch"),
         }
 
         assert_eq!(
@@ -3107,15 +3107,15 @@ mod tests {
         // changesDv: #[field_id = 153]
         assert_field_id(&tracking_schema, "changesDv", 153);
 
-        // Verify ManifestStats field IDs
-        let manifest_stats_schema = ManifestStats::to_schema();
-        assert_field_id(&manifest_stats_schema, "addedFilesCount", 504);
-        assert_field_id(&manifest_stats_schema, "existingFilesCount", 505);
-        assert_field_id(&manifest_stats_schema, "deletesFilesCount", 506);
-        assert_field_id(&manifest_stats_schema, "addedRowsCount", 512);
-        assert_field_id(&manifest_stats_schema, "existingRowsCount", 513);
-        assert_field_id(&manifest_stats_schema, "deleteRowsCount", 514);
-        assert_field_id(&manifest_stats_schema, "minSequenceNumber", 516);
+        // Verify ManifestInfo field IDs
+        let manifest_info_schema = ManifestInfo::to_schema();
+        assert_field_id(&manifest_info_schema, "addedFilesCount", 504);
+        assert_field_id(&manifest_info_schema, "existingFilesCount", 505);
+        assert_field_id(&manifest_info_schema, "deletesFilesCount", 506);
+        assert_field_id(&manifest_info_schema, "addedRowsCount", 512);
+        assert_field_id(&manifest_info_schema, "existingRowsCount", 513);
+        assert_field_id(&manifest_info_schema, "deleteRowsCount", 514);
+        assert_field_id(&manifest_info_schema, "minSequenceNumber", 516);
 
         // Verify DvInfo field IDs
         let dv_info_schema = DvInfo::to_schema();
@@ -3135,7 +3135,7 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
         assert_field_id(&metadata_entry_schema, "fileSizeInBytes", 104);
-        assert_field_id(&metadata_entry_schema, "manifestStats", 150);
+        assert_field_id(&metadata_entry_schema, "manifestInfo", 150);
         assert_field_id(&metadata_entry_schema, "manifestDv", 151);
 
         // Verify content_stats field_id in to_schema_with_content_stats
@@ -3260,7 +3260,7 @@ mod tests {
 
     #[ignore] // DataManifest is not supported
     #[test]
-    fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
+    fn test_roundtrip_metadata_entry_with_manifest_info() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -3280,7 +3280,7 @@ mod tests {
             .sort_order_id(2)
             .record_count(100)
             .file_size_in_bytes(10240)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 10,
                 deletes_files_count: 2,
@@ -3406,7 +3406,7 @@ mod tests {
             .sort_order_id(2)
             .record_count(100)
             .file_size_in_bytes(10240)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 10,
                 deletes_files_count: 2,
@@ -3590,7 +3590,7 @@ mod tests {
         assert!(ti.first_row_id.is_none());
         assert!(ti.changes_dv.is_none());
         assert!(actual.manifest_dv.is_none());
-        assert!(actual.manifest_stats.is_none());
+        assert!(actual.manifest_info.is_none());
 
         Ok(())
     }
@@ -4131,7 +4131,7 @@ mod tests {
             })
             .record_count(100)
             .file_size_in_bytes(1024)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 10,
                 existing_files_count: 90,
                 deletes_files_count: 0,
@@ -4153,7 +4153,7 @@ mod tests {
             })
             .record_count(10)
             .file_size_in_bytes(512)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 5,
                 deletes_files_count: 0,
@@ -4214,7 +4214,7 @@ mod tests {
                 })
                 .record_count(100)
                 .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
+                .manifest_info(ManifestInfo {
                     added_files_count: 10,
                     existing_files_count: 90,
                     deletes_files_count: 0,
@@ -4387,7 +4387,7 @@ mod tests {
                 })
                 .record_count(100)
                 .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
+                .manifest_info(ManifestInfo {
                     added_files_count: 10,
                     existing_files_count: 90,
                     deletes_files_count: 0,
@@ -4410,7 +4410,7 @@ mod tests {
                 })
                 .record_count(100)
                 .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
+                .manifest_info(ManifestInfo {
                     added_files_count: 10,
                     existing_files_count: 90,
                     deletes_files_count: 0,
