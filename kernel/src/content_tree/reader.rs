@@ -144,8 +144,8 @@ fn visit_metadata_entry_at<'a>(
         .transpose()?;
 
     // Extract scalar fields
-    let partition_spec_id: i64 = getters[13].get(row_index, "partition_spec_id")?;
-    let sort_order_id: Option<i64> = getters[14].get_opt(row_index, "sort_order_id")?;
+    let partition_spec_id: i32 = getters[13].get(row_index, "partition_spec_id")?;
+    let sort_order_id: Option<i32> = getters[14].get_opt(row_index, "sort_order_id")?;
     let record_count: i64 = getters[15].get(row_index, "record_count")?;
     let file_size_in_bytes: Option<i64> = getters[16].get_opt(row_index, "file_size_in_bytes")?;
 

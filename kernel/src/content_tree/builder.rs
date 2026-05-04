@@ -734,8 +734,8 @@ impl ContentTreeNodeBuilder {
                     ])
                 }
                 "dvInfo" => Expression::null_literal(field.data_type().clone()),
-                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
-                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "partitionSpecId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
@@ -1377,8 +1377,8 @@ impl ContentTreeNodeBuilder {
                         Expression::null_literal(field.data_type().clone())
                     }
                 }
-                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
-                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "partitionSpecId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),

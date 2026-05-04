@@ -1827,11 +1827,11 @@ pub(super) struct ContentTreeNodeEntry {
 
     /// ID of partition spec used to write manifest or data/delete files.
     #[field_id = 141]
-    pub(crate) partition_spec_id: i64,
+    pub(crate) partition_spec_id: i32,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
     #[field_id = 140]
-    pub(crate) sort_order_id: Option<i64>,
+    pub(crate) sort_order_id: Option<i32>,
 
     /// Number of records in this file, or the cardinality of a deletion vector
     #[field_id = 103]
@@ -1906,8 +1906,8 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     file_format: DataFileFormat,
     tracking: TrackingInfo,
     dv_info: Option<DvInfo>,
-    partition_spec_id: i64,
-    sort_order_id: Option<i64>,
+    partition_spec_id: i32,
+    sort_order_id: Option<i32>,
     record_count: i64,
     file_size_in_bytes: Option<i64>,
     content_stats: Option<StructData>,
@@ -2023,13 +2023,13 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn partition_spec_id(mut self, partition_spec_id: i64) -> Self {
+    pub(crate) fn partition_spec_id(mut self, partition_spec_id: i32) -> Self {
         self.partition_spec_id = partition_spec_id;
         self
     }
 
     #[allow(dead_code)]
-    pub(crate) fn sort_order_id(mut self, sort_order_id: i64) -> Self {
+    pub(crate) fn sort_order_id(mut self, sort_order_id: i32) -> Self {
         self.sort_order_id = Some(sort_order_id);
         self
     }
@@ -3151,6 +3151,36 @@ mod tests {
     }
 
     #[test]
+    fn test_entry_integer_field_types_match_iceberg() {
+        use crate::schema::ToSchema;
+
+        let schema = ContentTreeNodeEntry::to_schema();
+
+        assert_eq!(
+            schema.field("partitionSpecId").unwrap().data_type(),
+            &DataType::INTEGER,
+            "partition_spec_id (141) must be INTEGER for Iceberg compatibility"
+        );
+        assert_eq!(
+            schema.field("sortOrderId").unwrap().data_type(),
+            &DataType::Primitive(crate::schema::PrimitiveType::Integer),
+            "sort_order_id (140) must be INTEGER for Iceberg compatibility"
+        );
+
+        // Verify Long fields are still Long
+        assert_eq!(
+            schema.field("recordCount").unwrap().data_type(),
+            &DataType::LONG,
+            "record_count (103) must be LONG"
+        );
+        assert_eq!(
+            schema.field("fileSizeInBytes").unwrap().data_type(),
+            &DataType::LONG,
+            "file_size_in_bytes (104) must be LONG"
+        );
+    }
+
+    #[test]
     fn test_field_ids_in_metadata_entry_schema() -> DeltaResult<()> {
         use crate::schema::{ColumnMetadataKey, MetadataValue};
 
@@ -3486,8 +3516,8 @@ mod tests {
                         first_row_id: Some((i * 1000) as i64),
                         changes_dv: None,
                     })
-                    .partition_spec_id(i as i64)
-                    .sort_order_id(i as i64)
+                    .partition_spec_id(i as i32)
+                    .sort_order_id(i as i32)
                     .record_count((i * 10) as i64)
                     .file_size_in_bytes((i * 512) as i64)
                     .build()
