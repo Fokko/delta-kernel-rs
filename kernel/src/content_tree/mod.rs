@@ -1697,12 +1697,14 @@ pub(crate) struct DvInfo {
     #[field_id = 145]
     pub(crate) size_in_bytes: i64,
 
+    /// Number of set bits (deleted rows) in the deletion vector.
     #[field_id = 156]
     pub(crate) cardinality: i64,
 }
 
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub struct TrackingInfo {
+    /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
     pub(crate) status: TrackingStatus,
 
@@ -1765,20 +1767,27 @@ impl From<TrackingInfo> for Scalar {
 
 #[derive(Debug, Clone, Default, PartialEq, ToSchema, IntoEngineData)]
 pub(crate) struct ManifestInfo {
+    /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
     pub(crate) added_files_count: i64,
+    /// Number of entries with EXISTING status in the manifest.
     #[field_id = 505]
     pub(crate) existing_files_count: i64,
+    /// Number of entries with DELETED status in the manifest.
     #[field_id = 506]
     pub(crate) deletes_files_count: i64,
 
+    /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
     pub(crate) added_rows_count: i64,
+    /// Total row count across all EXISTING entries in the manifest.
     #[field_id = 513]
     pub(crate) existing_rows_count: i64,
+    /// Total row count across all DELETED entries in the manifest.
     #[field_id = 514]
     pub(crate) delete_rows_count: i64,
 
+    /// Minimum data sequence number of all entries in the manifest.
     #[field_id = 516]
     pub(crate) min_sequence_number: i64,
 
