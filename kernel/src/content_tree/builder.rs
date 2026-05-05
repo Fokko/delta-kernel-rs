@@ -1952,8 +1952,8 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
                     self.selection_vector[i] = true;
                 }
             } else {
-                // Remove row: stays false in selection_vector by initialization; insert key to
-                // suppress the matching content root entry.
+                // Remove row: never emitted as a content root entry.
+                self.selection_vector[i] = false;
                 let rem_path: Option<String> = getters[Self::REM_PATH].get_opt(i, "remove.path")?;
                 let Some(path) = rem_path else { continue };
                 let dv_loc = Self::dv_location(i, getters, Self::REM_DV_ST, Self::REM_DV_PATH)?;
