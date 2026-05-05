@@ -21,7 +21,7 @@ use crate::content_tree::{
     DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS,
 };
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
 use crate::log_replay::{ActionsBatch, FileActionKey};
 use crate::schema::{
@@ -2002,7 +2002,7 @@ pub(crate) struct ContentRootRebuildProcessor {
     log_action_keys: HashSet<FileActionKey>,
     leaf_removes: Vec<LeafManifestIndex>,
     /// Physical table schema; passed to `LogBatchStatsVisitor` for per-row stats parsing.
-    table_schema: crate::schema::StructType,
+    table_schema: StructType,
     /// Type of the `content_stats` column; used to build null scalars for unselected rows.
     content_stats_type: DataType,
     /// Pre-built evaluator: raw log batch + `_dv_*` + `_stats_*` columns → ContentTreeNodeEntry
@@ -2151,7 +2151,8 @@ impl ContentRootRebuildProcessor {
         stats_visitor.visit_rows_of(batch.actions.as_ref())?;
 
         // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
-        let augmented_with_dv = batch.actions.append_columns(
+        let inner_actions = batch.actions;
+        let augmented_with_dv = inner_actions.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![
                 ArrayData::try_new(
@@ -2202,10 +2203,10 @@ impl ContentRootRebuildProcessor {
     /// root all predate the current commit by definition.
     pub(crate) fn process_root_batch(
         &mut self,
-        batch: ActionsBatch,
+        batch: FilteredEngineData,
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
         let mut visitor = ContentTreeNodeEntryVisitor::default();
-        visitor.visit_rows_of(batch.actions.as_ref())?;
+        FilteredRowVisitor::visit_rows_of(&mut visitor, &batch)?;
 
         let mut entries = Vec::new();
         for entry in visitor.entries {

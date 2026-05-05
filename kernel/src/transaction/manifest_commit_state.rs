@@ -11,10 +11,9 @@ use crate::content_tree::builder::{
 use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
 use crate::log_reader::commit::CommitReader;
-use crate::log_replay::ActionsBatch;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, FileMeta, Version};
+use crate::{DeltaResult, Engine, FileMeta, FilteredEngineData, Version};
 
 /// Commit mode that uses a caller-supplied root manifest instead of having kernel build one.
 ///
@@ -117,7 +116,9 @@ fn replay_content_root(
     )?;
     let mut entries = Vec::new();
     for batch in content_root_iter {
-        entries.extend(processor.process_root_batch(ActionsBatch::new(batch?, false))?);
+        entries.extend(
+            processor.process_root_batch(FilteredEngineData::with_all_rows_selected(batch?))?,
+        );
     }
     Ok(entries)
 }

@@ -7,7 +7,9 @@ use super::{
     ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestInfo, TrackingInfo,
     TrackingStatus,
 };
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{
+    FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor, TypedGetData as _,
+};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, Error};
 
@@ -36,10 +38,25 @@ impl RowVisitor for ContentTreeNodeEntryVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // The number of getters should match the number of leaf fields in ContentTreeNodeEntry
-        // schema We'll validate this implicitly by accessing each field
-
         for i in 0..row_count {
+            let entry = visit_metadata_entry_at(i, getters)?;
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+}
+
+impl FilteredRowVisitor for ContentTreeNodeEntryVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        RowVisitor::selected_column_names_and_types(self)
+    }
+
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        for i in rows {
             let entry = visit_metadata_entry_at(i, getters)?;
             self.entries.push(entry);
         }
