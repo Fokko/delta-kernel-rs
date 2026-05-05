@@ -319,7 +319,12 @@ impl BulkManifestStreamProcessor {
 
         // Create manifest DV applicator
         let manifest_dv_applicator = super::ManifestDvApplicator::new(
-            manifest_ref.data_manifest.manifest.manifest_dv.as_ref(),
+            manifest_ref
+                .data_manifest
+                .manifest
+                .manifest_info
+                .as_ref()
+                .and_then(|mi| mi.dv.as_ref()),
         )?;
 
         // Build only the per-manifest add evaluators (embed manifest path as a literal).

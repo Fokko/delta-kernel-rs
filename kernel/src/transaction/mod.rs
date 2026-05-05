@@ -3257,7 +3257,11 @@ mod tests {
             .iter()
             .find(|entry| {
                 entry.content_type == DataContentType::CombinedManifest
-                    && entry.manifest_dv.is_some()
+                    && entry
+                        .manifest_info
+                        .as_ref()
+                        .and_then(|mi| mi.dv.as_ref())
+                        .is_some()
             })
             .ok_or_else(|| {
                 Error::generic(
@@ -3271,8 +3275,9 @@ mod tests {
             .ok_or_else(|| Error::generic("CombinedManifest has no location"))?;
 
         let manifest_dv_bytes = manifest_with_dv
-            .manifest_dv
+            .manifest_info
             .as_ref()
+            .and_then(|mi| mi.dv.as_ref())
             .ok_or_else(|| Error::generic("CombinedManifest has no manifest_dv"))?;
 
         if manifest_dv_bytes.len() < 4 {

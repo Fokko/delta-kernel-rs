@@ -402,20 +402,29 @@ impl ContentTreeNodeBuilder {
                 continue;
             }
 
-            // Serialize manifest_dv if it was deserialized
+            // Serialize manifest DV into manifest_info.dv
             if let Some(ref manifest_dv) = cache.manifest_dv {
-                entry.manifest_dv = Some(serialize_roaring_treemap(manifest_dv)?);
+                let dv_bytes = serialize_roaring_treemap(manifest_dv)?;
+                let cardinality: i64 = manifest_dv.len().try_into().map_err(|_| {
+                    crate::Error::generic(format!(
+                        "manifest DV cardinality {} exceeds i64::MAX",
+                        manifest_dv.len()
+                    ))
+                })?;
 
-                // Update tracking status based on DV cardinality
+                let manifest_info = entry.manifest_info.as_mut().ok_or_else(|| {
+                    crate::Error::generic(
+                        "manifest entry has a dirty DV cache but no manifest_info",
+                    )
+                })?;
+                manifest_info.dv = Some(dv_bytes);
+                manifest_info.dv_cardinality = Some(cardinality);
+
                 // If all active entries are deleted, mark manifest as Deleted
-                if let Some(ref manifest_info) = entry.manifest_info {
-                    let active_entry_count =
-                        manifest_info.added_files_count + manifest_info.existing_files_count;
-                    let cardinality = manifest_dv.len() as i64;
-
-                    if cardinality == active_entry_count {
-                        entry.tracking.status = TrackingStatus::Deleted;
-                    }
+                let active_entry_count =
+                    manifest_info.added_files_count + manifest_info.existing_files_count;
+                if cardinality == active_entry_count {
+                    entry.tracking.status = TrackingStatus::Deleted;
                 }
             }
 
@@ -740,8 +749,6 @@ impl ContentTreeNodeBuilder {
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
                 "manifestInfo" => Expression::null_literal(field.data_type().clone()),
-                "referencedFile" => Expression::null_literal(DataType::STRING),
-                "manifestDv" => Expression::null_literal(DataType::BINARY),
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             field_exprs.push(Arc::new(expr));
@@ -826,9 +833,10 @@ impl ContentTreeNodeBuilder {
                     0
                 };
 
-                // Keep serialized manifest_dv bytes in entry, clone into cache
+                // Read DV bytes from manifest_info.dv, clone into cache
                 // Bytes is Rc-based, so clone is cheap (just increments refcount)
-                let cache = DvCache::new(entry.manifest_dv.clone(), total_entry_count);
+                let dv_bytes = entry.manifest_info.as_ref().and_then(|mi| mi.dv.clone());
+                let cache = DvCache::new(dv_bytes, total_entry_count);
                 self.dv_cache.insert(location.clone(), cache);
 
                 // Always clear changes_dv from entries (starts empty for new commit)
@@ -1146,6 +1154,7 @@ impl ContentTreeNodeBuilder {
             existing_rows_count,
             delete_rows_count,
             min_sequence_number,
+            ..Default::default()
         });
 
         // Aggregate content_stats from all pending entries
@@ -1383,8 +1392,6 @@ impl ContentTreeNodeBuilder {
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
                 "manifestInfo" => Expression::null_literal(field.data_type().clone()),
-                "referencedFile" => Expression::null_literal(DataType::STRING),
-                "manifestDv" => Expression::null_literal(DataType::BINARY),
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             field_exprs.push(Arc::new(expr));
@@ -2887,8 +2894,7 @@ mod tests {
 
         // Verify the manifest_dv field contains the deleted index
         let manifest_dv_bytes = data_manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         assert!(
             manifest_dv_bytes.len() >= 4,
@@ -2970,7 +2976,7 @@ mod tests {
             .unwrap();
 
         // Verify all deleted indices in manifest_dv field
-        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let manifest_dv_bytes = data_manifest.manifest_dv_bytes().unwrap();
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(2));
         assert!(treemap.contains(5));
@@ -3165,7 +3171,7 @@ mod tests {
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
         // Verify the deletion was recorded in manifest_dv
-        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let manifest_dv_bytes = data_manifest.manifest_dv_bytes().unwrap();
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(3));
 
@@ -3207,6 +3213,7 @@ mod tests {
                 existing_rows_count: 100,
                 delete_rows_count: 200,
                 min_sequence_number: 1,
+                ..Default::default()
             })
             .build();
 
@@ -3244,8 +3251,7 @@ mod tests {
 
         // Verify manifest_dv has cardinality 3 (not 5)
         let manifest_dv_bytes = leaf_manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
 
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
@@ -3302,8 +3308,7 @@ mod tests {
 
         // Verify manifest_dv contains both deletions (2 and 5)
         let manifest_dv_v1 = manifest_v1
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v1 = RoaringTreemap::deserialize_from(&manifest_dv_v1[4..])?;
         assert!(cumulative_v1.contains(2));
@@ -3343,8 +3348,7 @@ mod tests {
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
         let manifest_dv_v2 = manifest_v2
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v2 = RoaringTreemap::deserialize_from(&manifest_dv_v2[4..])?;
         assert!(cumulative_v2.contains(2));
@@ -3398,8 +3402,7 @@ mod tests {
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
         let manifest_dv_v3 = manifest_v3
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v3 = RoaringTreemap::deserialize_from(&manifest_dv_v3[4..])?;
         assert!(cumulative_v3.contains(2));
@@ -3465,8 +3468,7 @@ mod tests {
 
         // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
         let manifest_dv_v4 = manifest_v4
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v4 = RoaringTreemap::deserialize_from(&manifest_dv_v4[4..])?;
         assert_eq!(
@@ -3535,8 +3537,7 @@ mod tests {
 
         // Verify manifest_dv contains the deletions (for internal tracking)
         let manifest_dv = manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative = RoaringTreemap::deserialize_from(&manifest_dv[4..])?;
         assert!(cumulative.contains(2));
