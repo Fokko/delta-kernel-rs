@@ -445,8 +445,6 @@ impl ContentTreeNodeBuilder {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     #[cfg(test)]
     fn path_to_absolute(&self, path: &str) -> Result<String, crate::Error> {
-        use url::Url;
-
         // Try to parse the path as an absolute URL
         if let Ok(url) = Url::parse(path) {
             // If it parses successfully, it's an absolute URL
@@ -1516,7 +1514,6 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
 ///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
-    use crate::schema::{StructField, StructType};
     let add_dv = DataType::Struct(Box::new(StructType::new_unchecked([
         StructField::nullable("storageType", DataType::STRING),
         StructField::nullable("pathOrInlineDv", DataType::STRING),
@@ -1565,7 +1562,6 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
 pub(crate) fn build_delta_stats_schema(
     table_schema: &crate::schema::StructType,
 ) -> crate::schema::StructType {
-    use crate::schema::{StructField, StructType};
     let value_fields: Vec<StructField> = table_schema
         .fields()
         .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
@@ -1606,7 +1602,6 @@ fn build_content_stats_from_delta_stats_parsed(
     table_schema: &crate::schema::StructType,
     amt_schema: &crate::schema::StructType,
 ) -> DeltaResult<crate::expressions::Expression> {
-    use crate::expressions::{Expression, Scalar};
     let col_exprs: Vec<Arc<Expression>> = table_schema
         .fields()
         .zip(amt_schema.fields())
@@ -1671,7 +1666,6 @@ fn build_content_stats_from_delta_stats_parsed(
 /// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg
 /// framing).
 static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::schema::{StructField, StructType};
     Arc::new(StructType::new_unchecked(vec![
         StructField::nullable("_dv_location", DataType::STRING),
         StructField::nullable("_dv_offset", DataType::LONG),
@@ -1958,23 +1952,23 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
                     self.selection_vector[i] = true;
                 }
             } else {
+                // Remove row: stays false in selection_vector by initialization; insert key to
+                // suppress the matching content root entry.
                 let rem_path: Option<String> = getters[Self::REM_PATH].get_opt(i, "remove.path")?;
-                if let Some(path) = rem_path {
-                    // Remove row: mark as seen which will suppress the matching content root entry.
-                    let dv_loc = Self::dv_location(i, getters, Self::REM_DV_ST, Self::REM_DV_PATH)?;
-                    self.log_action_keys
-                        .insert(FileActionKey::new(path, dv_loc));
-                    // Collect leaf removes for post-replay DV bitmap updates.
-                    let leaf_path: Option<String> =
-                        getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.dataManifestPath")?;
-                    let position: Option<i64> = getters[Self::REM_MANIFEST_POS]
-                        .get_opt(i, "remove.dataManifestPosition")?;
-                    if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
-                        self.leaf_removes.push(LeafManifestIndex {
-                            path: leaf_path,
-                            position: pos,
-                        });
-                    }
+                let Some(path) = rem_path else { continue };
+                let dv_loc = Self::dv_location(i, getters, Self::REM_DV_ST, Self::REM_DV_PATH)?;
+                self.log_action_keys
+                    .insert(FileActionKey::new(path, dv_loc));
+                // Collect leaf removes for post-replay DV bitmap updates.
+                let leaf_path: Option<String> =
+                    getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.dataManifestPath")?;
+                let position: Option<i64> =
+                    getters[Self::REM_MANIFEST_POS].get_opt(i, "remove.dataManifestPosition")?;
+                if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
+                    self.leaf_removes.push(LeafManifestIndex {
+                        path: leaf_path,
+                        position: pos,
+                    });
                 }
             }
         }
@@ -1986,11 +1980,11 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
 // ContentRootRebuildProcessor
 // ===========================================================================================
 
-/// Log replay processor for AMT rollup.
+/// Stateful processor for replaying delta log commits during AMT root manifest rebuild.
 ///
 /// Processes delta log commits in **descending** order (newest first) followed by the existing
 /// content root (as a "checkpoint" batch) to build the complete set of entries for a new content
-/// root. Uses spec-correct `(path, dv_location)` deduplication: first-seen wins, so the newest
+/// root. Uses `(path, dv_location)` deduplication as per spec: first-seen wins, so the newest
 /// action for each logical file is authoritative.
 ///
 /// - Log batches (`is_log_batch = true`): [`LogBatchDedupVisitor`] is the single visitor pass; it
@@ -2023,7 +2017,6 @@ impl ContentRootRebuildProcessor {
     /// - `engine`: Engine for constructing expression evaluators.
     /// - `snapshot_id`: Stamped into tracking info for each emitted log-batch entry.
     /// - `table_schema`: Physical table schema. Used to derive the content_stats output schema.
-    /// - `_partition_schema`: Reserved for future partition-aware stats; currently unused.
     pub(crate) fn new(
         engine: &dyn Engine,
         snapshot_id: i64,
@@ -2067,7 +2060,7 @@ impl ContentRootRebuildProcessor {
         ));
 
         let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-        let nullability =
+        let null_if_no_dv =
             Expression::from_pred(Predicate::is_not_null(Expression::column(["_dv_location"])));
         let dv_info_expr = Expression::struct_with_nullability_from(
             [
@@ -2076,7 +2069,7 @@ impl ContentRootRebuildProcessor {
                 Expression::column(["_dv_size_in_bytes"]),
                 Expression::column(["_dv_cardinality"]),
             ],
-            nullability,
+            null_if_no_dv,
         );
 
         let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
@@ -2088,14 +2081,14 @@ impl ContentRootRebuildProcessor {
                 "tracking" => Expression::struct_from([
                     Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
                     snapshot_id_expr.clone(),
-                    Expression::column(["add", "defaultRowCommitVersion"]),
-                    Expression::column(["add", "defaultRowCommitVersion"]),
-                    Expression::null_literal(DataType::LONG), // firstRowId
-                    Expression::null_literal(DataType::BINARY), // changesDv
+                    Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
+                    Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
+                    Expression::null_literal(DataType::LONG),               // firstRowId
+                    Expression::null_literal(DataType::BINARY),             // changesDv
                 ]),
                 "dvInfo" => dv_info_expr.clone(),
-                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
-                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "partitionSpecId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
                 // recordCount and content_stats come from LogBatchStatsVisitor pre-parsed columns.
                 "recordCount" => Expression::column(["_stats_record_count"]),
                 "fileSizeInBytes" => Expression::column(["add", "size"]),
@@ -2216,9 +2209,8 @@ impl ContentRootRebuildProcessor {
 
         let mut entries = Vec::new();
         for entry in visitor.entries {
-            let path = match &entry.location {
-                Some(p) => p.clone(),
-                None => continue,
+            let Some(path) = entry.location.as_deref() else {
+                continue;
             };
             let dv_loc = entry.dv_info.as_ref().map(|d| d.location.clone());
             let key = FileActionKey::new(path, dv_loc);
@@ -2229,7 +2221,7 @@ impl ContentRootRebuildProcessor {
             }
 
             // Mark previously "added" entries as "existing"
-            // ToDo: for DV replacements, "replaced" status?
+            // TODO: for DV replacements, "replaced" status?
             let entry = if entry.tracking.status == TrackingStatus::Added {
                 entry.with_status(TrackingStatus::Existed)
             } else {

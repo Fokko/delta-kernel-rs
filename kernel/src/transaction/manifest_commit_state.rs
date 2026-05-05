@@ -334,7 +334,8 @@ impl ManifestCommitState {
     /// the new content tree by inspecting the existing checkpoint action:
     ///
     /// - If [`release_root_and_delta_actions`](Self::release_root_and_delta_actions) was called,
-    ///   the root is cleared — the client will repopulate it via leaf manifests.
+    ///   the root data entries are cleared so the next commit starts fresh; leaf manifest updates
+    ///   are applied separately via [`apply_to_builder`](Self::apply_to_builder).
     /// - If delta log commits exist since the last checkpoint, replays them through a
     ///   [`ContentRootRebuildProcessor`] to produce a correct merged view of the content root.
     /// - If the content root is already current (no log commits since checkpoint), loads it

@@ -15,7 +15,6 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot, TrackingStatus};
 use test_utils::{
     collect_file_paths, create_add_files_metadata, create_table, engine_store_setup,
@@ -51,12 +50,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
         }
 
         // v2: Manifest commit creates root manifest
@@ -65,17 +60,13 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             txn.with_manifest_commit();
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        new_snapshot.checkpoint_action().is_some(),
-                        "Root manifest should exist"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                new_snapshot.checkpoint_action().is_some(),
+                "Root manifest should exist"
+            );
         }
 
         // Verify v2: Root manifest contains file1, file2
@@ -106,12 +97,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
         }
 
         // v4: Regular commit adds file4 to log
@@ -126,12 +113,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 4);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 4);
         }
 
         // Verify v4: Scan should show all 4 files (2 from root + 2 from log)
@@ -174,14 +157,10 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 5);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 5);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Verify v5: New root should contain all 5 files (4 rolled up + 1 new)
@@ -248,17 +227,13 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                    let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        snapshot_v1.checkpoint_action().is_some(),
-                        "v1 should create root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                snapshot_v1.checkpoint_action().is_some(),
+                "v1 should create root manifest"
+            );
         }
 
         // Verify v1: Root contains all 4 files
@@ -308,12 +283,8 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
 
             assert_eq!(removed_count, 1, "Should remove exactly 1 file");
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file2 removed
@@ -344,15 +315,11 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                    let new_snapshot: Arc<Snapshot> =
-                        Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let new_snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Final verification: v3 should show 4 files (3 rolled up + 1 new)
@@ -422,17 +389,13 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                    let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        snapshot_v1.checkpoint_action().is_some(),
-                        "v1 should create root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                snapshot_v1.checkpoint_action().is_some(),
+                "v1 should create root manifest"
+            );
         }
 
         // Verify v1: Root contains all 4 files
@@ -483,12 +446,8 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
 
             assert_eq!(removed_count, 1, "Should remove exactly 1 file");
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file2 removed
@@ -524,15 +483,11 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                    let new_snapshot: Arc<Snapshot> =
-                        Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let new_snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Final verification: v3 should show 4 files (3 rolled up + 1 new)
@@ -591,12 +546,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
         }
 
         // Verify v1: file1 present in root, no DV
@@ -640,12 +591,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             // Add DV to file1
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file1 present with DV from v2
@@ -702,12 +649,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             // Replace DV via delta log
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
         }
 
         // Verify v3: file1 present with REPLACED DV from v3 (not v2!)
@@ -739,17 +682,13 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             txn.with_manifest_commit();
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 4);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        new_snapshot.checkpoint_action().is_some(),
-                        "v4 should create new root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 4);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                new_snapshot.checkpoint_action().is_some(),
+                "v4 should create new root manifest"
+            );
         }
 
         // Verify v4: file1 present with DV from v3 (NOT v2) rolled up into new root
@@ -829,14 +768,10 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                 batch.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                    let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(s.checkpoint_action().is_some(), "v1 should have root");
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v1 should have root");
         }
 
         // Verify v1: file1 present, no DV
@@ -875,10 +810,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                 },
             );
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 2),
-                other => panic!("Expected success, got {:?}", other),
-            };
+            assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 2);
         }
 
         // Verify v2: file1 has DV from v2
@@ -898,14 +830,10 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             txn.with_manifest_commit();
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                    let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(s.checkpoint_action().is_some(), "v3 should have root");
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v3 should have root");
         }
 
         // Verify v3: file1 appears exactly once with DV from v2; rolled up as Existed
@@ -962,10 +890,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                 },
             );
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 4),
-                other => panic!("Expected success, got {:?}", other),
-            };
+            assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 4);
         }
 
         // Verify v4: file1 has DV from v4
@@ -985,14 +910,10 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             txn.with_manifest_commit();
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 5);
-                    let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(s.checkpoint_action().is_some(), "v5 should have root");
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 5);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v5 should have root");
         }
 
         // Verify v5: file1 appears exactly once with DV from v4 (replacement); rolled up as Existed
