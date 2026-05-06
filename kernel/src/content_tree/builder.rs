@@ -222,9 +222,15 @@ pub(crate) struct ContentTreeNodeBuilder {
 
 /// Lightweight aggregate stats computed when adding pre-built columnar batches.
 struct BatchAggregates {
-    added_file_count: i64,
-    existing_file_count: i64,
+    added_file_count: i32,
+    existing_file_count: i32,
     total_record_count: i64,
+}
+
+/// Converts a `usize` length to an `i32` file count, returning an error on overflow.
+fn file_count_from_len(len: usize) -> DeltaResult<i32> {
+    len.try_into()
+        .map_err(|_| Error::generic(format!("file count {len} exceeds i32::MAX")))
 }
 
 impl std::fmt::Debug for ContentTreeNodeBuilder {
@@ -396,9 +402,7 @@ impl ContentTreeNodeBuilder {
                 manifest_info.dv_cardinality = Some(cardinality);
 
                 // If all active entries are deleted, mark manifest as Deleted
-                let active_entry_count =
-                    manifest_info.added_files_count + manifest_info.existing_files_count;
-                if cardinality == active_entry_count {
+                if cardinality == manifest_info.active_entry_count() {
                     entry.tracking.status = TrackingStatus::Deleted;
                 }
             }
@@ -704,7 +708,7 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            added_file_count: engine_data.len() as i64,
+            added_file_count: file_count_from_len(engine_data.len())?,
             existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
         };
@@ -725,13 +729,10 @@ impl ContentTreeNodeBuilder {
         ) {
             if let Some(ref location) = entry.location {
                 // Get total entry count from manifest_info for bounds checking
-                let total_entry_count = if let Some(ref manifest_info) = entry.manifest_info {
-                    manifest_info.added_files_count
-                        + manifest_info.existing_files_count
-                        + manifest_info.deletes_files_count
-                } else {
-                    0
-                };
+                let total_entry_count = entry
+                    .manifest_info
+                    .as_ref()
+                    .map_or(0, |mi| mi.total_entry_count());
 
                 // Read DV bytes from manifest_info.dv, clone into cache
                 // Bytes is Rc-based, so clone is cheap (just increments refcount)
@@ -1012,9 +1013,9 @@ impl ContentTreeNodeBuilder {
         let mut record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
 
         // Calculate manifest stats (entry counts by status)
-        let mut added_files_count = 0i64;
-        let mut existing_files_count = 0i64;
-        let mut deletes_files_count = 0i64;
+        let mut added_files_count = 0i32;
+        let mut existing_files_count = 0i32;
+        let mut deletes_files_count = 0i32;
         let mut added_rows_count = 0i64;
         let mut existing_rows_count = 0i64;
         let mut delete_rows_count = 0i64;
@@ -1321,7 +1322,7 @@ impl ContentTreeNodeBuilder {
 
         let aggregates = BatchAggregates {
             added_file_count: 0,
-            existing_file_count: engine_data.len() as i64,
+            existing_file_count: file_count_from_len(engine_data.len())?,
             total_record_count: agg_visitor.total_record_count,
         };
 
@@ -1442,7 +1443,7 @@ impl ContentTreeNodeBuilder {
 
         let aggregates = BatchAggregates {
             added_file_count: 0,
-            existing_file_count: filtered.len() as i64,
+            existing_file_count: file_count_from_len(filtered.len())?,
             total_record_count: agg_visitor.total_record_count,
         };
         self.pre_built_data.push(filtered);
@@ -1467,7 +1468,7 @@ impl ContentTreeNodeBuilder {
         let mut agg_visitor = TransformedAggregateVisitor::default();
         agg_visitor.visit_rows_of(data.as_ref())?;
         let aggregates = BatchAggregates {
-            added_file_count: data.len() as i64,
+            added_file_count: file_count_from_len(data.len())?,
             existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
         };

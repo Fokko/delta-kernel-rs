@@ -168,11 +168,11 @@ fn visit_metadata_entry_at<'a>(
     // content_stats has no fields, so no getters
 
     // Extract manifest_info fields (9 fields: 17-25, including dv and dv_cardinality)
-    let ms_added_files_count: Option<i64> =
+    let ms_added_files_count: Option<i32> =
         getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
-    let ms_existing_files_count: Option<i64> =
+    let ms_existing_files_count: Option<i32> =
         getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
-    let ms_deletes_files_count: Option<i64> =
+    let ms_deletes_files_count: Option<i32> =
         getters[19].get_opt(row_index, "manifest_info.deletes_files_count")?;
     let ms_added_rows_count: Option<i64> =
         getters[20].get_opt(row_index, "manifest_info.added_rows_count")?;

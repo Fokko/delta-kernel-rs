@@ -1769,13 +1769,13 @@ impl From<TrackingInfo> for Scalar {
 pub(crate) struct ManifestInfo {
     /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
-    pub(crate) added_files_count: i64,
+    pub(crate) added_files_count: i32,
     /// Number of entries with EXISTING status in the manifest.
     #[field_id = 505]
-    pub(crate) existing_files_count: i64,
+    pub(crate) existing_files_count: i32,
     /// Number of entries with DELETED status in the manifest.
     #[field_id = 506]
-    pub(crate) deletes_files_count: i64,
+    pub(crate) deletes_files_count: i32,
 
     /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
@@ -1795,6 +1795,20 @@ pub(crate) struct ManifestInfo {
     pub(crate) dv: Option<Bytes>,
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
+}
+
+impl ManifestInfo {
+    /// Number of active (ADDED + EXISTING) entries, widened to i64 for comparison with
+    /// i64 values like `dv_cardinality`.
+    pub(crate) fn active_entry_count(&self) -> i64 {
+        i64::from(self.added_files_count) + i64::from(self.existing_files_count)
+    }
+
+    /// Total number of entries (ADDED + EXISTING + DELETED), widened to i64 for use as
+    /// bounds in structures like `DvCache`.
+    pub(crate) fn total_entry_count(&self) -> i64 {
+        self.active_entry_count() + i64::from(self.deletes_files_count)
+    }
 }
 
 impl From<ManifestInfo> for Scalar {
