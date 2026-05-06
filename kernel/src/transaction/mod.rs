@@ -640,84 +640,35 @@ impl<S> Transaction<S> {
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
             let physical_table_schema = table_schema.make_physical(column_mapping_mode)?;
-            let table_root = self.read_snapshot.table_root().clone();
-            let current_version = self.read_snapshot.version();
 
-            // Load existing metadata and determine the version from which to replay delta log
-            let (mut metadata_builder, root_manifest_path, replay_from_version) =
-                if let Some(checkpoint_action) = latest_checkpoint_action {
-                    // Load metadata from content root directly into the builder
-                    let root_path = checkpoint_action.content_root.path.clone();
-                    let builder =
-                        crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
-                            engine,
-                            &checkpoint_action.content_root,
-                            table_root.clone(),
-                            physical_table_schema.clone(),
-                            commit_version,
-                        )?;
-                    // Replay delta log from the version after the checkpoint action
-                    (builder, Some(root_path), checkpoint_action.version + 1)
-                } else {
-                    // No checkpoint action found, start with empty metadata
-                    // Use commit_version for the new metadata, not the current snapshot version
-                    let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
-                        table_root.clone(),
-                        commit_version,
-                        physical_table_schema.clone(),
-                    );
-                    // Replay all delta log commits from the beginning
-                    (builder, None, 0)
-                };
-
-            // If root was released to client control, clear all root data and DV entries
-            // The client will add them back via leaf manifests
-            if self
-                .manifest_commit_state
+            let root_manifest_path = latest_checkpoint_action
                 .as_ref()
-                .is_some_and(|b| b.root_released)
-            {
-                metadata_builder.clear_root_data_and_dv_entries();
+                .map(|ca| ca.content_root.path.clone());
 
-                // TODO: Process incremental removes from delta log and mark them as DELETED
-                // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the checkpoint action version
-                // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
-                // 3. Calling metadata_builder.delete_from_leaf() for each removed file
-                // This is deferred to future work as it requires a new delta log processor.
-            } else if replay_from_version <= current_version {
-                // Root not released: replay delta log commits to add incremental changes
-                // Create a scan of just root + delta log (skip leaves to avoid duplicates)
-                let scan = crate::scan::ScanBuilder::new(self.read_snapshot.clone())
-                    .skip_leaf_manifests(true)
-                    .build()?;
-                let scan_metadata_iter = scan.scan_metadata(engine)?;
-
-                for scan_metadata_result in scan_metadata_iter {
-                    let scan_metadata = scan_metadata_result?;
-                    let engine_data = scan_metadata.scan_files.data();
-
-                    // Add incremental actions from delta log to the metadata builder
-                    // TODO: When replaying, we should preserve original sequence_numbers from the
-                    // files' tracking instead of using current_version. This would require
-                    // extracting sequence_number from the scan data and passing it through.
-                    metadata_builder.add_from_scan_row_data(
-                        engine_data,
-                        current_version,
-                        snapshot_id,
-                    )?;
-                }
-            }
+            let temp_mcs;
+            let manifest_commit_state = if let Some(mcs) = &self.manifest_commit_state {
+                mcs
+            } else {
+                temp_mcs = ManifestCommitState::new(
+                    commit_version,
+                    snapshot_id,
+                    self.read_snapshot.clone(),
+                );
+                &temp_mcs
+            };
+            let mut metadata_builder =
+                manifest_commit_state.initialize_content_root_builder(engine)?;
 
             for add_metadata_result in self.add_files_metadata.iter() {
                 // Pre-convert stats from Delta JSON format to AMT struct format at batch level
-                let converted = crate::content_tree::stats::try_pre_convert_stats_column(
-                    engine,
-                    add_metadata_result.as_ref(),
-                    "stats",
-                    &physical_table_schema,
-                    &BASE_ADD_FILES_SCHEMA,
-                )?;
+                let converted: Option<Box<dyn EngineData>> =
+                    crate::content_tree::stats::try_pre_convert_stats_column(
+                        engine,
+                        add_metadata_result.as_ref(),
+                        "stats",
+                        &physical_table_schema,
+                        &BASE_ADD_FILES_SCHEMA,
+                    )?;
                 let data: &dyn EngineData = match &converted {
                     Some(c) => c.as_ref(),
                     None => add_metadata_result.as_ref(),
@@ -4070,7 +4021,8 @@ mod tests {
                 "partitionValues": {},
                 "size": 1024,
                 "modificationTime": 1677811178336u64,
-                "dataChange": true
+                "dataChange": true,
+                "defaultRowCommitVersion": version
             }
         });
 

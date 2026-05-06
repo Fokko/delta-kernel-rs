@@ -2357,20 +2357,17 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // With manifest_commit, JSON log should contain: commit_info + checkpoint action
-        // No add actions should be in the JSON log
-        assert_eq!(
-            parsed_actions.len(),
-            2,
-            "Expected commit info and checkpoint actions, got {}. Actions: {:?}",
-            parsed_actions.len(),
+        // With manifest_commit, JSON log should contain commitInfo + checkpoint, plus any
+        // protocol-required actions (e.g. domainMetadata for rowTracking). No add actions.
+        assert!(
+            parsed_actions.iter().any(|a| a.get("commitInfo").is_some()),
+            "Expected commitInfo action in commit. Actions: {:?}",
             parsed_actions
         );
-        assert!(parsed_actions[0].get("commitInfo").is_some());
         assert!(
-            parsed_actions[1].get("checkpoint").is_some(),
-            "Second action should be checkpoint, but got: {:?}",
-            parsed_actions[1]
+            parsed_actions.iter().any(|a| a.get("checkpoint").is_some()),
+            "Expected checkpoint action in commit. Actions: {:?}",
+            parsed_actions
         );
 
         // Verify no add actions in JSON log
