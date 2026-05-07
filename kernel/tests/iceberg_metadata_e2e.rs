@@ -578,3 +578,101 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     println!("\n=== SUCCESS: CTAS + 2 follow-up commits with snapshot history ===");
     Ok(())
 }
+
+/// CREATE TABLE with data via manifest commit (content tree) should produce exactly one
+/// IcebergMetadataDomain, not two. Regression test for the duplicate domain bug where
+/// both the CREATE TABLE path and the manifest commit path generated metadata.json.
+#[tokio::test]
+async fn test_create_table_manifest_commit_single_iceberg_domain(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_utils::test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?);
+
+    let mut txn = create_table(&table_path, schema, "TestEngine/1.0")
+        .with_table_properties([
+            ("delta.columnMapping.mode", "id"),
+            ("delta.feature.metadataTree-experimental", "supported"),
+            ("delta.feature.domainMetadata", "supported"),
+            ("delta.enableRowTracking", "true"),
+            ("delta.enableIcebergNativeV4Experimental", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    let add_files_schema = txn.add_files_schema();
+
+    // Add data via manifest commit (content tree), like Reyden does
+    {
+        let mc = txn.with_manifest_commit();
+        let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                add_files_schema,
+                vec![
+                    ("part-00000.parquet", 1024, 1_000_000, 10),
+                    ("part-00001.parquet", 2048, 1_000_001, 20),
+                ],
+            )?,
+        )?;
+        mc.add_leaf(leaf.finish(engine.as_ref())?)?;
+    }
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), 0);
+
+    // Verify: exactly ONE metadata.json file (not two)
+    let table_dir = std::path::Path::new(&table_path);
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
+    let metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    assert_eq!(
+        metadata_files.len(),
+        1,
+        "CREATE TABLE + manifest commit should produce exactly 1 metadata.json, got {}",
+        metadata_files.len()
+    );
+
+    // Verify: the metadata.json has a snapshot (not empty schema-only)
+    let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
+    assert_eq!(table_metadata.snapshots().len(), 1);
+    assert!(table_metadata.current_snapshot_id().is_some());
+
+    // Verify: exactly ONE iceberg domain metadata in the Delta commit
+    let commit_path = table_dir
+        .join("_delta_log")
+        .join("00000000000000000000.json");
+    let commit_content = std::fs::read_to_string(&commit_path)?;
+    let iceberg_domain_count = commit_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|action| {
+            action
+                .get("domainMetadata")
+                .and_then(|dm| dm.get("domain"))
+                .and_then(|d| d.as_str())
+                == Some("com.databricks.iceberg.metadata")
+        })
+        .count();
+    assert_eq!(
+        iceberg_domain_count, 1,
+        "Should have exactly 1 iceberg domain metadata, got {}",
+        iceberg_domain_count
+    );
+
+    // Verify: table is readable
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    let expected: HashSet<String> = ["part-00000.parquet", "part-00001.parquet"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(paths, expected);
+
+    Ok(())
+}
