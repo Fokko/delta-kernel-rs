@@ -141,7 +141,8 @@ pub(crate) fn generate_iceberg_metadata(
 
     // Step 3: Build TableMetadata — incremental if previous metadata exists, fresh otherwise
     let table_metadata = if let Some(prev) = previous_domain {
-        build_table_metadata_incremental(engine, prev, snapshot)?
+        let properties = build_iceberg_properties(metadata, version, timestamp_ms);
+        build_table_metadata_incremental(engine, prev, snapshot, properties)?
     } else {
         let delta_schema = metadata.parse_schema()?;
         let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
@@ -309,6 +310,7 @@ fn build_table_metadata_incremental(
     engine: &dyn Engine,
     previous_domain: &IcebergMetadataDomain,
     snapshot: iceberg_spec::Snapshot,
+    properties: HashMap<String, String>,
 ) -> DeltaResult<iceberg_spec::TableMetadata> {
     let prev_location = previous_domain
         .metadata_location
@@ -332,8 +334,12 @@ fn build_table_metadata_incremental(
     let prev_metadata: iceberg_spec::TableMetadata = serde_json::from_slice(&prev_bytes)
         .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {}", e)))?;
 
-    // Build on top of previous metadata, preserving snapshot history
-    let builder = prev_metadata.into_builder(Some(prev_location.clone()));
+    // Build on top of previous metadata, preserving snapshot history.
+    // Update properties (delta-version, delta-timestamp, etc.) to reflect the current commit.
+    let builder = prev_metadata
+        .into_builder(Some(prev_location.clone()))
+        .set_properties(properties)
+        .map_err(|e| Error::generic(format!("Failed to set properties: {e}")))?;
 
     add_snapshot_and_build(builder, snapshot)
 }

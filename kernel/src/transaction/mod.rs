@@ -568,11 +568,10 @@ impl<S> Transaction<S> {
                 metadata_data,
             )));
 
-            // Generate Iceberg metadata.json for CREATE TABLE without data (schema only).
-            // CTAS (create table with data) skips this — its metadata.json is generated
-            // in the manifest commit block with a proper snapshot.
+            // Generate Iceberg metadata.json for empty CREATE TABLE (schema only, no snapshot).
+            // Skip when manifest commit will run — it generates metadata.json with a snapshot.
             #[cfg(feature = "iceberg-nativev4")]
-            if has_iceberg_native_v4 && self.add_files_metadata.is_empty() {
+            if has_iceberg_native_v4 && !self.is_manifest_commit() {
                 let result = crate::iceberg_metadata::generate_iceberg_metadata_for_create_table(
                     engine,
                     self.read_snapshot.table_root(),
