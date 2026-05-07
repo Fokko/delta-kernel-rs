@@ -61,8 +61,8 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // TODO: parameterize format version once iceberg crate supports V4
-        iceberg_spec::FormatVersion::V2,
+        // Using V3 for now; upgrade to V4 once iceberg crate supports it
+        iceberg_spec::FormatVersion::V3,
         properties,
     )
     .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?
@@ -277,6 +277,9 @@ fn build_snapshot(
             operation: iceberg_spec::Operation::Append,
             additional_properties: HashMap::new(),
         })
+        // V3 requires row lineage: first_row_id + added_rows_count.
+        // TODO: compute actual row counts from Delta add file stats.
+        .with_row_range(0, 0)
         .with_schema_id(0)
         .build())
 }
@@ -294,8 +297,8 @@ fn build_table_metadata_fresh(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // TODO: parameterize format version once iceberg crate supports V4
-        iceberg_spec::FormatVersion::V2,
+        // Using V3 for now; upgrade to V4 once iceberg crate supports it
+        iceberg_spec::FormatVersion::V3,
         properties,
     )
     .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?;
@@ -606,7 +609,7 @@ mod tests {
         let parsed: iceberg_spec::TableMetadata = serde_json::from_slice(&json_bytes).unwrap();
 
         // Verify format version
-        assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V2);
+        assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V3);
 
         // Verify table UUID
         assert_eq!(parsed.uuid(), table_uuid);

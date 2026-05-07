@@ -124,7 +124,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
     assert_eq!(
         table_metadata.format_version(),
-        iceberg_spec::FormatVersion::V2
+        iceberg_spec::FormatVersion::V3
     );
     assert_eq!(
         table_metadata.current_schema().as_struct().fields().len(),
