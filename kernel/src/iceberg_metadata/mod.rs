@@ -61,7 +61,7 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // Built with V2 internally; serialize_metadata_json overrides to V4 for AMT
+        // TODO: parameterize format version once iceberg crate supports V4
         iceberg_spec::FormatVersion::V2,
         properties,
     )
@@ -71,7 +71,8 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
     .map_err(|e| Error::generic(format!("Failed to build TableMetadata: {}", e)))?;
 
     let metadata_location = generate_metadata_path(table_root, version)?;
-    let metadata_bytes = serialize_metadata_json(&table_metadata.metadata)?;
+    let metadata_bytes = serde_json::to_vec(&table_metadata.metadata)
+        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
 
     engine
         .storage_handler()
@@ -152,7 +153,8 @@ pub(crate) fn generate_iceberg_metadata(
 
     // Step 4: Serialize and write to storage
     let metadata_location = generate_metadata_path(table_root, version)?;
-    let metadata_bytes = serialize_metadata_json(&table_metadata)?;
+    let metadata_bytes = serde_json::to_vec(&table_metadata)
+        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
 
     engine
         .storage_handler()
@@ -177,34 +179,6 @@ pub(crate) fn generate_iceberg_metadata(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// The Iceberg format version written to metadata.json. V4 (adaptive metadata tree) is required
-/// for Iceberg clients to correctly handle manifest-list references pointing to AMT root manifests.
-const ICEBERG_FORMAT_VERSION: u8 = 4;
-
-/// Serializes TableMetadata to JSON bytes, overriding format-version to [`ICEBERG_FORMAT_VERSION`].
-///
-/// The iceberg crate (0.8) only supports up to format-version 3, so we build with V2 internally
-/// and post-process the serialized JSON to set the correct version for AMT compatibility.
-// TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
-fn serialize_metadata_json(metadata: &iceberg_spec::TableMetadata) -> DeltaResult<Vec<u8>> {
-    let mut json: serde_json::Value = serde_json::to_value(metadata)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {e}")))?;
-    json["format-version"] = serde_json::Value::Number(ICEBERG_FORMAT_VERSION.into());
-    serde_json::to_vec(&json)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {e}")))
-}
-
-/// Deserializes TableMetadata from JSON bytes, downgrading format-version from V4 to V2 so
-/// the iceberg crate can parse it.
-// TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
-fn deserialize_metadata_json(bytes: &[u8]) -> DeltaResult<iceberg_spec::TableMetadata> {
-    let mut json: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {e}")))?;
-    json["format-version"] = serde_json::Value::Number(2.into());
-    serde_json::from_value(json)
-        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {e}")))
-}
 
 /// Finds the maximum field ID in an Iceberg schema (for `last_column_id`).
 fn find_max_field_id(schema: &iceberg_spec::Schema) -> i32 {
@@ -321,7 +295,7 @@ fn build_table_metadata_fresh(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // Built with V2 internally; serialize_metadata_json overrides to V4 for AMT
+        // TODO: parameterize format version once iceberg crate supports V4
         iceberg_spec::FormatVersion::V2,
         properties,
     )
@@ -357,7 +331,8 @@ fn build_table_metadata_incremental(
         .into_iter()
         .next()
         .ok_or_else(|| Error::generic("No data returned for previous metadata.json"))??;
-    let prev_metadata = deserialize_metadata_json(&prev_bytes)?;
+    let prev_metadata: iceberg_spec::TableMetadata = serde_json::from_slice(&prev_bytes)
+        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {}", e)))?;
 
     // Build on top of previous metadata, preserving snapshot history.
     // Update properties (delta-version, delta-timestamp, etc.) to reflect the current commit.
