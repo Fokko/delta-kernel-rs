@@ -8,16 +8,16 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
-use iceberg::spec as iceberg_spec;
 use test_utils::{collect_file_paths, create_add_files_metadata};
 
 /// Reads the latest metadata.json from the iceberg metadata directory, validates file count
-/// and version prefix, and returns the parsed TableMetadata for further assertions.
+/// and version prefix, and returns the parsed JSON for further assertions.
+/// Returns serde_json::Value because the iceberg crate cannot deserialize format-version 4.
 fn read_and_validate_iceberg_metadata(
     iceberg_metadata_dir: &std::path::Path,
     expected_file_count: usize,
     expected_version: u64,
-) -> iceberg_spec::TableMetadata {
+) -> serde_json::Value {
     let mut files: Vec<_> = std::fs::read_dir(iceberg_metadata_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -78,9 +78,17 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let table_dir = std::path::Path::new(&table_path);
     let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
     let create_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
-    assert_eq!(create_metadata.snapshots().len(), 0);
     assert_eq!(
-        create_metadata.current_schema().as_struct().fields().len(),
+        create_metadata["snapshots"]
+            .as_array()
+            .map_or(0, |a| a.len()),
+        0
+    );
+    assert_eq!(
+        create_metadata["schemas"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .len(),
         2
     );
 
@@ -122,21 +130,26 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     // Validate metadata.json content for version 1 (with snapshot)
     let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
+    assert_eq!(table_metadata["format-version"], 4);
     assert_eq!(
-        table_metadata.format_version(),
-        iceberg_spec::FormatVersion::V2
-    );
-    assert_eq!(
-        table_metadata.current_schema().as_struct().fields().len(),
+        table_metadata["schemas"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .len(),
         2
     );
-    assert!(table_metadata.current_snapshot_id().is_some());
-    let snapshot = table_metadata.current_snapshot().unwrap();
+    assert!(table_metadata["current-snapshot-id"].as_i64().is_some());
+    let snapshot = &table_metadata["snapshots"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    let manifest_list = snapshot["manifest-list"].as_str().unwrap();
     assert!(
-        snapshot.manifest_list().contains(".content."),
+        manifest_list.contains(".content."),
         "manifest-list should point to a .content. parquet file"
     );
-    assert!(table_metadata.properties().contains_key("delta-version"));
+    assert!(table_metadata["properties"]["delta-version"].is_string());
 
     // Verify IcebergMetadataDomain is in the Delta commit JSON
     let commit_path = table_dir
@@ -230,13 +243,13 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     let latest_metadata_path = metadata_files.last().unwrap().path();
     let latest_content = std::fs::read_to_string(&latest_metadata_path)?;
-    let latest_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&latest_content)?;
+    let latest_metadata: serde_json::Value = serde_json::from_str(&latest_content)?;
 
     println!("\n=== Latest metadata.json (version 3) ===");
     println!("{}", latest_content);
 
     // Should have 3 snapshots (version 1, 2, 3)
-    let snapshot_count = latest_metadata.snapshots().len();
+    let snapshot_count = latest_metadata["snapshots"].as_array().unwrap().len();
     println!("\nSnapshot count: {}", snapshot_count);
     assert_eq!(
         snapshot_count, 3,
@@ -248,17 +261,19 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     // Currently the incremental builder preserves properties from the first metadata.json.
     // For now, verify the current snapshot ID is set.
     assert!(
-        latest_metadata.current_snapshot_id().is_some(),
+        latest_metadata["current-snapshot-id"].as_i64().is_some(),
         "Latest metadata should have a current snapshot"
     );
 
     // Verify snapshot log has 3 entries
-    let snapshot_log = latest_metadata.history();
-    println!("Snapshot log entries: {}", snapshot_log.len());
-    assert_eq!(snapshot_log.len(), 3, "Snapshot log should have 3 entries");
+    let snapshot_log_len = latest_metadata["snapshot-log"].as_array().unwrap().len();
+    println!("Snapshot log entries: {}", snapshot_log_len);
+    assert_eq!(snapshot_log_len, 3, "Snapshot log should have 3 entries");
 
     // Verify metadata log tracks previous metadata files
-    let metadata_log_count = latest_metadata.metadata_log().len();
+    let metadata_log_count = latest_metadata["metadata-log"]
+        .as_array()
+        .map_or(0, |a| a.len());
     println!("Metadata log entries: {}", metadata_log_count);
     assert!(
         metadata_log_count >= 1,
@@ -451,42 +466,40 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
 
     // Verify it has a snapshot (unlike pure CREATE TABLE which has 0)
     let content = std::fs::read_to_string(metadata_files[0].path())?;
-    let table_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&content)?;
+    let table_metadata: serde_json::Value = serde_json::from_str(&content)?;
 
     println!("\n=== CTAS metadata.json ===");
     println!("{}", content);
 
     assert_eq!(
-        table_metadata.snapshots().len(),
+        table_metadata["snapshots"].as_array().unwrap().len(),
         1,
         "CTAS metadata.json should have 1 snapshot"
     );
     assert!(
-        table_metadata.current_snapshot_id().is_some(),
+        table_metadata["current-snapshot-id"].as_i64().is_some(),
         "CTAS should have a current snapshot"
     );
 
-    let snapshot = table_metadata.current_snapshot().unwrap();
+    let snapshot = &table_metadata["snapshots"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    let manifest_list = snapshot["manifest-list"].as_str().unwrap();
     assert!(
-        snapshot.manifest_list().contains(".content."),
+        manifest_list.contains(".content."),
         "Snapshot should point to a .content. parquet file, got: {}",
-        snapshot.manifest_list()
+        manifest_list
     );
 
     // Verify Iceberg schema is readable and matches the Delta schema
-    let iceberg_schema = table_metadata.current_schema();
-    let fields = iceberg_schema.as_struct().fields();
+    let fields = table_metadata["schemas"][0]["fields"].as_array().unwrap();
     assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].name, "id");
-    assert_eq!(
-        *fields[0].field_type,
-        iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int)
-    );
-    assert_eq!(fields[1].name, "value");
-    assert_eq!(
-        *fields[1].field_type,
-        iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::String)
-    );
+    assert_eq!(fields[0]["name"], "id");
+    assert_eq!(fields[0]["type"], "int");
+    assert_eq!(fields[1]["name"], "value");
+    assert_eq!(fields[1]["type"], "string");
 
     // Verify the table is readable
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -541,23 +554,31 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         .collect();
     final_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
     let final_content = std::fs::read_to_string(final_files.last().unwrap().path())?;
-    let final_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&final_content)?;
+    let final_metadata: serde_json::Value = serde_json::from_str(&final_content)?;
 
     assert_eq!(
-        final_metadata.snapshots().len(),
+        final_metadata["snapshots"].as_array().unwrap().len(),
         3,
         "After CTAS + 2 inserts, should have 3 snapshots"
     );
     assert_eq!(
-        final_metadata.history().len(),
+        final_metadata["snapshot-log"].as_array().unwrap().len(),
         3,
         "Snapshot log should have 3 entries"
     );
 
-    // Verify parent chain: v2 -> v1 -> v0 (CTAS)
-    let current = final_metadata.current_snapshot().unwrap();
+    // Verify parent chain: current snapshot (v2) should have a parent (v1).
+    // Use current-snapshot-id to find the right snapshot — the snapshots array
+    // is not guaranteed to be in chronological order.
+    let current_id = final_metadata["current-snapshot-id"].as_i64().unwrap();
+    let current = final_metadata["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["snapshot-id"].as_i64() == Some(current_id))
+        .expect("current snapshot should be in snapshots array");
     assert!(
-        current.parent_snapshot_id().is_some(),
+        current["parent-snapshot-id"].as_i64().is_some(),
         "v2 snapshot should have a parent"
     );
 

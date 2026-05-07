@@ -243,12 +243,12 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
 
-    // Verify min_sequence_number in manifest_stats
-    let manifest_stats = manifest_entry
-        .manifest_stats
+    // Verify min_sequence_number in manifest_info
+    let manifest_info = manifest_entry
+        .manifest_info
         .as_ref()
-        .expect("manifest_stats");
-    assert_eq!(manifest_stats.min_sequence_number, 1);
+        .expect("manifest_info");
+    assert_eq!(manifest_info.min_sequence_number, 1);
 
     // Read back the leaf entries (pending_entries are preserved after write_leaf)
     let entries = build_and_read_leaf(&mut builder, &engine, 3)?;

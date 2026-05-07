@@ -21,7 +21,7 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, PrimitiveType,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData};
+use crate::{DeltaResult, Engine, EngineData, Error};
 
 /// Number of supported stats per column.
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
@@ -1136,6 +1136,7 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 /// let stats_json = r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":100},"nullCount":{"id":0}}"#;
 /// let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)?;
 /// ```
+#[cfg(test)]
 pub(crate) fn delta_json_stats_to_content_stats(
     stats_json: Option<&str>,
     table_schema: &StructType,
@@ -1158,6 +1159,32 @@ pub(crate) fn delta_json_stats_to_content_stats(
     Ok(Some(content_stats))
 }
 
+/// Parses an Add action's stats JSON blob and returns both AMT `content_stats` and `num_records`
+/// from a single parse.
+///
+/// Unlike [`delta_json_stats_to_content_stats`], errors when `stats_json` is present but cannot
+/// be parsed or is missing `numRecords`. Returns `Ok((None, 0))` when `stats_json` is absent.
+pub(crate) fn parse_delta_add_stats(
+    stats_json: Option<&str>,
+    table_schema: &StructType,
+    tight_bounds_when_null: Option<bool>,
+) -> DeltaResult<(Option<StructData>, i64)> {
+    let Some(json_str) = stats_json else {
+        return Ok((None, 0));
+    };
+
+    let delta_stats = DeltaJsonStats::parse(json_str, tight_bounds_when_null)
+        .ok_or_else(|| Error::generic(format!("failed to parse stats JSON: {json_str}")))?;
+
+    let num_records = delta_stats
+        .num_records
+        .ok_or_else(|| Error::missing_data("numRecords"))?;
+    let stats_struct = stats_schema(table_schema)?;
+    let content_stats = build_struct_stats(table_schema, &stats_struct, &delta_stats, "");
+
+    Ok((Some(content_stats), num_records))
+}
+
 /// Builds a content_stats entry for a single partition column.
 ///
 /// Partition columns have a single constant value across all rows in the file, so:
@@ -1165,6 +1192,7 @@ pub(crate) fn delta_json_stats_to_content_stats(
 /// - `null_value_count` = num_records if partition value is null, else 0
 /// - `lower_bound` / `upper_bound` = the parsed partition value (both equal)
 /// - `exact_bounds` = true (partition values are always exact)
+#[cfg(test)]
 fn build_partition_column_stats(
     stats_struct: &StructType,
     partition_value: Option<&Scalar>,
@@ -1225,6 +1253,7 @@ fn build_partition_column_stats(
 /// * `partition_values` - Map of physical partition column name to string-serialised value
 /// * `table_schema` - The physical table schema (including partition columns with field IDs)
 /// * `num_records` - Record count for this file (used for `value_count` / `null_value_count`)
+#[cfg(test)]
 pub(crate) fn merge_partition_values_into_stats(
     content_stats: Option<StructData>,
     partition_values: &HashMap<String, String>,

@@ -514,8 +514,7 @@ fn maybe_enable_ict_for_catalog_managed(
 /// Conditionally enables the icebergNativeV4 feature during table creation.
 ///
 /// When `delta.enableIcebergNativeV4Experimental` is set to `"true"`, adds the
-/// `IcebergNativeV4Experimental` feature to the protocol. RowTracking is auto-enabled
-/// via `maybe_auto_enable_property_driven_features` when `delta.enableRowTracking` is set.
+/// `IcebergNativeV4Experimental` feature (and its dependency `RowTracking`) to the protocol.
 fn maybe_enable_iceberg_native_v4(validated: &mut ValidatedTableProperties) {
     let enabled = validated
         .properties

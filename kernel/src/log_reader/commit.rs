@@ -1,12 +1,11 @@
 //! Commit phase for log replay - processes JSON commit files.
 
-use delta_kernel::Version;
-use itertools::Itertools;
+use itertools::Itertools as _;
 
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine};
+use crate::{DeltaResult, Engine, Version};
 
 /// Phase that processes JSON commit files into [`ActionsBatch`]s
 pub(crate) struct CommitReader {
@@ -27,18 +26,18 @@ impl CommitReader {
         content_root_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let commit_covers = log_segment.find_commit_cover(schema, None, content_root_version)?;
-        let commit_reads = commit_covers
+        let cover_reads: Vec<DeltaResult<_>> = commit_covers
             .into_iter()
             .map(|partial_commit_cover| {
                 engine.json_handler().read_json_files(
                     &partial_commit_cover.files,
-                    partial_commit_cover.read_schema.clone(),
-                    partial_commit_cover.meta_predicate.clone(),
+                    partial_commit_cover.read_schema,
+                    partial_commit_cover.meta_predicate,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        let actions = commit_reads.into_iter().flat_map(|result| match result {
+        let actions = cover_reads.into_iter().flat_map(|result| match result {
             Ok(iter) => Box::new(iter.map_ok(|batch| ActionsBatch::new(batch, true)))
                 as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
             Err(e) => Box::new(std::iter::once(Err(e)))
@@ -68,7 +67,6 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::log_reader::commit::CommitReader;
-    use crate::log_replay::ActionsBatch;
     use crate::scan::COMMIT_READ_SCHEMA;
     use crate::utils::test_utils::load_test_table;
 
@@ -83,13 +81,9 @@ mod tests {
         let mut file_paths = vec![];
         for result in commit_phase {
             let batch = result?;
-            let ActionsBatch {
-                actions,
-                is_log_batch,
-            } = batch;
-            assert!(is_log_batch);
+            assert!(batch.is_log_batch);
 
-            let record_batch = actions.try_into_record_batch()?;
+            let record_batch = batch.actions.try_into_record_batch()?;
             let add = record_batch.column_by_name("add").unwrap();
             let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
 
