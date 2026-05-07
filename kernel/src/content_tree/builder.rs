@@ -1016,9 +1016,11 @@ impl ContentTreeNodeBuilder {
         let mut added_files_count = 0i32;
         let mut existing_files_count = 0i32;
         let mut deletes_files_count = 0i32;
+        let mut replaced_files_count = 0i32;
         let mut added_rows_count = 0i64;
         let mut existing_rows_count = 0i64;
         let mut delete_rows_count = 0i64;
+        let mut replaced_rows_count = 0i64;
         let mut min_sequence_number = i64::MAX;
 
         for entry in &self.pending_entries {
@@ -1038,6 +1040,16 @@ impl ContentTreeNodeBuilder {
                 TrackingStatus::Deleted => {
                     deletes_files_count += 1;
                     delete_rows_count += entry.record_count;
+                }
+                // Currently always 0: mark_deleted() uses Deleted for all removals.
+                // Per the v4 spec, a Remove+Add for the same file with a new DV should
+                // mark the old entry as Replaced, but the transaction layer does not yet
+                // correlate removes with adds to distinguish deletes from replacements.
+                // TODO: Update mark_deleted() to set Replaced when the same file is re-added
+                // with a new DV in the same commit.
+                TrackingStatus::Replaced => {
+                    replaced_files_count += 1;
+                    replaced_rows_count += entry.record_count;
                 }
             }
         }
@@ -1060,9 +1072,11 @@ impl ContentTreeNodeBuilder {
             added_files_count,
             existing_files_count,
             deletes_files_count,
+            replaced_files_count,
             added_rows_count,
             existing_rows_count,
             delete_rows_count,
+            replaced_rows_count,
             min_sequence_number,
             ..Default::default()
         });

@@ -68,7 +68,7 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (27 total, excluding array types):
+    // The getters are in order of flattened leaf fields (29 total, excluding array types):
     // 0: content_type
     // 1: location
     // 2: file_format
@@ -79,8 +79,8 @@ fn visit_metadata_entry_at<'a>(
     // 15: record_count
     // 16: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 17-25: manifest_info fields (9 fields, including dv and dv_cardinality)
-    // 26: key_metadata
+    // 17-27: manifest_info fields (11 fields, including dv and dv_cardinality)
+    // 28: key_metadata
     // (split_offsets excluded - array type not supported by GetData)
     // (equality_ids excluded - array type not supported by GetData)
 
@@ -114,6 +114,7 @@ fn visit_metadata_entry_at<'a>(
         0 => TrackingStatus::Existed,
         1 => TrackingStatus::Added,
         2 => TrackingStatus::Deleted,
+        3 => TrackingStatus::Replaced,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid tracking status value: {}",
@@ -167,39 +168,45 @@ fn visit_metadata_entry_at<'a>(
 
     // content_stats has no fields, so no getters
 
-    // Extract manifest_info fields (9 fields: 17-25, including dv and dv_cardinality)
+    // Extract manifest_info fields (11 fields: 17-27, including dv and dv_cardinality)
     let ms_added_files_count: Option<i32> =
         getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
     let ms_existing_files_count: Option<i32> =
         getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
     let ms_deletes_files_count: Option<i32> =
         getters[19].get_opt(row_index, "manifest_info.deletes_files_count")?;
+    let ms_replaced_files_count: Option<i32> =
+        getters[20].get_opt(row_index, "manifest_info.replaced_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_info.added_rows_count")?;
+        getters[21].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_info.existing_rows_count")?;
+        getters[22].get_opt(row_index, "manifest_info.existing_rows_count")?;
     let ms_delete_rows_count: Option<i64> =
-        getters[22].get_opt(row_index, "manifest_info.delete_rows_count")?;
+        getters[23].get_opt(row_index, "manifest_info.delete_rows_count")?;
+    let ms_replaced_rows_count: Option<i64> =
+        getters[24].get_opt(row_index, "manifest_info.replaced_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[23].get_opt(row_index, "manifest_info.min_sequence_number")?;
-    let ms_dv: Option<&[u8]> = getters[24].get_opt(row_index, "manifest_info.dv")?;
+        getters[25].get_opt(row_index, "manifest_info.min_sequence_number")?;
+    let ms_dv: Option<&[u8]> = getters[26].get_opt(row_index, "manifest_info.dv")?;
     let ms_dv_cardinality: Option<i64> =
-        getters[25].get_opt(row_index, "manifest_info.dv_cardinality")?;
+        getters[27].get_opt(row_index, "manifest_info.dv_cardinality")?;
 
     let manifest_info = ms_added_files_count.map(|added_files_count| ManifestInfo {
         added_files_count,
         existing_files_count: ms_existing_files_count.unwrap_or(0),
         deletes_files_count: ms_deletes_files_count.unwrap_or(0),
+        replaced_files_count: ms_replaced_files_count.unwrap_or(0),
         added_rows_count: ms_added_rows_count.unwrap_or(0),
         existing_rows_count: ms_existing_rows_count.unwrap_or(0),
         delete_rows_count: ms_delete_rows_count.unwrap_or(0),
+        replaced_rows_count: ms_replaced_rows_count.unwrap_or(0),
         min_sequence_number: ms_min_sequence_number.unwrap_or(0),
         dv: ms_dv.map(Bytes::copy_from_slice),
         dv_cardinality: ms_dv_cardinality,
     });
 
     // Extract key_metadata
-    let key_metadata: Option<&[u8]> = getters[26].get_opt(row_index, "key_metadata")?;
+    let key_metadata: Option<&[u8]> = getters[28].get_opt(row_index, "key_metadata")?;
     let key_metadata_bytes = key_metadata.map(Bytes::copy_from_slice);
 
     // Note: split_offsets and equality_ids are array types not supported by GetData

@@ -1570,9 +1570,11 @@ pub(crate) fn metadata_entry_to_scalars(
                         Scalar::from(ms.added_files_count),
                         Scalar::from(ms.existing_files_count),
                         Scalar::from(ms.deletes_files_count),
+                        Scalar::from(ms.replaced_files_count),
                         Scalar::from(ms.added_rows_count),
                         Scalar::from(ms.existing_rows_count),
                         Scalar::from(ms.delete_rows_count),
+                        Scalar::from(ms.replaced_rows_count),
                         Scalar::from(ms.min_sequence_number),
                         Scalar::from(ms.dv.clone()),
                         Scalar::from(ms.dv_cardinality),
@@ -1668,6 +1670,7 @@ pub enum TrackingStatus {
     Existed = 0,
     Added = 1,
     Deleted = 2,
+    Replaced = 3,
 }
 
 impl ToDataType for TrackingStatus {
@@ -1776,6 +1779,9 @@ pub(crate) struct ManifestInfo {
     /// Number of entries with DELETED status in the manifest.
     #[field_id = 506]
     pub(crate) deletes_files_count: i32,
+    /// Number of entries with REPLACED status in the manifest.
+    #[field_id = 520]
+    pub(crate) replaced_files_count: i32,
 
     /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
@@ -1786,6 +1792,9 @@ pub(crate) struct ManifestInfo {
     /// Total row count across all DELETED entries in the manifest.
     #[field_id = 514]
     pub(crate) delete_rows_count: i64,
+    /// Total row count across all REPLACED entries in the manifest.
+    #[field_id = 521]
+    pub(crate) replaced_rows_count: i64,
 
     /// Minimum data sequence number of all entries in the manifest.
     #[field_id = 516]
@@ -1821,9 +1830,11 @@ impl From<ManifestInfo> for Scalar {
             value.added_files_count.into(),
             value.existing_files_count.into(),
             value.deletes_files_count.into(),
+            value.replaced_files_count.into(),
             value.added_rows_count.into(),
             value.existing_rows_count.into(),
             value.delete_rows_count.into(),
+            value.replaced_rows_count.into(),
             value.min_sequence_number.into(),
             value.dv.into(),
             value.dv_cardinality.into(),
@@ -2425,9 +2436,8 @@ mod tests {
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // 29 leaf fields: 28 (previous) - manifestDv(1) + dv(1) + dvCardinality(1) inside
-        // manifest_info
-        assert_eq!(leaf_names.len(), 29);
+        // 31 leaf fields (6 tracking + 4 dv_info + 11 manifest_info + 10 other)
+        assert_eq!(leaf_names.len(), 31);
     }
 
     #[test]
@@ -3113,9 +3123,11 @@ mod tests {
         assert_field_id(&manifest_info_schema, "addedFilesCount", 504);
         assert_field_id(&manifest_info_schema, "existingFilesCount", 505);
         assert_field_id(&manifest_info_schema, "deletesFilesCount", 506);
+        assert_field_id(&manifest_info_schema, "replacedFilesCount", 520);
         assert_field_id(&manifest_info_schema, "addedRowsCount", 512);
         assert_field_id(&manifest_info_schema, "existingRowsCount", 513);
         assert_field_id(&manifest_info_schema, "deleteRowsCount", 514);
+        assert_field_id(&manifest_info_schema, "replacedRowsCount", 521);
         assert_field_id(&manifest_info_schema, "minSequenceNumber", 516);
         assert_field_id(&manifest_info_schema, "dv", 522);
         assert_field_id(&manifest_info_schema, "dvCardinality", 523);
@@ -3551,6 +3563,7 @@ mod tests {
             TrackingStatus::Existed,
             TrackingStatus::Added,
             TrackingStatus::Deleted,
+            TrackingStatus::Replaced,
         ];
 
         let entries: Vec<ContentTreeNodeEntry> = statuses
