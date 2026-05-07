@@ -472,7 +472,7 @@ mod tests {
         // Verify it serializes to valid JSON
         let json = serde_json::to_value(&metadata).unwrap();
 
-        assert_eq!(json["format-version"], 2);
+        assert_eq!(json["format-version"], 3);
         assert_eq!(json["table-uuid"], "d20125c8-7284-442c-9aea-15fee620737e");
         // Iceberg may strip trailing slash from location
         let location = json["location"].as_str().unwrap();
