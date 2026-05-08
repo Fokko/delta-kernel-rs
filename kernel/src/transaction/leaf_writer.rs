@@ -330,8 +330,7 @@ impl LeafNodeWriter {
     /// LeafNodeWriterResult with written manifests and tracking info
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
-        // In the new CombinedManifest model, DV info is inline on data entries,
-        // so no separate DV manifest is needed.
+        // DV info is inline on data entries, so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
             let entry = self.data_builder.write_leaf(engine, self.snapshot_id)?;
             Some(entry)

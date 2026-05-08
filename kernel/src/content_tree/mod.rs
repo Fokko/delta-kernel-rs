@@ -204,7 +204,7 @@ impl ContentTreeNode {
     /// Construct ContentTreeNode from batches with a specific version (for content root reading).
     ///
     /// Validates that the root manifest only contains supported entry types
-    /// (`Data` and `CombinedManifest`). Returns an error if any unsupported
+    /// (`Data` and `DataManifest`). Returns an error if any unsupported
     /// manifest type is found.
     pub(crate) fn from_batches_with_version(
         data: Vec<Box<dyn EngineData>>,
@@ -225,9 +225,8 @@ impl ContentTreeNode {
 
     /// Validates that the root manifest only contains supported entry types.
     ///
-    /// In the CombinedManifest model, the only supported manifest type is
-    /// `CombinedManifest` (value=5). `Data` entries (value=0) are also allowed.
-    /// Any other active entry type (DataManifest, DeleteManifest, PositionDeletes,
+    /// The only supported manifest type is `DataManifest` (value=3). `Data` entries (value=0)
+    /// are also allowed. Any other active entry type (DeleteManifest, PositionDeletes,
     /// EqualityDeletes) causes an `Error::unsupported`.
     fn validate_root_manifest_entries(&self) -> DeltaResult<()> {
         use std::sync::LazyLock;
@@ -266,11 +265,10 @@ impl ContentTreeNode {
                     }
 
                     match content_type_int {
-                        0 | 5 => {} // Data or CombinedManifest — supported
-                        3 | 4 => {
+                        0 | 3 => {} // Data or DataManifest — supported
+                        4 => {
                             return Err(Error::unsupported(
-                                "DataManifest/DeleteManifest format is not supported; \
-                                 only CombinedManifest (type 5) is supported in the content tree",
+                                "DeleteManifest format is not supported in the content tree",
                             ))
                         }
                         1 => return Err(Error::unsupported(
@@ -1061,13 +1059,13 @@ impl ContentTreeNode {
     /// This method implements the hierarchical metadata tree structure described in the
     /// Iceberg Single File Commits specification. It parses the root manifest and identifies:
     ///
-    /// - **CombinedManifest files** (content_type = CombinedManifest): References to child
-    ///   manifests containing actual data file entries with optional inline DV info
-    /// - **Manifest deletion vectors**: Stored inline in the `manifest_dv` field of
-    ///   CombinedManifest entries. Applied during manifest reading to filter out deleted entries.
+    /// - **DataManifest files** (content_type = DataManifest): References to child manifests
+    ///   containing actual data file entries with optional inline DV info
+    /// - **Manifest deletion vectors**: Stored inline in the `manifest_dv` field of DataManifest
+    ///   entries. Applied during manifest reading to filter out deleted entries.
     ///
     /// # Returns
-    /// A `LeafReferences` containing one `ManifestReference` per CombinedManifest in the root.
+    /// A `LeafReferences` containing one `ManifestReference` per DataManifest in the root.
     ///
     ///
     /// # Parameters
@@ -1180,17 +1178,16 @@ impl ContentTreeNode {
         };
 
         // Separate entries by type
-        let mut combined_manifest_entries = Vec::new();
+        let mut data_manifest_entries = Vec::new();
         let mut data_file_entries = Vec::new();
 
         for entry in entries {
             match entry.content_type {
-                DataContentType::CombinedManifest => combined_manifest_entries.push(entry),
+                DataContentType::DataManifest => data_manifest_entries.push(entry),
                 DataContentType::Data => data_file_entries.push(entry),
-                DataContentType::DataManifest | DataContentType::DeleteManifest => {
+                DataContentType::DeleteManifest => {
                     return Err(Error::generic(
-                        "Old DataManifest/DeleteManifest format is no longer supported; \
-                         use CombinedManifest format",
+                        "DeleteManifest format is not supported in the content tree",
                     ));
                 }
                 DataContentType::PositionDeletes => {
@@ -1204,9 +1201,9 @@ impl ContentTreeNode {
             }
         }
 
-        // CombinedManifest entries have inline DV info — no joining needed.
+        // DataManifest entries have inline DV info — no joining needed.
         // Each entry produces a ManifestReference.
-        let manifest_references: Vec<ManifestReference> = combined_manifest_entries
+        let manifest_references: Vec<ManifestReference> = data_manifest_entries
             .into_iter()
             .map(|data_entry| ManifestReference {
                 data_manifest: FilteredManifest::new(data_entry),
@@ -1602,9 +1599,8 @@ pub enum DataContentType {
     PositionDeletes = 1,
     EqualityDeletes = 2,
     // Types below are only allowed in the root
-    DataManifest = 3,     // kept for backwards compat reading
-    DeleteManifest = 4,   // kept for backwards compat reading
-    CombinedManifest = 5, // unified manifest with inline DV info
+    DataManifest = 3,   // manifest of data files with inline DV info
+    DeleteManifest = 4, // kept for backwards compat reading only
 }
 
 // ToDataType implementations for enums
@@ -3747,7 +3743,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, DV is inline on Data entries.
+        // DV is inline on Data entries.
         // A Data entry with dv_info: None produces an Add with no deletionVector.
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
@@ -3852,7 +3848,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with dv_info produces an Add with a DV.
+        // A Data entry with dv_info produces an Add with a DV.
         // Use a relative DV path format: deletion_vector_{uuid}.bin
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
@@ -4015,7 +4011,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, each Data entry has its own inline DV.
+        // Each Data entry has its own inline DV.
         // Two data entries, each with a different DV, both should produce Add actions with DVs.
         let dv_loc1 = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let dv_loc2 = "deletion_vector_87654321-4321-4321-4321-cba987654321.bin";
@@ -4118,8 +4114,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with Deleted tracking status
-        // should not produce any Add action (it produces a Remove action instead).
+        // A Data entry with Deleted tracking status should not produce any Add action
+        // (it produces a Remove action instead).
         let mut data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
             .tracking(TrackingInfo {
@@ -4167,36 +4163,12 @@ mod tests {
     }
 
     #[test]
-    fn test_old_data_manifest_format_returns_error() -> DeltaResult<()> {
-        // Old DataManifest/DeleteManifest format is no longer supported.
-        // manifest_references() should return an error for these entry types.
+    fn test_delete_manifest_format_returns_error() -> DeltaResult<()> {
+        // DeleteManifest format is not supported; manifest_references() should return an error.
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
-            .location("memory:///data-manifest.parquet")
-            .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            })
-            .record_count(100)
-            .file_size_in_bytes(1024)
-            .manifest_info(ManifestInfo {
-                added_files_count: 10,
-                existing_files_count: 90,
-                deletes_files_count: 0,
-                added_rows_count: 1000,
-                existing_rows_count: 9000,
-                delete_rows_count: 0,
-                min_sequence_number: 50,
-                ..Default::default()
-            })
-            .build();
         let delete_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DeleteManifest)
             .location("memory:///delete-manifest.parquet")
             .tracking(TrackingInfo {
@@ -4221,23 +4193,17 @@ mod tests {
             })
             .build();
 
-        let metadata = build_node(
-            vec![data_manifest, delete_manifest],
-            0,
-            &table_root_url,
-            &engine,
-        )?;
+        let metadata = build_node(vec![delete_manifest], 0, &table_root_url, &engine)?;
 
-        // Old format should return an error
         let result = metadata.manifest_references(None, None, None, None, None);
         assert!(
             result.is_err(),
-            "Old DataManifest/DeleteManifest format should return an error"
+            "DeleteManifest format should return an error"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("no longer supported"),
-            "Error should mention format is no longer supported: {err_msg}"
+            err_msg.contains("DeleteManifest"),
+            "Error should mention DeleteManifest: {err_msg}"
         );
 
         Ok(())
@@ -4245,14 +4211,13 @@ mod tests {
 
     #[test]
     fn test_from_batches_with_version_rejects_unsupported_types() -> DeltaResult<()> {
-        // from_batches_with_version() should reject DataManifest, DeleteManifest,
-        // PositionDeletes, and EqualityDeletes entries at root-read time.
+        // from_batches_with_version() should reject DeleteManifest, PositionDeletes,
+        // and EqualityDeletes entries at root-read time.
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         let unsupported_cases: &[(DataContentType, &str)] = &[
-            (DataContentType::DataManifest, "DataManifest"),
             (DataContentType::DeleteManifest, "DeleteManifest"),
             (DataContentType::PositionDeletes, "PositionDeletes"),
             (DataContentType::EqualityDeletes, "EqualityDeletes"),
@@ -4304,15 +4269,15 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_references_combined_manifest() -> DeltaResult<()> {
-        // Test that CombinedManifest entries work correctly with manifest_references()
+    fn test_manifest_references_data_manifest() -> DeltaResult<()> {
+        // Test that DataManifest entries work correctly with manifest_references()
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // CombinedManifest entries contain data files + optional inline DVs
-        let combined_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-            .location("memory:///combined-manifest.parquet")
+        // DataManifest entries contain data files + optional inline DVs
+        let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("memory:///data-manifest.parquet")
             .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(1),
@@ -4325,16 +4290,16 @@ mod tests {
             .file_size_in_bytes(1024)
             .build();
 
-        let metadata = build_node(vec![combined_manifest], 0, &table_root_url, &engine)?;
+        let metadata = build_node(vec![data_manifest], 0, &table_root_url, &engine)?;
 
         let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
-        // CombinedManifest produces one manifest reference
+        // DataManifest produces one manifest reference
         assert_eq!(root_state.manifest_references.len(), 1);
         let refs = &root_state.manifest_references[0];
         assert_eq!(
             refs.data_manifest.manifest.location.as_ref().unwrap(),
-            "memory:///combined-manifest.parquet"
+            "memory:///data-manifest.parquet"
         );
 
         Ok(())
@@ -4430,56 +4395,53 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Create a root manifest that references both child manifests (as CombinedManifest, new
-        // format)
-        let data_manifest_entry_1 =
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-                .location(child_manifest_url_1.as_str())
-                .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(100),
-                    file_sequence_number: Some(100),
-                    first_row_id: Some(0),
-                    changes_dv: None,
-                })
-                .record_count(100)
-                .file_size_in_bytes(1024)
-                .manifest_info(ManifestInfo {
-                    added_files_count: 10,
-                    existing_files_count: 90,
-                    deletes_files_count: 0,
-                    added_rows_count: 1000,
-                    existing_rows_count: 9000,
-                    delete_rows_count: 0,
-                    min_sequence_number: 50,
-                    ..Default::default()
-                })
-                .build();
-        let data_manifest_entry_2 =
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-                .location(child_manifest_url_2.as_str())
-                .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(100),
-                    file_sequence_number: Some(100),
-                    first_row_id: Some(0),
-                    changes_dv: None,
-                })
-                .record_count(100)
-                .file_size_in_bytes(1024)
-                .manifest_info(ManifestInfo {
-                    added_files_count: 10,
-                    existing_files_count: 90,
-                    deletes_files_count: 0,
-                    added_rows_count: 1000,
-                    existing_rows_count: 9000,
-                    delete_rows_count: 0,
-                    min_sequence_number: 50,
-                    ..Default::default()
-                })
-                .build();
+        // Create a root manifest that references both child manifests as DataManifest entries
+        let data_manifest_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(child_manifest_url_1.as_str())
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .manifest_info(ManifestInfo {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deletes_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                delete_rows_count: 0,
+                min_sequence_number: 50,
+                ..Default::default()
+            })
+            .build();
+        let data_manifest_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(child_manifest_url_2.as_str())
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .manifest_info(ManifestInfo {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deletes_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                delete_rows_count: 0,
+                min_sequence_number: 50,
+                ..Default::default()
+            })
+            .build();
 
         let root_metadata = build_node(
             vec![data_manifest_entry_1, data_manifest_entry_2],
@@ -4837,15 +4799,14 @@ mod tests {
         // Let's find all manifests and read them to find PositionDeletes
         let mut found_position_deletes_count = 0;
 
-        // In the new CombinedManifest model, DV info is inline on Data entries.
-        // Check CombinedManifest entries in root — they point to leaf manifests
-        // that contain Data entries with inline dv_info.
+        // DV info is inline on Data entries. Check DataManifest entries in root —
+        // they point to leaf manifests that contain Data entries with inline dv_info.
         for entry in &root_entries {
-            if matches!(entry.content_type, DataContentType::CombinedManifest) {
+            if matches!(entry.content_type, DataContentType::DataManifest) {
                 let manifest_path = entry
                     .location
                     .as_ref()
-                    .expect("CombinedManifest should have location");
+                    .expect("DataManifest should have location");
                 let manifest_url = table_url.join(manifest_path)?;
                 let (iter, version, path_in_log) = ContentTreeNode::open_stream(
                     engine.parquet_handler(),

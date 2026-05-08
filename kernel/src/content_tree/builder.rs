@@ -362,9 +362,7 @@ impl ContentTreeNodeBuilder {
             // Only process manifest entries
             if !matches!(
                 entry.content_type,
-                DataContentType::DataManifest
-                    | DataContentType::DeleteManifest
-                    | DataContentType::CombinedManifest
+                DataContentType::DataManifest | DataContentType::DeleteManifest
             ) {
                 continue;
             }
@@ -723,9 +721,7 @@ impl ContentTreeNodeBuilder {
         // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
-            DataContentType::DataManifest
-                | DataContentType::DeleteManifest
-                | DataContentType::CombinedManifest
+            DataContentType::DataManifest | DataContentType::DeleteManifest
         ) {
             if let Some(ref location) = entry.location {
                 // Get total entry count from manifest_info for bounds checking
@@ -832,9 +828,7 @@ impl ContentTreeNodeBuilder {
             .filter(|entry| {
                 !matches!(
                     entry.content_type,
-                    DataContentType::DataManifest
-                        | DataContentType::DeleteManifest
-                        | DataContentType::CombinedManifest
+                    DataContentType::DataManifest | DataContentType::DeleteManifest
                 )
             })
             .filter_map(|entry| entry.location.clone())
@@ -845,9 +839,7 @@ impl ContentTreeNodeBuilder {
             // Remove actual data/DV entries from root
             matches!(
                 entry.content_type,
-                DataContentType::DataManifest
-                    | DataContentType::DeleteManifest
-                    | DataContentType::CombinedManifest
+                DataContentType::DataManifest | DataContentType::DeleteManifest
             )
         });
 
@@ -1089,7 +1081,7 @@ impl ContentTreeNodeBuilder {
         );
 
         Ok(
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+            ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
                 .location(manifest_path)
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -3224,13 +3216,13 @@ mod tests {
         // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
-        // Should have: 1 CombinedManifest (DV is now inline on this entry)
+        // Should have: 1 DataManifest entry
         assert_eq!(root_entries.len(), 1);
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
@@ -3310,11 +3302,11 @@ mod tests {
 
         // Build, write, and read back the root to verify
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
-        assert_eq!(root_entries.len(), 1); // CombinedManifest (DV is inline)
+        assert_eq!(root_entries.len(), 1); // DataManifest entry
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
 
         // Verify all deleted indices in manifest_dv field
@@ -3387,7 +3379,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::CombinedManifest
+                e.content_type == DataContentType::DataManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3507,7 +3499,7 @@ mod tests {
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
@@ -3542,7 +3534,7 @@ mod tests {
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
-        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("leaf-manifest.parquet")
             .with_tracking(TrackingStatus::Added, 1, 1)
             .record_count(5) // Total entries in the leaf
@@ -3576,7 +3568,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::CombinedManifest
+                e.content_type == DataContentType::DataManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3645,8 +3637,8 @@ mod tests {
         let entries_v1 = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest_v1 = entries_v1
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains both deletions (2 and 5)
         let manifest_dv_v1 = manifest_v1
@@ -3685,8 +3677,8 @@ mod tests {
         let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, 2)?;
         let manifest_v2 = entries_v2
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
         let manifest_dv_v2 = manifest_v2
@@ -3739,8 +3731,8 @@ mod tests {
         let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, 3)?;
         let manifest_v3 = entries_v3
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
         let manifest_dv_v3 = manifest_v3
@@ -3805,8 +3797,8 @@ mod tests {
         let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, 4)?;
         let manifest_v4 = entries_v4
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
         let manifest_dv_v4 = manifest_v4
@@ -3874,8 +3866,8 @@ mod tests {
         let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains the deletions (for internal tracking)
         let manifest_dv = manifest
