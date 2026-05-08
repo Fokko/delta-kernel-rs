@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::log_reader::commit::CommitReader;
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
+use crate::schema::Schema;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, FileMeta, FilteredEngineData, Version};
@@ -78,8 +79,8 @@ impl ExplicitRootManifestCommit {
 /// [`EngineData`]: crate::EngineData
 /// [`add_pre_built_log_batch`]: ContentTreeNodeBuilder::add_pre_built_log_batch
 fn replay_log_commits(
-    processor: &mut ContentRootRebuildProcessor,
     engine: &dyn Engine,
+    processor: &mut ContentRootRebuildProcessor,
     log_segment: &crate::log_segment::LogSegment,
     from_version: Version,
 ) -> DeltaResult<Vec<Box<dyn crate::EngineData>>> {
@@ -92,17 +93,19 @@ fn replay_log_commits(
     )?;
     let mut batches = Vec::new();
     for batch in reader {
-        if let Some(fed) = processor.process_log_batch(batch?)? {
-            batches.push(fed.apply_selection_vector()?);
+        let filtered_batch = processor.process_actions_batch(batch?)?;
+        if filtered_batch.has_selected_rows() {
+            batches.push(filtered_batch.apply_selection_vector()?);
         }
     }
+
     Ok(batches)
 }
 
 /// Applies `processor` over the existing content root and returns the live entries.
 fn replay_content_root(
-    processor: &mut ContentRootRebuildProcessor,
     engine: &dyn Engine,
+    processor: &mut ContentRootRebuildProcessor,
     root_path_str: &str,
     table_root: &Url,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
@@ -384,53 +387,72 @@ impl ManifestCommitState {
         // If a content root exists and is current, load it directly and return — no replay needed.
         // Otherwise fall through: either no checkpoint (replay from v0) or log commits exist
         // after the checkpoint version (replay from checkpoint.version + 1).
-        let (log_start_version, root_path) =
-            if let Some(checkpoint_action) = self.read_snapshot.checkpoint_action() {
-                let log_start_version = checkpoint_action.version + 1;
-                if log_start_version > current_version {
-                    let mut builder = ContentTreeNodeBuilder::from_content_root(
-                        engine,
-                        &checkpoint_action.content_root,
-                        table_root,
-                        physical_schema,
-                        self.version_to_write,
-                    )?;
-                    if self.root_released {
-                        builder.clear_root_data_and_dv_entries();
-                    }
-                    return Ok(builder);
-                }
-                (
-                    log_start_version,
-                    Some(checkpoint_action.content_root.path.clone()),
+        let mut builder = match self.read_snapshot.checkpoint_action() {
+            Some(checkpoint_action) if checkpoint_action.version + 1 > current_version => {
+                ContentTreeNodeBuilder::from_content_root(
+                    engine,
+                    &checkpoint_action.content_root,
+                    table_root,
+                    physical_schema,
+                    self.version_to_write,
+                )?
+            }
+            _ if self.root_released => {
+                // TODO: Process incremental removes from delta log and mark them as DELETED in the
+                // appropriate leaf manifests. This can be done by calling `replay_log_commits`,
+                // discarding the returned batches, and then applying
+                // `processor.deleted_leaf_positions_by_location()` to `builder`.
+                ContentTreeNodeBuilder::new_for(table_root, self.version_to_write, physical_schema)
+            }
+            Some(checkpoint_action) => {
+                return self.replay_actions_and_apply_to_builder(
+                    engine,
+                    table_root,
+                    physical_schema,
+                    checkpoint_action.version + 1,
+                    Some(checkpoint_action.content_root.path.as_str()),
                 )
-            } else {
-                (0, None)
-            };
-
-        let mut builder = ContentTreeNodeBuilder::new_for(
-            table_root.clone(),
-            self.version_to_write,
-            physical_schema.clone(),
-        );
+            }
+            None => {
+                return self.replay_actions_and_apply_to_builder(
+                    engine,
+                    table_root,
+                    physical_schema,
+                    0,
+                    None,
+                )
+            }
+        };
 
         if self.root_released {
             builder.clear_root_data_and_dv_entries();
-            // TODO: Process incremental removes from delta log and mark them as DELETED in the
-            // appropriate leaf manifests. This can be done by calling `replay_log_commits`,
-            // discarding the returned batches, and then applying
-            // `processor.deleted_leaf_positions_by_location()` to `builder`.
-            return Ok(builder);
         }
+        Ok(builder)
+    }
 
+    /// Replays the delta log commits (and the existing content root, if present) into a fresh
+    /// builder.
+    fn replay_actions_and_apply_to_builder(
+        &self,
+        engine: &dyn Engine,
+        table_root: Url,
+        physical_schema: Schema,
+        log_start_version: Version,
+        root_path: Option<&str>,
+    ) -> DeltaResult<ContentTreeNodeBuilder> {
         let mut processor =
-            ContentRootRebuildProcessor::new(engine, self.snapshot_id, physical_schema)?;
+            ContentRootRebuildProcessor::new(engine, self.snapshot_id, &physical_schema)?;
+        let mut builder = ContentTreeNodeBuilder::new_for(
+            table_root.clone(),
+            self.version_to_write,
+            physical_schema,
+        );
         let log_segment = self.read_snapshot.log_segment();
-        for data in replay_log_commits(&mut processor, engine, log_segment, log_start_version)? {
+        for data in replay_log_commits(engine, &mut processor, log_segment, log_start_version)? {
             builder.add_pre_built_log_batch(data)?;
         }
-        if let Some(root_path) = root_path.as_deref() {
-            for entry in replay_content_root(&mut processor, engine, root_path, &table_root)? {
+        if let Some(root_path) = root_path {
+            for entry in replay_content_root(engine, &mut processor, root_path, &table_root)? {
                 builder.add_entry(entry);
             }
             for (leaf_path, bitmap) in processor.deleted_leaf_positions_by_location() {
@@ -439,7 +461,6 @@ impl ManifestCommitState {
                 }
             }
         }
-
         Ok(builder)
     }
 

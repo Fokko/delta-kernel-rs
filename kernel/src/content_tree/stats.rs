@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 use crate::content_tree::{
@@ -21,7 +22,9 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, PrimitiveType,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData, Error};
+#[cfg(test)]
+use crate::Error;
+use crate::{DeltaResult, Engine, EngineData};
 
 /// Number of supported stats per column.
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
@@ -494,6 +497,7 @@ pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType>
 /// The optional `tightBounds` field indicates whether the statistics are exact:
 /// - `true` (or absent): bounds are tight/exact, accurately representing the data
 /// - `false`: bounds may be wider than actual data (e.g., due to deletion vectors)
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct DeltaJsonStats {
     num_records: Option<i64>,
@@ -506,6 +510,7 @@ struct DeltaJsonStats {
     tight_bounds: bool,
 }
 
+#[cfg(test)]
 impl DeltaJsonStats {
     /// Parse a JSON stats string from Delta Protocol format.
     ///
@@ -566,6 +571,7 @@ impl DeltaJsonStats {
 }
 
 /// Converts a JSON value to a Scalar based on the expected data type.
+#[cfg(test)]
 fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scalar> {
     match data_type {
         DataType::Primitive(ptype) => match ptype {
@@ -636,6 +642,7 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
 /// * `max_value` - The maximum value (upper_bound)
 /// * `null_count` - The count of null values
 /// * `tight_bounds` - Whether the bounds are tight/exact (from Delta's `tightBounds` field)
+#[cfg(test)]
 fn build_column_stats(
     field: &StructField,
     stats_struct: &StructType,
@@ -677,6 +684,7 @@ fn build_column_stats(
 }
 
 /// Recursively builds content_stats StructData for a struct field.
+#[cfg(test)]
 fn build_struct_stats(
     table_struct: &StructType,
     stats_struct: &StructType,
@@ -1164,6 +1172,7 @@ pub(crate) fn delta_json_stats_to_content_stats(
 ///
 /// Unlike [`delta_json_stats_to_content_stats`], errors when `stats_json` is present but cannot
 /// be parsed or is missing `numRecords`. Returns `Ok((None, 0))` when `stats_json` is absent.
+#[cfg(test)]
 pub(crate) fn parse_delta_add_stats(
     stats_json: Option<&str>,
     table_schema: &StructType,

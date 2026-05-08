@@ -9,9 +9,9 @@ use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorSt
 #[cfg(test)]
 use crate::actions::Add;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+use crate::content_tree::stats::aggregate_content_stats;
 #[cfg(test)]
-use crate::content_tree::stats::merge_partition_values_into_stats;
-use crate::content_tree::stats::{aggregate_content_stats, parse_delta_add_stats};
+use crate::content_tree::stats::{merge_partition_values_into_stats, parse_delta_add_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
@@ -23,8 +23,9 @@ use crate::content_tree::{
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
-use crate::log_replay::{ActionsBatch, FileActionKey};
+use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
 use crate::row_tracking::CursorRowIdAllocator;
+use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{
     column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
     StructField, StructType,
@@ -1513,27 +1514,7 @@ impl ContentTreeNodeBuilder {
 
         // Step 3: Append 4 flat _dv_* columns if any DV rows are present; build input schema.
         let (transformed_data, input_schema) = if dv_visitor.has_any_dv() {
-            let augmented = stats_engine_data.append_columns(
-                DV_DECODED_FLAT_SCHEMA.clone(),
-                vec![
-                    ArrayData::try_new(
-                        ArrayType::new(DataType::STRING, true),
-                        dv_visitor.decoded_paths,
-                    )?,
-                    ArrayData::try_new(
-                        ArrayType::new(DataType::LONG, true),
-                        dv_visitor.decoded_offsets,
-                    )?,
-                    ArrayData::try_new(
-                        ArrayType::new(DataType::LONG, true),
-                        dv_visitor.decoded_sizes,
-                    )?,
-                    ArrayData::try_new(
-                        ArrayType::new(DataType::LONG, true),
-                        dv_visitor.decoded_cardinalities,
-                    )?,
-                ],
-            )?;
+            let augmented = dv_visitor.append_decoded_dv_columns(stats_engine_data.as_ref())?;
             let mut fields: Vec<StructField> = stats_augmented_schema.fields().cloned().collect();
             fields.extend(DV_DECODED_FLAT_SCHEMA.fields().cloned());
             let schema = Arc::new(StructType::new_unchecked(fields));
@@ -1834,6 +1815,144 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// Builds an evaluator that projects `add.path`, `add.size`,
+/// `add.defaultRowCommitVersion` and parses `add.stats` JSON into a
+/// `stats_parsed` struct matching `delta_stats_schema`.
+fn build_log_batch_evaluator(
+    engine: &dyn Engine,
+    delta_stats_schema: &SchemaRef,
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let input_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "add",
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+        ]))),
+    )]));
+
+    let output_schema = DataType::Struct(Box::new(StructType::new_unchecked([
+        StructField::nullable(
+            "add",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("path", DataType::STRING),
+                StructField::nullable("size", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+            ]))),
+        ),
+        StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
+        ),
+    ])));
+
+    let expression = Arc::new(Expression::struct_from([
+        Expression::struct_from([
+            Expression::column(["add", "path"]),
+            Expression::column(["add", "size"]),
+            Expression::column(["add", "defaultRowCommitVersion"]),
+        ]),
+        Expression::parse_json(
+            Expression::column(["add", "stats"]),
+            delta_stats_schema.clone(),
+        ),
+    ]));
+
+    engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, expression, output_schema)
+}
+
+/// Builds an evaluator that assembles `ContentTreeNodeEntry` rows from the
+/// prepared log columns and decoded DV columns, shaped to `output_schema`.
+fn build_action_to_content_tree_entry_evaluator(
+    engine: &dyn Engine,
+    snapshot_id: i64,
+    table_schema: &Schema,
+    delta_stats_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    // Output schema's content_stats field is always a struct by construction;
+    // unwrap once and reuse across the field-expr loop.
+    let amt_content_stats_schema = match output_schema
+        .field(CONTENT_STATS_FIELD_NAME)
+        .map(|f| f.data_type())
+    {
+        Some(DataType::Struct(s)) => s.as_ref().clone(),
+        _ => StructType::new_unchecked([]),
+    };
+
+    let input_schema = Arc::new(StructType::new_unchecked(
+        [StructField::nullable(
+            "add",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("path", DataType::STRING),
+                StructField::nullable("size", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+            ]))),
+        )]
+        .into_iter()
+        .chain(DV_DECODED_FLAT_SCHEMA.fields().cloned())
+        .chain([StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
+        )])
+        .collect::<Vec<_>>(),
+    ));
+
+    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
+    let null_if_no_dv =
+        Expression::from_pred(Predicate::is_not_null(Expression::column(["_dv_location"])));
+    let dv_info_expr = Expression::struct_with_nullability_from(
+        [
+            Expression::column(["_dv_location"]),
+            Expression::column(["_dv_offset"]),
+            Expression::column(["_dv_size_in_bytes"]),
+            Expression::column(["_dv_cardinality"]),
+        ],
+        null_if_no_dv,
+    );
+
+    let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+    for field in output_schema.fields() {
+        let expr: Expression = match field.name().as_str() {
+            "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+            "location" => Expression::column(["add", "path"]),
+            "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
+            "tracking" => Expression::struct_from([
+                Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
+                snapshot_id_expr.clone(),
+                Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
+                Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
+                Expression::null_literal(DataType::LONG),               // firstRowId
+                Expression::null_literal(DataType::BINARY),             // changesDv
+            ]),
+            "deletionVector" => dv_info_expr.clone(),
+            "specId" => Expression::literal(Scalar::Integer(0)),
+            "sortOrderId" => Expression::null_literal(DataType::INTEGER),
+            "recordCount" => Expression::coalesce([
+                Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS]),
+                // Remove actions have no stats; default the record count to 0.
+                Expression::literal(Scalar::Long(0)),
+            ]),
+            CONTENT_STATS_FIELD_NAME => build_content_stats_from_delta_stats_parsed(
+                table_schema,
+                &amt_content_stats_schema,
+            )?,
+            "fileSizeInBytes" => Expression::column(["add", "size"]),
+            _ => Expression::null_literal(field.data_type().clone()),
+        };
+        field_exprs.push(Arc::new(expr));
+    }
+
+    engine.evaluation_handler().new_expression_evaluator(
+        input_schema,
+        Arc::new(Expression::struct_from(field_exprs)),
+        DataType::Struct(Box::new(output_schema.as_ref().clone())),
+    )
+}
+
 /// Visits rows in one pass, accumulating decoded DV columns.
 ///
 /// For rows with a DV: decodes path (base85 UUID → relative path), widens offset/sizeInBytes
@@ -1870,6 +1989,21 @@ impl DecodedDvVisitor {
 
     fn has_any_dv(&self) -> bool {
         self.decoded_paths.iter().any(|s| !s.is_null())
+    }
+
+    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        data.append_columns(
+            DV_DECODED_FLAT_SCHEMA.clone(),
+            vec![
+                ArrayData::try_new(ArrayType::new(DataType::STRING, true), self.decoded_paths)?,
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_offsets)?,
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_sizes)?,
+                ArrayData::try_new(
+                    ArrayType::new(DataType::LONG, true),
+                    self.decoded_cardinalities,
+                )?,
+            ],
+        )
     }
 }
 
@@ -1967,60 +2101,6 @@ struct LeafManifestIndex {
 // ===========================================================================================
 // AMT log replay helpers
 // ===========================================================================================
-
-/// Parses `add.stats` JSON into `(record_count, content_stats)` for selected rows only.
-/// Non-selected rows get `0` / null to keep output lengths consistent with `row_count`.
-struct LogBatchStatsVisitor<'a> {
-    table_schema: &'a crate::schema::StructType,
-    content_stats_type: DataType,
-    selection_vector: &'a [bool],
-    record_counts: Vec<crate::expressions::Scalar>,
-    content_stats_scalars: Vec<crate::expressions::Scalar>,
-}
-
-impl RowVisitor for LogBatchStatsVisitor<'_> {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("add.stats"),
-                column_name!("add.deletionVector.storageType"),
-            ];
-            let types = vec![DataType::STRING, DataType::STRING];
-            (names, types).into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        for i in 0..row_count {
-            if !self.selection_vector[i] {
-                self.record_counts.push(Scalar::Long(0));
-                self.content_stats_scalars
-                    .push(Scalar::Null(self.content_stats_type.clone()));
-                continue;
-            }
-            let stats_json: Option<String> = getters[0].get_opt(i, "add.stats")?;
-            let has_dv: bool = getters[1]
-                .get_opt(i, "add.deletionVector.storageType")?
-                .map(|_: String| true)
-                .unwrap_or(false);
-            let tight_bounds_when_null = has_dv.then_some(false);
-            let (content_stats, record_count) = parse_delta_add_stats(
-                stats_json.as_deref(),
-                self.table_schema,
-                tight_bounds_when_null,
-            )?;
-            self.record_counts.push(Scalar::Long(record_count));
-            match content_stats {
-                Some(sd) => self.content_stats_scalars.push(Scalar::Struct(sd)),
-                None => self
-                    .content_stats_scalars
-                    .push(Scalar::Null(self.content_stats_type.clone())),
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Single-pass visitor that deduplicates a log batch for AMT replay.
 /// Sets `selection_vector[i] = true` for first-seen Add rows; updates `log_action_keys`
@@ -2167,199 +2247,46 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
 pub(crate) struct ContentRootRebuildProcessor {
     log_action_keys: HashSet<FileActionKey>,
     leaf_removes: Vec<LeafManifestIndex>,
-    /// Physical table schema; passed to `LogBatchStatsVisitor` for per-row stats parsing.
-    table_schema: StructType,
-    /// Type of the `content_stats` column; used to build null scalars for unselected rows.
-    content_stats_type: DataType,
-    /// Pre-built evaluator: raw log batch + `_dv_*` + `_stats_*` columns → ContentTreeNodeEntry
-    /// schema.
-    action_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// Builds ContentTreeNodeEntry rows from the log and DV columns.
+    action_to_content_tree_entry_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// Projects the `add` columns and parses `add.stats` JSON.
+    log_batch_evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
 impl ContentRootRebuildProcessor {
-    /// Creates a new processor and pre-builds the expression evaluator.
+    /// Creates a new processor and pre-builds the expression evaluators.
     ///
     /// # Parameters
     /// - `engine`: Engine for constructing expression evaluators.
     /// - `snapshot_id`: Stamped into tracking info for each emitted log-batch entry.
     /// - `table_schema`: Physical table schema. Used to derive the content_stats output schema.
+    ///   Only read during construction; not retained.
     pub(crate) fn new(
         engine: &dyn Engine,
         snapshot_id: i64,
-        table_schema: Schema,
+        table_schema: &Schema,
     ) -> DeltaResult<Self> {
-        // Output schema: ContentTreeNodeEntry with content_stats derived from delta stats schema.
-        let delta_stats_schema = Arc::new(build_delta_stats_schema(&table_schema));
+        let delta_stats_schema = Arc::new(build_delta_stats_schema(table_schema));
         let output_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
-            &table_schema,
+            table_schema,
             &delta_stats_schema,
         )?);
 
-        // content_stats type: extracted from output schema for building null scalars and the
-        // stats-decoded append schema.
-        let content_stats_type = output_schema
-            .field(CONTENT_STATS_FIELD_NAME)
-            .map(|f| f.data_type().clone())
-            .unwrap_or_else(|| DataType::Struct(Box::new(StructType::new_unchecked([]))));
-
-        // Schema for the two stats columns appended by LogBatchStatsVisitor.
-        let stats_decoded_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("_stats_record_count", DataType::LONG),
-            StructField::nullable("_stats_content_stats", content_stats_type.clone()),
-        ]));
-
-        // Input schema: add.{path, size, defaultRowCommitVersion} + decoded DV columns + stats
-        // columns.
-        let action_input_schema = Arc::new(StructType::new_unchecked(
-            [StructField::nullable(
-                "add",
-                DataType::Struct(Box::new(StructType::new_unchecked([
-                    StructField::nullable("path", DataType::STRING),
-                    StructField::nullable("size", DataType::LONG),
-                    StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                ]))),
-            )]
-            .into_iter()
-            .chain(DV_DECODED_FLAT_SCHEMA.fields().cloned())
-            .chain(stats_decoded_schema.fields().cloned())
-            .collect::<Vec<_>>(),
-        ));
-
-        let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-        let null_if_no_dv =
-            Expression::from_pred(Predicate::is_not_null(Expression::column(["_dv_location"])));
-        let deletion_vector_expr = Expression::struct_with_nullability_from(
-            [
-                Expression::column(["_dv_location"]),
-                Expression::column(["_dv_offset"]),
-                Expression::column(["_dv_size_in_bytes"]),
-                Expression::column(["_dv_cardinality"]),
-            ],
-            null_if_no_dv,
-        );
-
-        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
-        for field in output_schema.fields() {
-            let expr: Expression = match field.name().as_str() {
-                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
-                "location" => Expression::column(["add", "path"]),
-                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-                "tracking" => Expression::struct_from([
-                    Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
-                    snapshot_id_expr.clone(),
-                    Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
-                    Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
-                    Expression::null_literal(DataType::LONG),               // firstRowId
-                    Expression::null_literal(DataType::BINARY),             // changesDv
-                ]),
-                "deletionVector" => deletion_vector_expr.clone(),
-                "specId" => Expression::literal(Scalar::Integer(0)),
-                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
-                // recordCount and content_stats come from LogBatchStatsVisitor pre-parsed columns.
-                "recordCount" => Expression::column(["_stats_record_count"]),
-                "fileSizeInBytes" => Expression::column(["add", "size"]),
-                CONTENT_STATS_FIELD_NAME => Expression::column(["_stats_content_stats"]),
-                _ => Expression::null_literal(field.data_type().clone()),
-            };
-            field_exprs.push(Arc::new(expr));
-        }
-        let action_evaluator = engine.evaluation_handler().new_expression_evaluator(
-            action_input_schema,
-            Arc::new(Expression::struct_from(field_exprs)),
-            DataType::Struct(Box::new(output_schema.as_ref().clone())),
+        let log_batch_evaluator = build_log_batch_evaluator(engine, &delta_stats_schema)?;
+        let action_to_content_tree_entry_evaluator = build_action_to_content_tree_entry_evaluator(
+            engine,
+            snapshot_id,
+            table_schema,
+            &delta_stats_schema,
+            &output_schema,
         )?;
 
         Ok(Self {
             log_action_keys: HashSet::new(),
             leaf_removes: Vec::new(),
-            table_schema,
-            content_stats_type,
-            action_evaluator,
+            action_to_content_tree_entry_evaluator,
+            log_batch_evaluator,
         })
-    }
-
-    /// Processes a log batch (`is_log_batch = true`).
-    ///
-    /// [`LogBatchDedupVisitor`] is the single visitor pass: it builds a selection vector marking
-    /// surviving Add rows and accumulates leaf removes. The surviving rows are converted to
-    /// ContentTreeNodeEntry schema via the pre-built expression evaluator and returned as a
-    /// [`FilteredEngineData`] paired with the selection vector.
-    ///
-    /// Returns `None` when all rows are filtered out (no surviving Add actions in this batch).
-    pub(crate) fn process_log_batch(
-        &mut self,
-        batch: ActionsBatch,
-    ) -> DeltaResult<Option<FilteredEngineData>> {
-        let row_count = batch.actions.len();
-
-        let mut dedup = LogBatchDedupVisitor {
-            log_action_keys: &mut self.log_action_keys,
-            leaf_removes: &mut self.leaf_removes,
-            selection_vector: vec![false; row_count],
-        };
-        dedup.visit_rows_of(batch.actions.as_ref())?;
-
-        if !dedup.selection_vector.iter().any(|&b| b) {
-            return Ok(None);
-        }
-
-        // Decode DV columns: z85 path decoding cannot be expressed as a kernel expression.
-        let mut dv_decoder = DecodedDvVisitor::for_log_batch(row_count);
-        dv_decoder.visit_rows_of(batch.actions.as_ref())?;
-
-        let mut stats_visitor = LogBatchStatsVisitor {
-            table_schema: &self.table_schema,
-            content_stats_type: self.content_stats_type.clone(),
-            selection_vector: &dedup.selection_vector,
-            record_counts: Vec::with_capacity(row_count),
-            content_stats_scalars: Vec::with_capacity(row_count),
-        };
-        stats_visitor.visit_rows_of(batch.actions.as_ref())?;
-
-        // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
-        let inner_actions = batch.actions;
-        let augmented_with_dv = inner_actions.append_columns(
-            DV_DECODED_FLAT_SCHEMA.clone(),
-            vec![
-                ArrayData::try_new(
-                    ArrayType::new(DataType::STRING, true),
-                    dv_decoder.decoded_paths,
-                )?,
-                ArrayData::try_new(
-                    ArrayType::new(DataType::LONG, true),
-                    dv_decoder.decoded_offsets,
-                )?,
-                ArrayData::try_new(
-                    ArrayType::new(DataType::LONG, true),
-                    dv_decoder.decoded_sizes,
-                )?,
-                ArrayData::try_new(
-                    ArrayType::new(DataType::LONG, true),
-                    dv_decoder.decoded_cardinalities,
-                )?,
-            ],
-        )?;
-
-        let stats_decoded_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("_stats_record_count", DataType::LONG),
-            StructField::nullable("_stats_content_stats", self.content_stats_type.clone()),
-        ]));
-        let augmented = augmented_with_dv.append_columns(
-            stats_decoded_schema,
-            vec![
-                ArrayData::try_new(
-                    ArrayType::new(DataType::LONG, true),
-                    stats_visitor.record_counts,
-                )?,
-                ArrayData::try_new(
-                    ArrayType::new(self.content_stats_type.clone(), true),
-                    stats_visitor.content_stats_scalars,
-                )?,
-            ],
-        )?;
-
-        let result = self.action_evaluator.evaluate(augmented.as_ref())?;
-        FilteredEngineData::try_new(result, dedup.selection_vector).map(Some)
     }
 
     /// Processes a content root batch (`is_log_batch = false`).
@@ -2411,6 +2338,51 @@ impl ContentRootRebuildProcessor {
             result.entry(lr.path).or_default().insert(lr.position);
         }
         result
+    }
+
+    /// Single-pass dedup over a log batch. Updates internal `log_action_keys`
+    /// and `leaf_removes`. Returns a selection vector where
+    /// `selection_vector[i] == true` indicates row `i` is the latest Add
+    /// action for that (data file, DV) pair.
+    fn dedup_log_batch(&mut self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        let row_count = actions.len();
+        let mut dedup = LogBatchDedupVisitor {
+            log_action_keys: &mut self.log_action_keys,
+            leaf_removes: &mut self.leaf_removes,
+            selection_vector: vec![false; row_count],
+        };
+
+        dedup.visit_rows_of(actions)?;
+        Ok(dedup.selection_vector)
+    }
+}
+impl LogReplayProcessor for ContentRootRebuildProcessor {
+    type Output = FilteredEngineData;
+    fn process_actions_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let selection_vector = self.dedup_log_batch(batch.actions.as_ref())?;
+
+        if !selection_vector.iter().any(|&b| b) {
+            return FilteredEngineData::try_new(batch.actions, selection_vector);
+        }
+
+        let actions = batch.actions;
+
+        // Decode DV columns: z85 path decoding cannot be expressed as a kernel expression.
+        let mut dv_decoder = DecodedDvVisitor::for_log_batch(actions.len());
+        dv_decoder.visit_rows_of(actions.as_ref())?;
+        let intermediate = self.log_batch_evaluator.evaluate(actions.as_ref())?;
+
+        // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
+        let augmented_with_dv = dv_decoder.append_decoded_dv_columns(intermediate.as_ref())?;
+
+        let result = self
+            .action_to_content_tree_entry_evaluator
+            .evaluate(augmented_with_dv.as_ref())?;
+        FilteredEngineData::try_new(result, selection_vector)
+    }
+
+    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
+        None
     }
 }
 
