@@ -399,24 +399,20 @@ impl<S> Transaction<S> {
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
 
-        // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
-        // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
-        // than written to the delta log (same issue as removes). This requires:
-        // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions to
-        //    update the content tree with new DV descriptors.
-        // 2. Suppressing dv_update_actions from the log (similar to how remove_actions are
-        //    suppressed when manifest_commit is active).
-        // 3. Including !self.dv_matched_files.is_empty() in is_manifest_commit()'s has_work_to_do
-        //    check.
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
-
-        // Step 5: Generate remove actions for the delta log (skipped in manifest commit mode, where
-        // removes are recorded in the content tree instead).
+        // Step 4: Determine if manifest commit is active (needed before generating DV/remove
+        // actions, since those are suppressed from the log in manifest commit mode).
         let manifest_commit = self.is_manifest_commit();
-        let remove_actions = if manifest_commit {
-            None
+
+        // Step 5: Generate remove and DV update actions for the delta log. Both are skipped in
+        // manifest commit mode, where they are recorded in the content tree instead (see
+        // generate_log_actions).
+        let (remove_actions, dv_update_actions) = if manifest_commit {
+            (None, None)
         } else {
-            Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
+            let removes =
+                self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+            let dv_updates = self.generate_dv_update_actions(engine)?;
+            (Some(removes), Some(dv_updates))
         };
 
         // Step 6: Generate all log actions (commit info, protocol, metadata for create-table,
@@ -432,7 +428,7 @@ impl<S> Transaction<S> {
         let filtered_actions = actions
             .into_iter()
             .chain(remove_actions.into_iter().flatten())
-            .chain(dv_update_actions);
+            .chain(dv_update_actions.into_iter().flatten());
 
         // Step 7: Commit via the committer
         let commit_metadata = self.create_commit_metadata(
@@ -635,6 +631,11 @@ impl<S> Transaction<S> {
                     "remove_files is not supported in manifest commit mode without an existing checkpoint action",
                 ));
             }
+            if latest_checkpoint_action.is_none() && !self.dv_matched_files.is_empty() {
+                return Err(Error::invalid_transaction_state(
+                    "DV updates are not supported in manifest commit mode without an existing checkpoint action",
+                ));
+            }
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
@@ -704,6 +705,50 @@ impl<S> Transaction<S> {
                 };
                 for (manifest_path, indices) in &leaf_deletions {
                     metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                }
+            }
+
+            // In manifest commit mode, process DV updates by:
+            // 1. Marking old entries as deleted (reuses ScanMetadataRemoveVisitor)
+            // 2. Re-adding entries with the new DV via add_from_existing_scan_rows
+            //
+            // The substitute_new_dv transform replaces deletionVector with newDeletionVector
+            // and drops the temp column. A null stats_parsed column is appended so
+            // add_from_existing_scan_rows can use its coalesce(stats_parsed, parse_json(stats))
+            // fallback to recover stats from the raw JSON string.
+            if !self.dv_matched_files.is_empty() {
+                // Phase 1: Mark old entries as deleted.
+                let leaf_deletions = {
+                    let mut visitor = ScanMetadataRemoveVisitor::new(
+                        root_manifest_path.as_deref(),
+                        |path, dv_path| {
+                            metadata_builder.mark_deleted(Some(path), dv_path, snapshot_id)
+                        },
+                    );
+                    for batch in self.dv_matched_files.iter() {
+                        visitor.selection_vector = batch.selection_vector();
+                        visitor.visit_rows_of(batch.data())?;
+                    }
+                    visitor.leaf_deletions
+                };
+                for (manifest_path, indices) in &leaf_deletions {
+                    metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                }
+
+                // Phase 2: Re-add entries with updated DV.
+                for batch in self.dv_matched_files.iter() {
+                    let transformed = update::substitute_new_dv_for_content_tree(
+                        engine,
+                        batch,
+                        &physical_table_schema,
+                    )?;
+                    metadata_builder.add_from_existing_scan_rows(
+                        engine,
+                        transformed.data(),
+                        transformed.selection_vector(),
+                        commit_version,
+                        snapshot_id,
+                    )?;
                 }
             }
 
@@ -1149,6 +1194,7 @@ impl<S> Transaction<S> {
             .is_none_or(|b| b.leaf_manifests.is_empty());
         let has_work_to_do = !self.add_files_metadata.is_empty()
             || !self.remove_files_metadata.is_empty()
+            || !self.dv_matched_files.is_empty()
             || !leaf_manifests_empty
             || self.explicit_root_manifest_commit.is_some()
             || self
@@ -4007,6 +4053,92 @@ mod tests {
         assert!(
             txn.is_manifest_commit(),
             "icebergNativeV4 should force manifest commit even without with_manifest_commit()"
+        );
+
+        Ok(())
+    }
+
+    /// Test that DV-only updates trigger manifest commit when manifest commit is active.
+    #[test]
+    fn test_dv_only_update_triggers_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Create table with metadataTree-experimental feature
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {
+                    "PARQUET:field_id": 1,
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "id"
+                }
+            }]
+        });
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"]
+            }
+        });
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableDeletionVectors": "true",
+                    "delta.columnMapping.mode": "id"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        create_dir_all(&delta_log_path)?;
+        write(delta_log_path.join("00000000000000000000.json"), data)?;
+
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("test".to_string());
+
+        // Opt into manifest commit
+        let _ = txn.with_manifest_commit();
+
+        // Without any work, is_manifest_commit should be false
+        assert!(
+            !txn.is_manifest_commit(),
+            "manifest commit should not be active without work to do"
+        );
+
+        // Add a DV-matched file to simulate a DV update
+        let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+            StringArray::from(vec!["dv"]),
+        ));
+        txn.dv_matched_files.push(dv_data);
+
+        // Now is_manifest_commit should be true (DV update counts as work to do)
+        assert!(
+            txn.is_manifest_commit(),
+            "manifest commit should be active when dv_matched_files is populated"
         );
 
         Ok(())

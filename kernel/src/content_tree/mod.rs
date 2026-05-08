@@ -2293,10 +2293,14 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use tempfile::tempdir;
 
     use super::*;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
     use crate::{Engine, IntoEngineData};
 
     // Note: Full integration test for ContentTreeNodeEntry::into_engine_data is not included here
@@ -4534,10 +4538,7 @@ mod tests {
     /// 1. PositionDeletes entries in persisted manifests have Iceberg format sizes (Delta size + 8
     ///    bytes)
     /// 2. The size conversion happens at write time in extract_deletion_vector_content
-    // TODO: update_deletion_vectors does not yet update inline DV info on existing leaf entries.
-    // Re-enable once that is implemented.
     #[test]
-    #[ignore]
     fn test_dv_size_conversion_through_metadata_tree() -> Result<(), Box<dyn std::error::Error>> {
         use std::fs::{create_dir_all, write};
         use std::sync::Arc;
@@ -4760,27 +4761,47 @@ mod tests {
             file_locations = scan_metadata.visit_scan_files(file_locations, collect_locations)?;
         }
 
-        // Step 4: Add DVs for the files using a known size (v2)
-        let known_dv_size_in_bytes: i32 = 42; // The Delta format size (what we'll test for conversion)
+        // Step 4: Update DVs on the files using a known size via update_deletion_vectors (v2).
+        // The manifest commit path records these in the content tree (mark old entry as
+        // deleted, re-add with new DV). The DecodedDvVisitor adds +8 bytes for Iceberg
+        // framing, which the assertions in Step 5 verify.
+        let known_dv_size_in_bytes: i32 = 42; // Delta format size (tested for conversion)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+            // Build DV descriptors with known size for each file found in the scan.
+            let mut dv_map = HashMap::new();
+            for (file_path, _manifest_path, _index) in &file_locations {
+                dv_map.insert(
+                    file_path.clone(),
+                    DeletionVectorDescriptor {
+                        storage_type: DeletionVectorStorageType::PersistedRelative,
+                        path_or_inline_dv: "ab1234567890123456789".to_string(), // fake z85 UUID
+                        offset: Some(0),
+                        size_in_bytes: known_dv_size_in_bytes,
+                        cardinality: 1,
+                    },
+                );
+            }
+
+            // Get scan files to provide existing file metadata for the DV update.
+            let scan = snapshot.clone().scan_builder().build()?;
+            let scan_files: Vec<FilteredEngineData> = scan
+                .scan_metadata(engine.as_ref())?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|sm| sm.scan_files)
+                .collect();
+
             let mut txn = snapshot
+                .clone()
                 .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
                 .with_operation("UPDATE".to_string());
 
-            {
-                let mc = txn.with_manifest_commit();
-                let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+            // Opt into manifest commit mode so DV updates go to the content tree.
+            let _ = txn.with_manifest_commit();
 
-                // TODO: Implement inline DV update for existing leaf entries in CombinedManifest
-                // model. Previously used leaf.update_deletion_vectors(dv_updates)
-                // here. In the new model DVs are inline on data entries, so
-                // updating a DV requires re-writing the data entry with updated
-                // dv_info.
-                let _ = (&file_locations, known_dv_size_in_bytes);
-
-                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
-            }
+            txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
             match txn.commit(engine.as_ref())? {
                 CommitResult::CommittedTransaction(_) => {}
@@ -4862,9 +4883,27 @@ mod tests {
             }
         }
 
+        // Also check root-level Data entries (DV-updated entries are re-added to root).
+        for entry in &root_entries {
+            if entry.content_type == DataContentType::Data {
+                if let Some(dv_info) = &entry.dv_info {
+                    let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
+                    assert_eq!(
+                        dv_info.size_in_bytes,
+                        expected_iceberg_size,
+                        "Persisted dv_info.size_in_bytes should be {} (Delta {} + 8 framing), got {}",
+                        expected_iceberg_size,
+                        known_dv_size_in_bytes,
+                        dv_info.size_in_bytes
+                    );
+                    found_position_deletes_count += 1;
+                }
+            }
+        }
+
         assert!(
             found_position_deletes_count > 0,
-            "Should have Data entries with inline dv_info in CombinedManifest leaf manifests"
+            "Should have Data entries with inline dv_info"
         );
 
         // The test successfully proves:
