@@ -3092,7 +3092,7 @@ mod tests {
 
         let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1)?;
 
-        // In the new CombinedManifest model, DV info is inline on Data entries.
+        // DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
@@ -3200,13 +3200,12 @@ mod tests {
         )?;
         let root_entries = root_metadata.entries()?;
 
-        // In the new CombinedManifest model, the data leaf (with inline DVs) is a CombinedManifest.
-        // After file removal, the CombinedManifest entry in the root should have a manifest_dv
+        // After file removal, the DataManifest entry in the root should have a manifest_dv
         // marking which data file entry indices are deleted.
         let manifest_with_dv = root_entries
             .iter()
             .find(|entry| {
-                entry.content_type == DataContentType::CombinedManifest
+                entry.content_type == DataContentType::DataManifest
                     && entry
                         .manifest_info
                         .as_ref()
@@ -3214,21 +3213,19 @@ mod tests {
                         .is_some()
             })
             .ok_or_else(|| {
-                Error::generic(
-                    "No CombinedManifest with manifest_dv found in root after file removal",
-                )
+                Error::generic("No DataManifest with manifest_dv found in root after file removal")
             })?;
 
         let leaf_manifest_path = manifest_with_dv
             .location
             .clone()
-            .ok_or_else(|| Error::generic("CombinedManifest has no location"))?;
+            .ok_or_else(|| Error::generic("DataManifest has no location"))?;
 
         let manifest_dv_bytes = manifest_with_dv
             .manifest_info
             .as_ref()
             .and_then(|mi| mi.dv.as_ref())
-            .ok_or_else(|| Error::generic("CombinedManifest has no manifest_dv"))?;
+            .ok_or_else(|| Error::generic("DataManifest has no manifest_dv"))?;
 
         if manifest_dv_bytes.len() < 4 {
             return Err(Box::new(Error::generic("manifest_dv bytes too short")));

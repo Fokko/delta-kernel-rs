@@ -201,7 +201,7 @@ fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>>
 ///   Version 3: Read V2 → write leaf + read back
 ///
 /// Both entries become Existed at V3 (were Added in prior versions).
-/// The write_leaf produces a CombinedManifest entry.
+/// The write_leaf produces a DataManifest entry.
 #[test]
 fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
@@ -233,12 +233,9 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
         3,
     )?;
 
-    // Write as a leaf manifest and verify the CombinedManifest entry
+    // Write as a leaf manifest and verify the DataManifest entry
     let manifest_entry = builder.write_leaf(&engine, 3)?;
-    assert_eq!(
-        manifest_entry.content_type,
-        DataContentType::CombinedManifest
-    );
+    assert_eq!(manifest_entry.content_type, DataContentType::DataManifest);
     let manifest_info = &manifest_entry.tracking;
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));

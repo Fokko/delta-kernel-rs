@@ -92,7 +92,6 @@ fn visit_metadata_entry_at<'a>(
         2 => DataContentType::EqualityDeletes,
         3 => DataContentType::DataManifest,
         4 => DataContentType::DeleteManifest,
-        5 => DataContentType::CombinedManifest,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid content_type value: {}",
