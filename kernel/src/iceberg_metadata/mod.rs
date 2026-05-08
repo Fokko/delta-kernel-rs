@@ -501,7 +501,8 @@ mod tests {
         )
         .unwrap();
 
-        // Verify it serializes to valid JSON via serialize_metadata_json (overrides format-version to 4)
+        // Verify it serializes to valid JSON via serialize_metadata_json (overrides format-version
+        // to 4)
         let json_bytes = serialize_metadata_json(&metadata).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
 
