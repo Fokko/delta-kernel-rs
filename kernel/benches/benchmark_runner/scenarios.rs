@@ -284,7 +284,7 @@ pub fn write(
         .with_data_change(true);
 
     if bulk_mode {
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
     }
 
     let add_files_schema = txn.add_files_schema();
@@ -350,7 +350,7 @@ fn add_batches_to_txn(
     if bulk_mode {
         use std::thread;
 
-        let mc = txn.with_manifest_commit();
+        let mc = txn.with_manifest_commit().unwrap();
 
         // Create leaf writers for each data batch and spawn threads to finish them
         let mut handles = Vec::new();
@@ -488,7 +488,7 @@ pub fn vacuum_delete(
             .with_data_change(true);
 
         if bulk_mode {
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
         }
 
         for batch in batches_to_delete {

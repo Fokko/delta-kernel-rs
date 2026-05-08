@@ -1,5 +1,7 @@
 //! Shared helpers for manifest-commit integration tests (metadata tree).
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;

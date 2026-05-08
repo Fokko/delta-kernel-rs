@@ -4687,7 +4687,7 @@ mod tests {
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(record_batch));
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
                 leaf.add_files(engine.as_ref(), metadata_engine_data)?;
                 mc.add_leaf(leaf.finish(engine.as_ref())?)?;
@@ -4731,7 +4731,7 @@ mod tests {
                 .with_operation("UPDATE".to_string());
 
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
 
                 // TODO: Implement inline DV update for existing leaf entries in DataManifest.

@@ -37,13 +37,13 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
-                        ("file1.parquet", 2048, 1000000, 100),
-                        ("file2.parquet", 1024, 1000001, 50),
+                        ("file1.parquet", 2048, 1000000, Some(100)),
+                        ("file2.parquet", 1024, 1000001, Some(50)),
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
@@ -58,7 +58,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let c = txn.commit(&engine)?.unwrap_committed();
             assert_eq!(c.commit_version(), 2);
@@ -93,7 +93,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file3.parquet", 512, 1000002, 25)],
+                vec![("file3.parquet", 512, 1000002, Some(25))],
             )?;
             txn.add_files(metadata);
 
@@ -109,7 +109,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file4.parquet", 768, 1000003, 30)],
+                vec![("file4.parquet", 768, 1000003, Some(30))],
             )?;
             txn.add_files(metadata);
 
@@ -147,11 +147,11 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 as part of the new root creation
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
-                    vec![("file5.parquet", 2048, 1000004, 100)],
+                    vec![("file5.parquet", 2048, 1000004, Some(100))],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
@@ -213,16 +213,16 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
                 vec![
-                    ("file1.parquet", 2048, 1000000, 100),
-                    ("file2.parquet", 1024, 1000001, 50),
-                    ("file3.parquet", 3072, 1000002, 150),
-                    ("file4.parquet", 1536, 1000003, 75),
+                    ("file1.parquet", 2048, 1000000, Some(100)),
+                    ("file2.parquet", 1024, 1000001, Some(50)),
+                    ("file3.parquet", 3072, 1000002, Some(150)),
+                    ("file4.parquet", 1536, 1000003, Some(75)),
                 ],
             )?;
             txn.add_files(metadata);
@@ -306,12 +306,12 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file5.parquet", 1024, 1000004, 50)],
+                vec![("file5.parquet", 1024, 1000004, Some(50))],
             )?;
             txn.add_files(metadata);
 
@@ -374,15 +374,15 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
-                        ("file1.parquet", 2048, 1000000, 100),
-                        ("file2.parquet", 1024, 1000001, 50),
-                        ("file3.parquet", 3072, 1000002, 150),
-                        ("file4.parquet", 1536, 1000003, 75),
+                        ("file1.parquet", 2048, 1000000, Some(100)),
+                        ("file2.parquet", 1024, 1000001, Some(50)),
+                        ("file3.parquet", 3072, 1000002, Some(150)),
+                        ("file4.parquet", 1536, 1000003, Some(75)),
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
@@ -473,11 +473,11 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 via leaf writer as part of new root creation
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
-                    vec![("file5.parquet", 1024, 1000004, 50)],
+                    vec![("file5.parquet", 1024, 1000004, Some(50))],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
@@ -537,12 +537,12 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file1.parquet", 2048, 1000000, 100)],
+                vec![("file1.parquet", 2048, 1000000, Some(100))],
             )?;
             txn.add_files(metadata);
 
@@ -565,7 +565,7 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             let mut txn = snapshot
                 .clone()
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             // Scan to get file1
             let scan = snapshot.clone().scan_builder().build()?;
@@ -680,7 +680,7 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let c = txn.commit(&engine)?.unwrap_committed();
             assert_eq!(c.commit_version(), 4);
@@ -758,11 +758,11 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let batch = txn.with_manifest_commit();
+                let batch = txn.with_manifest_commit().unwrap();
                 let mut leaf = batch.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
-                    vec![("file1.parquet", 2048, 1000000, 100)],
+                    vec![("file1.parquet", 2048, 1000000, Some(100))],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 batch.add_leaf(leaf.finish(&engine)?)?;
@@ -829,7 +829,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
             let c = txn.commit(&engine)?.unwrap_committed();
             assert_eq!(c.commit_version(), 3);
             let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -909,7 +909,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
             let c = txn.commit(&engine)?.unwrap_committed();
             assert_eq!(c.commit_version(), 5);
             let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;

@@ -393,7 +393,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
 
     // Add files to leaves: leaf1 (files 1-2), leaf2 (file3)
     {
-        let mc = txn.with_manifest_commit();
+        let mc = txn.with_manifest_commit()?;
         add_leaf_with_files(
             mc,
             engine.as_ref(),

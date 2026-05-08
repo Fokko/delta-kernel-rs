@@ -95,8 +95,8 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     txn.add_files(create_add_files_metadata(
         add_files_schema,
         vec![
-            ("part-00000.parquet", 1024, 1_000_000, 10),
-            ("part-00001.parquet", 2048, 1_000_001, 20),
+            ("part-00000.parquet", 1024, 1_000_000, Some(10)),
+            ("part-00001.parquet", 2048, 1_000_001, Some(20)),
         ],
     )?);
 
@@ -193,7 +193,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00002.parquet", 3072, 1_000_002, 30)],
+        vec![("part-00002.parquet", 3072, 1_000_002, Some(30))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -211,7 +211,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00003.parquet", 4096, 1_000_003, 40)],
+        vec![("part-00003.parquet", 4096, 1_000_003, Some(40))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -344,7 +344,7 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00000.parquet", 1024, 1_000_000, 10)],
+        vec![("part-00000.parquet", 1024, 1_000_000, Some(10))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -414,8 +414,8 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     txn.add_files(create_add_files_metadata(
         add_files_schema,
         vec![
-            ("ctas-part-00000.parquet", 1024, 1_000_000, 100),
-            ("ctas-part-00001.parquet", 2048, 1_000_001, 200),
+            ("ctas-part-00000.parquet", 1024, 1_000_000, Some(100)),
+            ("ctas-part-00001.parquet", 2048, 1_000_001, Some(200)),
         ],
     )?);
 
@@ -513,7 +513,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("insert-part-00000.parquet", 3072, 1_000_002, 50)],
+        vec![("insert-part-00000.parquet", 3072, 1_000_002, Some(50))],
     )?);
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
@@ -528,7 +528,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("insert-part-00001.parquet", 4096, 1_000_003, 60)],
+        vec![("insert-part-00001.parquet", 4096, 1_000_003, Some(60))],
     )?);
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 2);
@@ -605,15 +605,15 @@ async fn test_create_table_manifest_commit_single_iceberg_domain(
 
     // Add data via manifest commit (content tree), like Reyden does
     {
-        let mc = txn.with_manifest_commit();
+        let mc = txn.with_manifest_commit().unwrap();
         let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
         leaf.add_files(
             engine.as_ref(),
             create_add_files_metadata(
                 add_files_schema,
                 vec![
-                    ("part-00000.parquet", 1024, 1_000_000, 10),
-                    ("part-00001.parquet", 2048, 1_000_001, 20),
+                    ("part-00000.parquet", 1024, 1_000_000, Some(10)),
+                    ("part-00001.parquet", 2048, 1_000_001, Some(20)),
                 ],
             )?,
         )?;

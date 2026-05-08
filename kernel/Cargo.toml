@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -54,7 +54,7 @@ strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
 tracing = { version = "0.1", features = ["log"] }
 tracing-chrome = { version = "0.7", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
@@ -202,3 +202,11 @@ required-features = ["arrow", "default-engine-rustls", "clap", "internal-api", "
 name = "backfill-delta-table"
 path = "benches/add_action_generator/backfill.rs"
 required-features = ["arrow", "default-engine-rustls", "clap", "internal-api", "uc-bench-tools"]
+
+# Single integration test binary. Linking each integration test as a separate
+# binary is expensive (every binary re-links Arrow, Parquet, and the default
+# engine), so all integration tests share one binary whose entry point is
+# `tests/integration/main.rs` and whose topics live as submodules.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"

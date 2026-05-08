@@ -7,8 +7,8 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, FileDataReadResultIterator,
-    FileMeta, JsonHandler, MetricsReporter, ParquetFooter, ParquetHandler, ParquetWriteResult,
-    ParquetWriterConfig, PredicateRef, StorageHandler,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, ParquetWriteResult, ParquetWriterConfig,
+    PredicateRef, StorageHandler,
 };
 use url::Url;
 
@@ -78,10 +78,6 @@ impl<E: TaskExecutor + 'static> Engine for ForbidParquetWritesEngine<E> {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
-    }
-
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        self.inner.get_metrics_reporter()
     }
 }
 

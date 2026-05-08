@@ -1133,6 +1133,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         log_segment,
         engine.as_ref(),
         MetricId::default(),
+        None,
     )?);
 
     let scan = snapshot.scan_builder().build()?;
@@ -1235,7 +1236,7 @@ fn test_prefix_columns_simple() {
     };
     // A simple binary predicate: x > 100
     let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
+    let result = prefixer.transform_pred(&pred).into_owned();
 
     // The column reference should now be add.stats_parsed.x
     let refs: Vec<_> = result.references().into_iter().collect();
@@ -1433,12 +1434,7 @@ fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
-    Some(
-        prefixer
-            .transform_pred(&skipping_pred)
-            .unwrap()
-            .into_owned(),
-    )
+    Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.
@@ -1922,13 +1918,12 @@ mod scan_metadata_completed_tests {
     use std::time::Duration;
 
     use rstest::rstest;
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use crate::engine::default::DefaultEngineBuilder;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
-    use crate::utils::test_utils::CapturingReporter;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::Snapshot;
 
     fn run_scan(
@@ -1943,9 +1938,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        let guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let mut builder = snapshot.scan_builder();
         if let Some(pred) = predicate {
@@ -2018,9 +2011,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         {

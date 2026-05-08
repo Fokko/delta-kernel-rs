@@ -294,6 +294,7 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
+        validate_latest_commit_file(&listed_files, effective_version)?;
 
         // Build last_checkpoint_metadata from checkpoint_version and checkpoint_schema
         let last_checkpoint_metadata =
@@ -608,6 +609,10 @@ impl LogSegment {
     /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
     /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
     /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    ///
+    /// If the existing `latest_crc_file` is older than the new checkpoint version, it is
+    /// cleared to preserve the `LogSegmentFiles` invariant that `latest_crc_file.version >=
+    /// checkpoint version`.
     pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
         require!(
             matches!(
@@ -631,11 +636,19 @@ impl LogSegment {
 
         let mut new_log_segment = self.clone();
         new_log_segment.checkpoint_version = Some(checkpoint.version);
+        let checkpoint_version = checkpoint.version;
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
         // A snapshot at version N only contains commits and compactions at versions <= N,
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
+        // Preserve the LogSegmentFiles invariant that `latest_crc_file.version >= checkpoint
+        // version`. A stale CRC is worse than missing: downstream P&M fallbacks (see
+        // `read_protocol_metadata_opt`) would load an older P&M and overwrite the current one.
+        new_log_segment
+            .listed
+            .latest_crc_file
+            .take_if(|crc| crc.version < checkpoint_version);
         // TODO(#839): Once CheckpointWriter exposes the output schema, build a
         // LastCheckpointHintSummary and thread it through here instead of None. Today the
         // schema is computed inside checkpoint_data() but not returned. With None, the next
@@ -1540,7 +1553,6 @@ impl LogSegment {
     /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
     /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
     /// in `(start_v_exclusive, end_version]` are retained.
-    #[allow(dead_code)]
     pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
@@ -2008,4 +2020,30 @@ fn validate_end_version(
         );
     }
     Ok(effective_version)
+}
+
+/// Validates the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
+///
+/// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
+/// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
+fn validate_latest_commit_file(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> DeltaResult<()> {
+    require!(
+        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
+        Error::internal_error(
+            "latest_commit_file must be Some when ascending_commit_files is non-empty"
+        )
+    );
+    if let Some(commit) = &listed.latest_commit_file {
+        require!(
+            commit.version == effective_version,
+            Error::internal_error(format!(
+                "latest_commit_file version {} does not match end_version {effective_version}",
+                commit.version,
+            ))
+        );
+    }
+    Ok(())
 }
