@@ -43,8 +43,22 @@ fn read_and_validate_iceberg_metadata(
         latest_name
     );
 
-    let content = std::fs::read_to_string(latest.path()).unwrap();
-    serde_json::from_str(&content).unwrap()
+    let bytes = std::fs::read(latest.path()).unwrap();
+    parse_iceberg_metadata_v4(&bytes)
+}
+
+/// Parses on-disk Iceberg metadata.json (which has `format-version: 4` written by the kernel).
+/// Asserts the on-disk version is actually 4, then downgrades to 3 in-place so the iceberg
+/// crate (0.8, which only supports up to V3) can deserialize it.
+fn parse_iceberg_metadata_v4(bytes: &[u8]) -> iceberg_spec::TableMetadata {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(
+        json["format-version"], 4,
+        "Expected format-version 4 in metadata.json"
+    );
+    json["format-version"] = serde_json::Value::Number(3.into());
+    serde_json::from_value(json)
+        .unwrap_or_else(|e| panic!("Failed to parse metadata.json as V3: {e}"))
 }
 
 #[tokio::test]
@@ -122,10 +136,6 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     // Validate metadata.json content for version 1 (with snapshot)
     let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
-    assert_eq!(
-        table_metadata.format_version(),
-        iceberg_spec::FormatVersion::V3
-    );
     assert_eq!(
         table_metadata.current_schema().as_struct().fields().len(),
         2
@@ -230,7 +240,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     let latest_metadata_path = metadata_files.last().unwrap().path();
     let latest_content = std::fs::read_to_string(&latest_metadata_path)?;
-    let latest_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&latest_content)?;
+    let latest_metadata = parse_iceberg_metadata_v4(latest_content.as_bytes());
 
     println!("\n=== Latest metadata.json (version 3) ===");
     println!("{}", latest_content);
@@ -451,7 +461,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
 
     // Verify it has a snapshot (unlike pure CREATE TABLE which has 0)
     let content = std::fs::read_to_string(metadata_files[0].path())?;
-    let table_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&content)?;
+    let table_metadata = parse_iceberg_metadata_v4(content.as_bytes());
 
     println!("\n=== CTAS metadata.json ===");
     println!("{}", content);
@@ -541,7 +551,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         .collect();
     final_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
     let final_content = std::fs::read_to_string(final_files.last().unwrap().path())?;
-    let final_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&final_content)?;
+    let final_metadata = parse_iceberg_metadata_v4(final_content.as_bytes());
 
     assert_eq!(
         final_metadata.snapshots().len(),
@@ -554,11 +564,11 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         "Snapshot log should have 3 entries"
     );
 
-    // Verify parent chain: v2 -> v1 -> v0 (CTAS)
+    // Verify parent chain: current snapshot should have a parent (v1 -> v0 CTAS).
     let current = final_metadata.current_snapshot().unwrap();
     assert!(
         current.parent_snapshot_id().is_some(),
-        "v2 snapshot should have a parent"
+        "current snapshot should have a parent"
     );
 
     // Verify all files are readable
