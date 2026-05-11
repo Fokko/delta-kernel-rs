@@ -34,13 +34,17 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// action (this macro allows the use of standard rust snake_case, and will convert to the correct
 /// delta schema camelCase version).
 ///
-/// If a field sets `allow_null_container_values`, it means the underlying data can contain null in
-/// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
-/// mark the value field as nullable, but those mappings will be dropped when converting to an
-/// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
+/// Supported field attributes:
+/// - `#[field_id = N]`: Sets the Parquet field ID for this field.
+/// - `#[element_field_id = N]`: Sets the Parquet field ID for the element of a list field. Stored
+///   as `ColumnMappingNestedIds` metadata (`{"fieldName.element": N}`) on the parent `StructField`
+///   and propagated to the inner Arrow list element during schema conversion. The generated code
+///   references `serde_json::json!`, which must be available at the expansion site.
+/// - `#[allow_null_container_values]`: Marks the value field of a `HashMap` as nullable.
+/// - `#[skip_schema]`: Excludes this field from the generated schema.
 #[proc_macro_derive(
     ToSchema,
-    attributes(allow_null_container_values, field_id, skip_schema)
+    attributes(allow_null_container_values, field_id, element_field_id, skip_schema)
 )]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -85,19 +89,17 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
-/// Helper function to create field_id related errors
-fn field_id_error(span: Span, message: &str) -> Error {
-    Error::new(span, format!("field_id error: {}", message))
-}
-
-fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+fn get_named_attr_id(
+    field_attributes: &[Attribute],
+    attr_name: &str,
+) -> Result<Option<i64>, Error> {
     field_attributes
         .iter()
         .filter_map(|attr| match &attr.meta {
             Meta::NameValue(nv) => Some(nv),
             _ => None,
         })
-        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == "field_id"))
+        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == attr_name))
         .map(|nv| {
             let span = nv.value.span();
             match &nv.value {
@@ -105,12 +107,26 @@ fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
                     lit: Lit::Int(lit_int),
                     ..
                 }) => lit_int.base10_parse().map_err(|e| {
-                    field_id_error(lit_int.span(), &format!("Failed to parse integer: {}", e))
+                    Error::new(
+                        lit_int.span(),
+                        format!("{} error: Failed to parse integer: {}", attr_name, e),
+                    )
                 }),
-                _ => Err(field_id_error(span, "Expected field-id to be an integer")),
+                _ => Err(Error::new(
+                    span,
+                    format!("{} error: Expected an integer", attr_name),
+                )),
             }
         })
         .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
+}
+
+fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+    get_named_attr_id(field_attributes, "field_id")
+}
+
+fn get_element_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+    get_named_attr_id(field_attributes, "element_field_id")
 }
 
 /// Check if a path segment is `Option<HashMap<K, V>>`.
@@ -184,13 +200,34 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
             };
 
-            // Then, add field-id metadata if present
-            match get_field_id(&field.attrs) {
-                Ok(Some(id)) => {
-                    quote_spanned! { field.span() => #base_call.add_metadata([(delta_kernel::schema::ColumnMetadataKey::ParquetFieldId.as_ref(), #id)]) }
+            // Then, add field-id and element-field-id metadata if present
+            let field_id = match get_field_id(&field.attrs) {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+            let element_field_id = match get_element_field_id(&field.attrs) {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+
+            let with_field_id = if let Some(id) = field_id {
+                quote_spanned! { field.span() => #base_call.add_metadata([(delta_kernel::schema::ColumnMetadataKey::ParquetFieldId.as_ref(), #id)]) }
+            } else {
+                quote_spanned! { field.span() => #base_call }
+            };
+
+            if let Some(elem_id) = element_field_id {
+                let nested_key = format!("{}.element", name);
+                quote_spanned! { field.span() =>
+                    #with_field_id.add_metadata([(
+                        delta_kernel::schema::ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
+                        delta_kernel::schema::MetadataValue::Other(
+                            serde_json::json!({ #nested_key: #elem_id })
+                        )
+                    )])
                 }
-                Ok(None) => quote_spanned! { field.span() => #base_call },
-                Err(err) => err.to_compile_error(),
+            } else {
+                with_field_id
             }
         }
         _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty))
@@ -449,6 +486,85 @@ mod tests {
                 "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , 9223372036854775807i64)"
             ),
             "Expected 9223372036854775807, found: {}",
+            token_stream
+        );
+    }
+
+    #[test]
+    fn test_element_field_id_parsing() {
+        let input = r#"
+            struct TestStruct {
+                #[field_id = 132]
+                #[element_field_id = 133]
+                split_offsets: Option<Vec<i64>>,
+
+                #[field_id = 100]
+                normal_field: String,
+            }
+        "#;
+
+        let result = test_field_id_parsing(input);
+        assert!(result.is_ok(), "element_field_id should parse successfully");
+
+        let token_stream = result.unwrap().to_string();
+
+        // Should contain ParquetFieldId and ColumnMappingNestedIds metadata
+        assert!(
+            token_stream.contains("ParquetFieldId"),
+            "Should contain ParquetFieldId, found: {}",
+            token_stream
+        );
+        assert!(
+            token_stream.contains("ColumnMappingNestedIds"),
+            "Should contain ColumnMappingNestedIds, found: {}",
+            token_stream
+        );
+        assert!(
+            token_stream.contains("splitOffsets.element"),
+            "Should contain dot-path splitOffsets.element, found: {}",
+            token_stream
+        );
+        assert!(
+            token_stream.contains("132i64"),
+            "Should contain field_id 132, found: {}",
+            token_stream
+        );
+        assert!(
+            token_stream.contains("133i64"),
+            "Should contain element_field_id 133, found: {}",
+            token_stream
+        );
+    }
+
+    #[test]
+    fn test_element_field_id_without_field_id() {
+        let input = r#"
+            struct TestStruct {
+                #[element_field_id = 42]
+                list_field: Option<Vec<i64>>,
+            }
+        "#;
+
+        let result = test_field_id_parsing(input);
+        assert!(
+            result.is_ok(),
+            "element_field_id alone should parse successfully"
+        );
+
+        let token_stream = result.unwrap().to_string();
+        assert!(
+            token_stream.contains("ColumnMappingNestedIds"),
+            "Should contain ColumnMappingNestedIds, found: {}",
+            token_stream
+        );
+        assert!(
+            token_stream.contains("listField.element"),
+            "Should contain dot-path listField.element, found: {}",
+            token_stream
+        );
+        assert!(
+            !token_stream.contains("ParquetFieldId . as_ref"),
+            "Should NOT contain ParquetFieldId, found: {}",
             token_stream
         );
     }

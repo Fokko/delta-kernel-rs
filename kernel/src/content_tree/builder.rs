@@ -760,7 +760,7 @@ impl ContentTreeNodeBuilder {
     }
 
     /// Remove data file entries by path. Only used when moving values in the root
-    /// to the leaves (otherwise mark deleted it should be used.
+    /// to the leaves (otherwise mark_deleted should be used).
     ///
     /// This removes entries where the location matches and there is no referenced_file
     /// (i.e., data file entries, not DV entries).
@@ -1474,8 +1474,8 @@ impl ContentTreeNodeBuilder {
         let mut agg_visitor = TransformedAggregateVisitor::default();
         agg_visitor.visit_rows_of(data.as_ref())?;
         let aggregates = BatchAggregates {
-            added_file_count: file_count_from_len(data.len())?,
-            existing_file_count: 0,
+            added_file_count: 0,
+            existing_file_count: file_count_from_len(data.len())?,
             total_record_count: agg_visitor.total_record_count,
         };
         self.pre_built_data.push(data);
@@ -1516,8 +1516,8 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// Projects only the fields used by [`LogBatchDedupVisitor`], [`DecodedDvVisitor`], and
 /// the `action_evaluator` in [`ContentRootRebuildProcessor`]:
 ///
-/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `deletionVector` (all 5 DV sub-fields for
-///   z85 decode)
+/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `deletionVector` (all 5 DV
+///   sub-fields for z85 decode)
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
 ///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
@@ -1805,7 +1805,7 @@ struct LeafManifestIndex {
     /// Path to the leaf manifest file.
     path: String,
     /// Row position within the leaf manifest.
-    position: i64,
+    position: u64,
 }
 
 // ===========================================================================================
@@ -1972,6 +1972,9 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
                 let position: Option<i64> =
                     getters[Self::REM_MANIFEST_POS].get_opt(i, "remove.dataManifestPosition")?;
                 if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
+                    let pos = u64::try_from(pos).map_err(|_| {
+                        Error::generic(format!("negative manifest position: {pos}"))
+                    })?;
                     self.leaf_removes.push(LeafManifestIndex {
                         path: leaf_path,
                         position: pos,
@@ -2249,10 +2252,7 @@ impl ContentRootRebuildProcessor {
         let mut result: HashMap<String, roaring::RoaringTreemap> =
             HashMap::with_capacity(self.leaf_removes.len());
         for lr in self.leaf_removes.drain(..) {
-            result
-                .entry(lr.path)
-                .or_default()
-                .insert(lr.position as u64);
+            result.entry(lr.path).or_default().insert(lr.position);
         }
         result
     }

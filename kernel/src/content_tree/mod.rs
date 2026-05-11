@@ -1809,10 +1809,12 @@ impl ManifestInfo {
         i64::from(self.added_files_count) + i64::from(self.existing_files_count)
     }
 
-    /// Total number of entries (ADDED + EXISTING + DELETED), widened to i64 for use as
-    /// bounds in structures like `DvCache`.
+    /// Total number of entries (ADDED + EXISTING + DELETED + REPLACED), widened to i64 for use
+    /// as bounds in structures like `DvCache`.
     pub(crate) fn total_entry_count(&self) -> i64 {
-        self.active_entry_count() + i64::from(self.deletes_files_count)
+        self.active_entry_count()
+            + i64::from(self.deletes_files_count)
+            + i64::from(self.replaced_files_count)
     }
 }
 
@@ -1905,12 +1907,14 @@ pub(super) struct ContentTreeNodeEntry {
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must
     /// be sorted ascending
     #[field_id = 132]
+    #[element_field_id = 133]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     #[field_id = 135]
+    #[element_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
 }
 
@@ -3071,25 +3075,77 @@ mod tests {
         // annotations
         let tracking_schema = TrackingInfo::to_schema();
 
-        // Helper to check field_id metadata
-        fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
+        fn assert_metadata_id(
+            schema: &StructType,
+            field_name: &str,
+            key: &ColumnMetadataKey,
+            expected_id: i64,
+        ) {
             let field = schema
                 .field(field_name)
                 .unwrap_or_else(|| panic!("{} field should exist in schema", field_name));
-            let metadata = field.metadata();
-            assert!(
-                metadata.contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
-                "{} field should have PARQUET:field_id in metadata",
-                field_name
-            );
-            match metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()) {
+            match field.metadata().get(key.as_ref()) {
                 Some(MetadataValue::Number(n)) => assert_eq!(
-                    *n, expected_id,
-                    "{} field should have field_id = {}",
-                    field_name, expected_id
+                    *n,
+                    expected_id,
+                    "{}.{}: expected {}, got {}",
+                    field_name,
+                    key.as_ref(),
+                    expected_id,
+                    n
                 ),
                 other => panic!(
-                    "{} field should have Number metadata, got {:?}",
+                    "{}.{}: expected Number({}), got {:?}",
+                    field_name,
+                    key.as_ref(),
+                    expected_id,
+                    other
+                ),
+            }
+        }
+
+        fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
+            assert_metadata_id(
+                schema,
+                field_name,
+                &ColumnMetadataKey::ParquetFieldId,
+                expected_id,
+            );
+        }
+
+        fn assert_nested_field_id(
+            schema: &StructType,
+            field_name: &str,
+            nested_key: &str,
+            expected_id: i64,
+        ) {
+            let field = schema
+                .field(field_name)
+                .unwrap_or_else(|| panic!("{} field should exist in schema", field_name));
+            let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
+            let meta = field.metadata().get(meta_key);
+            match meta {
+                Some(MetadataValue::Other(serde_json::Value::Object(obj))) => {
+                    match obj.get(nested_key) {
+                        Some(serde_json::Value::Number(n)) => {
+                            assert_eq!(
+                                n.as_i64(),
+                                Some(expected_id),
+                                "{}.{}: expected {}, got {:?}",
+                                field_name,
+                                nested_key,
+                                expected_id,
+                                n
+                            );
+                        }
+                        other => panic!(
+                            "{}.{}: expected Number({}), got {:?}",
+                            field_name, nested_key, expected_id, other
+                        ),
+                    }
+                }
+                other => panic!(
+                    "{}: expected ColumnMappingNestedIds JSON object, got {:?}",
                     field_name, other
                 ),
             }
@@ -3147,6 +3203,22 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
         assert_field_id(&metadata_entry_schema, "fileSizeInBytes", 104);
         assert_field_id(&metadata_entry_schema, "manifestInfo", 150);
+
+        // Verify element field IDs on list fields (splitOffsets and equalityIds)
+        assert_field_id(&metadata_entry_schema, "splitOffsets", 132);
+        assert_nested_field_id(
+            &metadata_entry_schema,
+            "splitOffsets",
+            "splitOffsets.element",
+            133,
+        );
+        assert_field_id(&metadata_entry_schema, "equalityIds", 135);
+        assert_nested_field_id(
+            &metadata_entry_schema,
+            "equalityIds",
+            "equalityIds.element",
+            136,
+        );
 
         // Verify content_stats field_id in to_schema_with_content_stats
         let table_schema =
