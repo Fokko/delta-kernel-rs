@@ -178,8 +178,7 @@ pub(crate) fn generate_iceberg_metadata(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// The Iceberg format version written to metadata.json. V4 (adaptive metadata tree) is required
-/// for Iceberg clients to correctly handle manifest-list references pointing to AMT root manifests.
+/// The Iceberg format version written to metadata.json.
 const ICEBERG_FORMAT_VERSION: u8 = 4;
 
 /// Serializes TableMetadata to JSON bytes, overriding format-version to [`ICEBERG_FORMAT_VERSION`].
@@ -190,21 +189,28 @@ const ICEBERG_FORMAT_VERSION: u8 = 4;
 // TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
 fn serialize_metadata_json(metadata: &iceberg_spec::TableMetadata) -> DeltaResult<Vec<u8>> {
     let mut json: serde_json::Value = serde_json::to_value(metadata)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {e}")))?;
+        .map_err(|e| Error::generic(format!("Failed to convert metadata to JSON value: {e}")))?;
     json["format-version"] = serde_json::Value::Number(ICEBERG_FORMAT_VERSION.into());
-    serde_json::to_vec(&json)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {e}")))
+    serde_json::to_vec(&json).map_err(|e| {
+        Error::generic(format!(
+            "Failed to serialize metadata JSON value to bytes: {e}"
+        ))
+    })
 }
 
 /// Deserializes TableMetadata from JSON bytes, downgrading format-version from V4 to V3 so
 /// the iceberg crate can parse it.
 // TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
 fn deserialize_metadata_json(bytes: &[u8]) -> DeltaResult<iceberg_spec::TableMetadata> {
-    let mut json: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {e}")))?;
+    let mut json: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        Error::generic(format!("Failed to parse bytes as metadata JSON value: {e}"))
+    })?;
     json["format-version"] = serde_json::Value::Number(3.into());
-    serde_json::from_value(json)
-        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {e}")))
+    serde_json::from_value(json).map_err(|e| {
+        Error::generic(format!(
+            "Failed to convert metadata JSON value to TableMetadata: {e}"
+        ))
+    })
 }
 
 /// Finds the maximum field ID in an Iceberg schema (for `last_column_id`).
