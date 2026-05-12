@@ -4,8 +4,8 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 
 use super::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestInfo, TrackingInfo,
-    TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo, ManifestInfo,
+    TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{
     FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor, TypedGetData as _,
@@ -73,8 +73,8 @@ fn visit_metadata_entry_at<'a>(
     // 1: location
     // 2: file_format
     // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number,
-    // first_row_id, changes_dv) 9-12: dv_info fields (location, offset, size_in_bytes,
-    // cardinality) 13: partition_spec_id
+    // first_row_id, changes_dv) 9-12: deletion_vector fields (location, offset, size_in_bytes,
+    // cardinality) 13: spec_id
     // 14: sort_order_id
     // 15: record_count
     // 16: file_size_in_bytes
@@ -143,14 +143,14 @@ fn visit_metadata_entry_at<'a>(
         changes_dv: tracking_changes_dv_bytes,
     };
 
-    // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
-    let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;
-    let dv_info = dv_location
-        .map(|location| -> DeltaResult<DvInfo> {
-            let offset: i64 = getters[10].get(row_index, "dv_info.offset")?;
-            let size_in_bytes: i64 = getters[11].get(row_index, "dv_info.size_in_bytes")?;
-            let cardinality: i64 = getters[12].get(row_index, "dv_info.cardinality")?;
-            Ok(DvInfo {
+    // Extract deletion_vector fields (location, offset, size_in_bytes, cardinality)
+    let dv_location: Option<String> = getters[9].get_opt(row_index, "deletion_vector.location")?;
+    let deletion_vector = dv_location
+        .map(|location| -> DeltaResult<DeletionVectorInfo> {
+            let offset: i64 = getters[10].get(row_index, "deletion_vector.offset")?;
+            let size_in_bytes: i64 = getters[11].get(row_index, "deletion_vector.size_in_bytes")?;
+            let cardinality: i64 = getters[12].get(row_index, "deletion_vector.cardinality")?;
+            Ok(DeletionVectorInfo {
                 location,
                 offset,
                 size_in_bytes,
@@ -160,7 +160,7 @@ fn visit_metadata_entry_at<'a>(
         .transpose()?;
 
     // Extract scalar fields
-    let partition_spec_id: i32 = getters[13].get(row_index, "partition_spec_id")?;
+    let spec_id: i32 = getters[13].get(row_index, "spec_id")?;
     let sort_order_id: Option<i32> = getters[14].get_opt(row_index, "sort_order_id")?;
     let record_count: i64 = getters[15].get(row_index, "record_count")?;
     let file_size_in_bytes: Option<i64> = getters[16].get_opt(row_index, "file_size_in_bytes")?;
@@ -172,16 +172,16 @@ fn visit_metadata_entry_at<'a>(
         getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
     let ms_existing_files_count: Option<i32> =
         getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
-    let ms_deletes_files_count: Option<i32> =
-        getters[19].get_opt(row_index, "manifest_info.deletes_files_count")?;
+    let ms_deleted_files_count: Option<i32> =
+        getters[19].get_opt(row_index, "manifest_info.deleted_files_count")?;
     let ms_replaced_files_count: Option<i32> =
         getters[20].get_opt(row_index, "manifest_info.replaced_files_count")?;
     let ms_added_rows_count: Option<i64> =
         getters[21].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
         getters[22].get_opt(row_index, "manifest_info.existing_rows_count")?;
-    let ms_delete_rows_count: Option<i64> =
-        getters[23].get_opt(row_index, "manifest_info.delete_rows_count")?;
+    let ms_deleted_rows_count: Option<i64> =
+        getters[23].get_opt(row_index, "manifest_info.deleted_rows_count")?;
     let ms_replaced_rows_count: Option<i64> =
         getters[24].get_opt(row_index, "manifest_info.replaced_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
@@ -193,11 +193,11 @@ fn visit_metadata_entry_at<'a>(
     let manifest_info = ms_added_files_count.map(|added_files_count| ManifestInfo {
         added_files_count,
         existing_files_count: ms_existing_files_count.unwrap_or(0),
-        deletes_files_count: ms_deletes_files_count.unwrap_or(0),
+        deleted_files_count: ms_deleted_files_count.unwrap_or(0),
         replaced_files_count: ms_replaced_files_count.unwrap_or(0),
         added_rows_count: ms_added_rows_count.unwrap_or(0),
         existing_rows_count: ms_existing_rows_count.unwrap_or(0),
-        delete_rows_count: ms_delete_rows_count.unwrap_or(0),
+        deleted_rows_count: ms_deleted_rows_count.unwrap_or(0),
         replaced_rows_count: ms_replaced_rows_count.unwrap_or(0),
         min_sequence_number: ms_min_sequence_number.unwrap_or(0),
         dv: ms_dv.map(Bytes::copy_from_slice),
@@ -215,8 +215,8 @@ fn visit_metadata_entry_at<'a>(
         location,
         file_format,
         tracking,
-        dv_info,
-        partition_spec_id,
+        deletion_vector,
+        spec_id,
         sort_order_id,
         record_count,
         file_size_in_bytes,
