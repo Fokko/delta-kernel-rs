@@ -24,7 +24,6 @@ use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::path::ParsedLogPath;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, StructField, StructType};
 use crate::{
@@ -1328,11 +1327,10 @@ impl ContentTreeNode {
 
     /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
     ///
-    /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
-    ///
     /// # Returns
     /// A tuple of (batch_iterator, version, path_in_log) that can be used to construct
-    /// ContentTreeNode later.
+    /// a `ContentTreeNode` via [`Self::from_batches_with_version`]. The version component is
+    /// always 0 on this path (see TODO below).
     pub(crate) fn open_stream(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
@@ -1381,12 +1379,15 @@ impl ContentTreeNode {
             size: 0,
         };
 
-        let parsed =
-            ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
-
         let read_result_iter = parquet_handler.read_parquet_files(&[file], read_schema, None)?;
 
-        Ok((read_result_iter, parsed.version, path_in_log))
+        // Content tree manifests can live at any path (e.g. Iceberg AMT manifests under
+        // `metadata/`), not just Delta log paths. Nodes from this read path are only used for
+        // entry extraction, not writing, so the version field is irrelevant. We pass 0 here.
+        // TODO: Remove version from ParquetStreamResult and from_batches_with_version. The
+        // write path should get version from ContentTreeNodeBuilder directly instead of
+        // threading it through the read-side struct.
+        Ok((read_result_iter, 0, path_in_log))
     }
 }
 
@@ -3800,6 +3801,77 @@ mod tests {
             path_in_log,
             table_root_url.clone(),
         )
+    }
+
+    /// Verifies that `open_stream` succeeds for manifest files at arbitrary paths, not just
+    /// Delta log paths. Iceberg AMT manifests live under `metadata/` (e.g.
+    /// `metadata/UUID-root-1.parquet`), which `ParsedLogPath` would reject.
+    #[test]
+    fn test_open_stream_accepts_non_delta_log_paths() -> DeltaResult<()> {
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Build a minimal manifest with one entry
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data/file.parquet")
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(10)
+            .build();
+
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        builder.add_entry(entry);
+        let metadata = builder.build(&engine, 1)?;
+
+        // Write the manifest to disk (produces a Delta-log-style path)
+        let write_result = writer::ContentTreeNodeWriter::try_new(metadata)?.write(&engine)?;
+        let original_path = write_result
+            .location
+            .to_file_path()
+            .expect("should be a file URL");
+
+        // Copy the manifest to a non-Delta-log path (Iceberg-style)
+        let iceberg_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&iceberg_dir)?;
+        let iceberg_path = iceberg_dir.join("abc-root-1.parquet");
+        std::fs::copy(&original_path, &iceberg_path)?;
+        let iceberg_url = Url::from_file_path(&iceberg_path).unwrap();
+
+        // open_stream should succeed despite the non-Delta-log filename
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &iceberg_url,
+            "metadata/abc-root-1.parquet".to_string(),
+            None,
+            None,
+        )?;
+
+        // Round-trip through from_batches_with_version and verify entries
+        let data: Vec<_> = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let node = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root.clone(),
+        )?;
+        let entries = node.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].location.as_deref(),
+            Some("memory:///data/file.parquet")
+        );
+
+        Ok(())
     }
 
     #[test]
