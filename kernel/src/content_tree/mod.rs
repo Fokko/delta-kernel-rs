@@ -35,11 +35,23 @@ use crate::{
     SchemaRef, Version,
 };
 
-/// Field name for the content_stats column in ContentTreeNodeEntry schema.
-/// This field contains per-column statistics in AMT format.
+/// Field names in the [`ContentTreeNodeEntry`] schema.
+pub(crate) const CONTENT_TYPE_FIELD_NAME: &str = "contentType";
+pub(crate) const LOCATION_FIELD_NAME: &str = "location";
+pub(crate) const FILE_FORMAT_FIELD_NAME: &str = "fileFormat";
+pub(crate) const TRACKING_FIELD_NAME: &str = "tracking";
+pub(crate) const DV_INFO_FIELD_NAME: &str = "deletionVector";
+pub(crate) const PARTITION_SPEC_ID_FIELD_NAME: &str = "specId";
+pub(crate) const SORT_ORDER_ID_FIELD_NAME: &str = "sortOrderId";
+pub(crate) const RECORD_COUNT_FIELD_NAME: &str = "recordCount";
+pub(crate) const FILE_SIZE_IN_BYTES_FIELD_NAME: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+pub(crate) const MANIFEST_INFO_FIELD_NAME: &str = "manifestInfo";
+pub(crate) const KEY_METADATA_FIELD_NAME: &str = "keyMetadata";
+pub(crate) const SPLIT_OFFSETS_FIELD_NAME: &str = "splitOffsets";
+pub(crate) const EQUALITY_IDS_FIELD_NAME: &str = "equalityIds";
 
-/// Field names for the different fields within content_stats.
+/// Field names for the per-column sub-fields within `content_stats` (AMT format).
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
@@ -1552,10 +1564,10 @@ pub(crate) fn metadata_entry_to_scalars(
 
     for field in schema.fields() {
         let scalar = match field.name().as_str() {
-            "contentType" => Scalar::from(entry.content_type),
-            "location" => Scalar::from(entry.location.clone()),
-            "fileFormat" => Scalar::from(entry.file_format),
-            "tracking" => {
+            CONTENT_TYPE_FIELD_NAME => Scalar::from(entry.content_type),
+            LOCATION_FIELD_NAME => Scalar::from(entry.location.clone()),
+            FILE_FORMAT_FIELD_NAME => Scalar::from(entry.file_format),
+            TRACKING_FIELD_NAME => {
                 let ti = &entry.tracking;
                 // Get struct fields from schema
                 let struct_fields = if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1573,7 +1585,7 @@ pub(crate) fn metadata_entry_to_scalars(
                 ];
                 Scalar::Struct(StructData::new_unchecked(struct_fields, values))
             }
-            "deletionVector" => match &entry.deletion_vector {
+            DV_INFO_FIELD_NAME => match &entry.deletion_vector {
                 Some(dv) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1593,15 +1605,15 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "specId" => Scalar::from(entry.spec_id),
-            "sortOrderId" => Scalar::from(entry.sort_order_id),
-            "recordCount" => Scalar::from(entry.record_count),
-            "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
+            PARTITION_SPEC_ID_FIELD_NAME => Scalar::from(entry.spec_id),
+            SORT_ORDER_ID_FIELD_NAME => Scalar::from(entry.sort_order_id),
+            RECORD_COUNT_FIELD_NAME => Scalar::from(entry.record_count),
+            FILE_SIZE_IN_BYTES_FIELD_NAME => Scalar::from(entry.file_size_in_bytes),
             CONTENT_STATS_FIELD_NAME => match &entry.content_stats {
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "manifestInfo" => match &entry.manifest_info {
+            MANIFEST_INFO_FIELD_NAME => match &entry.manifest_info {
                 Some(ms) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1628,9 +1640,9 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "keyMetadata" => Scalar::from(entry.key_metadata.clone()),
-            "splitOffsets" => entry.split_offsets.clone().try_into()?,
-            "equalityIds" => entry.equality_ids.clone().try_into()?,
+            KEY_METADATA_FIELD_NAME => Scalar::from(entry.key_metadata.clone()),
+            SPLIT_OFFSETS_FIELD_NAME => entry.split_offsets.clone().try_into()?,
+            EQUALITY_IDS_FIELD_NAME => entry.equality_ids.clone().try_into()?,
             _ => Scalar::Null(field.data_type().clone()),
         };
 
@@ -2320,7 +2332,7 @@ impl ContentTreeNodeEntry {
         let mut fields = Vec::new();
         for field in base.fields() {
             fields.push(field.clone());
-            if field.name() == "fileSizeInBytes" {
+            if field.name() == FILE_SIZE_IN_BYTES_FIELD_NAME {
                 fields.push(content_stats_field.clone());
             }
         }
@@ -5362,7 +5374,7 @@ mod tests {
         use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
         use crate::schema::{ColumnName, ToSchema as _};
 
-        const RECORD_COUNT: i64 = 42;
+        const RECORD_COUNT_FIELD_NAME: i64 = 42;
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
@@ -5379,7 +5391,7 @@ mod tests {
                 changes_dv: None,
             })
             .sort_order_id(0)
-            .record_count(RECORD_COUNT)
+            .record_count(RECORD_COUNT_FIELD_NAME)
             .file_size_in_bytes(1024)
             .build();
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
@@ -5462,7 +5474,7 @@ mod tests {
         );
         assert_eq!(
             visitor.num_records[0],
-            Some(RECORD_COUNT),
+            Some(RECORD_COUNT_FIELD_NAME),
             "stats_parsed.numRecords should be populated from recordCount"
         );
 

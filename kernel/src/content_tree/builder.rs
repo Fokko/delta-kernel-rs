@@ -8,26 +8,31 @@ use url::Url;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 #[cfg(test)]
 use crate::actions::Add;
+use crate::actions::ADD_NAME;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
-use crate::content_tree::stats::aggregate_content_stats;
+use crate::content_tree::stats::{self, aggregate_content_stats};
 #[cfg(test)]
 use crate::content_tree::stats::{merge_partition_values_into_stats, parse_delta_add_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
-    ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder, DataContentType,
-    DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
-    DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
-    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS,
+    metadata_entry_to_scalars, ContentTreeNode, ContentTreeNodeEntry,
+    ContentTreeNodeEntryBuilder, DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus,
+    CONTENT_STATS_FIELD_NAME, CONTENT_TYPE_FIELD_NAME, DELTA_STATS_MAX_VALUES,
+    DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS,
+    DELTA_STATS_TIGHT_BOUNDS, DV_INFO_FIELD_NAME, FILE_FORMAT_FIELD_NAME,
+    FILE_SIZE_IN_BYTES_FIELD_NAME, LOCATION_FIELD_NAME, PARTITION_SPEC_ID_FIELD_NAME,
+    RECORD_COUNT_FIELD_NAME, SORT_ORDER_ID_FIELD_NAME, TRACKING_FIELD_NAME,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
 use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::scan::data_skipping::DataSkippingFilter;
+use crate::scan::log_replay::{DEFAULT_ROW_COMMIT_VERSION_NAME, STATS_PARSED_NAME};
 use crate::schema::{
-    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, MapType, Schema, SchemaRef,
     StructField, StructType,
 };
 use crate::utils::require;
@@ -550,8 +555,6 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
-        use crate::content_tree::stats;
-
         if engine_data.is_empty() {
             return Ok(());
         }
@@ -592,11 +595,8 @@ impl ContentTreeNodeBuilder {
         }
     }
 
-    /// Build and evaluate a write metadata transformation expression.
-    ///
-    /// When `stats_struct` is `Some`, the input schema includes the AMT stats struct
-    /// and content_stats/recordCount are derived from it. When `None`, stats are treated
-    /// as an empty struct and content_stats is null with recordCount = 0.
+    /// Blind-append write transform (status [`TrackingStatus::Added`]). With `stats_struct =
+    /// Some(_)` the input `stats` is AMT-shaped and passes through; otherwise stats are null.
     fn evaluate_write_transform(
         &self,
         engine: &dyn crate::Engine,
@@ -604,12 +604,8 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
         output_schema: &SchemaRef,
-        stats_struct: Option<&crate::schema::StructType>,
+        stats_struct: Option<&StructType>,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
-        use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
-        use crate::expressions::{Expression, Scalar};
-        use crate::schema::{MapType, StructField, StructType};
-
         let stats_type = match stats_struct {
             Some(ss) => DataType::Struct(Box::new(ss.clone())),
             None => DataType::Struct(Box::new(StructType::new_unchecked(vec![]))),
@@ -626,79 +622,41 @@ impl ContentTreeNodeBuilder {
             StructField::nullable("stats", stats_type),
         ]));
 
-        let version_i64 = version as i64;
-
-        // Build recordCount and content_stats expressions based on stats availability
-        let (record_count_expr, content_stats_expr) = match stats_struct {
+        let (record_count, content_stats) = match stats_struct {
             Some(ss) => {
-                let rc = if let Some(first_col) = ss.fields().next().map(|f| f.name().clone()) {
-                    Expression::coalesce([
+                let rc = match ss.fields().next() {
+                    Some(first_col) => Expression::coalesce([
                         Expression::column([
                             "stats",
-                            first_col.as_str(),
+                            first_col.name().as_str(),
                             crate::content_tree::VALUE_COUNT,
                         ]),
                         Expression::literal(Scalar::Long(0)),
-                    ])
-                } else {
-                    Expression::literal(Scalar::Long(0))
+                    ]),
+                    None => Expression::literal(Scalar::Long(0)),
                 };
-                (rc, Expression::column(["stats"]))
+                (rc, Some(Expression::column(["stats"])))
             }
-            None => {
-                let stats_null_type = output_schema
-                    .field(CONTENT_STATS_FIELD_NAME)
-                    .map(|f| f.data_type().clone())
-                    .unwrap_or(DataType::STRING);
-                (
-                    Expression::literal(Scalar::Long(0)),
-                    Expression::null_literal(stats_null_type),
-                )
-            }
+            None => (Expression::literal(Scalar::Long(0)), None),
         };
 
-        // Build field expressions mapping input → output for each ContentTreeNodeEntry field
-        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
-        for field in output_schema.fields() {
-            let expr: Expression = match field.name().as_str() {
-                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
-                "location" => Expression::column(["path"]),
-                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-                "tracking" => {
-                    if !matches!(field.data_type(), DataType::Struct(_)) {
-                        return Err(crate::Error::generic(
-                            "tracking field should be a struct type",
-                        ));
-                    }
-                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-                    Expression::struct_from([
-                        Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
-                        snapshot_id_expr,
-                        Expression::literal(Scalar::Long(version_i64)),
-                        Expression::literal(Scalar::Long(version_i64)),
-                        Expression::null_literal(DataType::LONG), // firstRowId
-                        Expression::null_literal(DataType::BINARY), // changesDv
-                    ])
-                }
-                "deletionVector" => Expression::null_literal(field.data_type().clone()),
-                "specId" => Expression::literal(Scalar::Integer(0)),
-                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
-                "recordCount" => record_count_expr.clone(),
-                "fileSizeInBytes" => Expression::column(["size"]),
-                CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
-                _ => Expression::null_literal(field.data_type().clone()),
-            };
-            field_exprs.push(Arc::new(expr));
-        }
+        let projections = ContentTreeEntryProjections {
+            status: TrackingStatus::Added,
+            snapshot_id,
+            location: Expression::column(["path"]),
+            file_size_in_bytes: Expression::column(["size"]),
+            sequence_number: Expression::literal(Scalar::Long(version as i64)),
+            dv_info: None,
+            record_count,
+            content_stats,
+        };
 
-        // Create the struct transform expression
-        let transform_expr = Expression::struct_from(field_exprs);
-
-        // Create evaluator and evaluate
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             input_schema,
-            Arc::new(transform_expr),
+            Arc::new(build_content_tree_entry_expression(
+                output_schema,
+                &projections,
+            )),
             DataType::Struct(Box::new(output_schema.as_ref().clone())),
         )?;
         let transformed = evaluator.evaluate(engine_data)?;
@@ -821,8 +779,6 @@ impl ContentTreeNodeBuilder {
     /// Data files inside leaf manifests are not loaded into pending_entries - they're stored
     /// in separate parquet files referenced by the manifest entries.
     pub(crate) fn clear_root_data_and_dv_entries(&mut self) {
-        use crate::content_tree::DataContentType;
-
         // Collect locations of entries being removed
         let removed_locations: Vec<String> = self
             .pending_entries
@@ -1157,9 +1113,6 @@ impl ContentTreeNodeBuilder {
         snapshot_id: i64,
         allocator: &mut CursorRowIdAllocator,
     ) -> DeltaResult<ContentTreeNode> {
-        use crate::content_tree::metadata_entry_to_scalars;
-        use crate::expressions::Scalar;
-
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
 
@@ -1207,18 +1160,9 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Build and evaluate a scan-row transformation expression.
-    ///
-    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existing`
-    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON
-    /// format: `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is
-    /// converted to AMT format for `content_stats` using
-    /// [`build_content_stats_from_delta_stats_parsed`].
-    ///
-    /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
-    /// `add_from_existing_scan_rows`), `deletionVector` is projected from those columns with a
-    /// nullability predicate so non-DV rows produce a null struct. Otherwise `deletionVector` is
-    /// null.
+    /// Scan-row ingest transform (status [`TrackingStatus::Existing`]). `scan_row_input_schema`
+    /// must include `stats_parsed` (Delta JSON-shaped); `deletionVector` comes from the flat
+    /// decoded-DV columns if present, else null.
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,
@@ -1227,95 +1171,39 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
-        use crate::content_tree::{
-            stats, DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME,
-        };
-        use crate::expressions::{Expression, Predicate, Scalar};
-        use crate::schema::DataType;
-
         let output_schema = self.get_schema()?;
         let stats_struct = stats::stats_schema(&self.table_schema)?;
-        let version_i64 = version as i64;
 
         // Detect whether flat decoded DV columns are present in the input schema.
-        let has_decoded_dv = scan_row_input_schema.field("_dv_location").is_some();
+        let has_decoded_dv = scan_row_input_schema
+            .field(DV_LOCATION_FIELD_NAME)
+            .is_some();
 
-        // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta
-        // format). record_count reads numRecords directly; content_stats converts Delta→AMT
-        // via expressions.
-        let record_count_expr = Expression::coalesce([
-            Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS]),
-            Expression::literal(Scalar::Long(0)),
-        ]);
-        let content_stats_expr =
-            build_content_stats_from_delta_stats_parsed(&self.table_schema, &stats_struct)?;
-
-        // Build field expressions mapping scan_row input → ContentTreeNodeEntry output
-        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
-        for field in output_schema.fields() {
-            let expr: Expression = match field.name().as_str() {
-                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
-                "location" => Expression::column(["path"]),
-                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-                "tracking" => {
-                    if !matches!(field.data_type(), DataType::Struct(_)) {
-                        return Err(crate::Error::generic(
-                            "tracking field should be a struct type",
-                        ));
-                    }
-                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-                    Expression::struct_from([
-                        Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
-                        snapshot_id_expr,
-                        Expression::literal(Scalar::Long(version_i64)),
-                        Expression::literal(Scalar::Long(version_i64)),
-                        Expression::null_literal(DataType::LONG), // firstRowId
-                        Expression::null_literal(DataType::BINARY), // changesDv
-                    ])
-                }
-                "deletionVector" => {
-                    if has_decoded_dv {
-                        // Flat decoded DV columns: project into deletionVector struct.
-                        // Nullability predicate: null struct for non-DV rows (_dv_location is
-                        // null).
-                        if !matches!(field.data_type(), DataType::Struct(_)) {
-                            return Err(crate::Error::generic(
-                                "deletionVector field should be a struct type",
-                            ));
-                        }
-                        let nullability =
-                            Expression::from_pred(Predicate::is_not_null(Expression::column([
-                                "_dv_location",
-                            ])));
-                        Expression::struct_with_nullability_from(
-                            [
-                                Expression::column(["_dv_location"]),
-                                Expression::column(["_dv_offset"]),
-                                Expression::column(["_dv_size_in_bytes"]),
-                                Expression::column(["_dv_cardinality"]),
-                            ],
-                            nullability,
-                        )
-                    } else {
-                        Expression::null_literal(field.data_type().clone())
-                    }
-                }
-                "specId" => Expression::literal(Scalar::Integer(0)),
-                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
-                "recordCount" => record_count_expr.clone(),
-                "fileSizeInBytes" => Expression::column(["size"]),
-                CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
-                _ => Expression::null_literal(field.data_type().clone()),
-            };
-            field_exprs.push(Arc::new(expr));
-        }
-
-        let transform_expr = Expression::struct_from(field_exprs);
+        let projections = ContentTreeEntryProjections {
+            status: TrackingStatus::Existing,
+            snapshot_id,
+            location: Expression::column(["path"]),
+            file_size_in_bytes: Expression::column(["size"]),
+            sequence_number: Expression::literal(Scalar::Long(version as i64)),
+            dv_info: has_decoded_dv.then(flat_dv_columns_to_dv_info_expr),
+            // stats_parsed is always present (Delta format); record_count reads numRecords
+            // directly, content_stats converts Delta -> AMT via expressions.
+            record_count: Expression::coalesce([
+                Expression::column([STATS_PARSED_NAME, DELTA_STATS_NUM_RECORDS]),
+                Expression::literal(Scalar::Long(0)),
+            ]),
+            content_stats: Some(build_content_stats_from_delta_stats_parsed(
+                &self.table_schema,
+                &stats_struct,
+            )?),
+        };
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             scan_row_input_schema.clone(),
-            Arc::new(transform_expr),
+            Arc::new(build_content_tree_entry_expression(
+                &output_schema,
+                &projections,
+            )),
             DataType::Struct(Box::new(output_schema.as_ref().clone())),
         )?;
         let transformed = evaluator.evaluate(engine_data)?;
@@ -1490,18 +1378,18 @@ impl ContentTreeNodeBuilder {
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable("stats", DataType::STRING),
-            StructField::nullable("stats_parsed", stats_parsed_type.clone()),
+            StructField::nullable(STATS_PARSED_NAME, stats_parsed_type.clone()),
         ]));
         let stats_augmented_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
-            StructField::nullable("stats_parsed", stats_parsed_type),
+            StructField::nullable(STATS_PARSED_NAME, stats_parsed_type),
         ]));
         let parse_stats_expr = Expression::struct_from([
             Expression::column(["path"]),
             Expression::column(["size"]),
             Expression::coalesce([
-                Expression::column(["stats_parsed"]),
+                Expression::column([STATS_PARSED_NAME]),
                 Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
             ]),
         ]);
@@ -1672,7 +1560,7 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
             DataType::Struct(Box::new(StructType::new_unchecked([
                 StructField::nullable("path", DataType::STRING),
                 StructField::nullable("size", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                 StructField::nullable("stats", DataType::STRING),
                 StructField::nullable("deletionVector", add_dv),
             ]))),
@@ -1763,10 +1651,10 @@ fn build_content_stats_from_delta_stats_parsed(
                 .map(|f| {
                     Arc::new(match f.name().as_str() {
                         crate::content_tree::VALUE_COUNT => {
-                            Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS])
+                            Expression::column([STATS_PARSED_NAME, DELTA_STATS_NUM_RECORDS])
                         }
                         crate::content_tree::NULL_VALUE_COUNT => Expression::column([
-                            "stats_parsed",
+                            STATS_PARSED_NAME,
                             DELTA_STATS_NULL_COUNT,
                             col_name.as_str(),
                         ]),
@@ -1780,17 +1668,17 @@ fn build_content_stats_from_delta_stats_parsed(
                             Expression::null_literal(DataType::INTEGER)
                         }
                         crate::content_tree::LOWER_BOUND => Expression::column([
-                            "stats_parsed",
+                            STATS_PARSED_NAME,
                             DELTA_STATS_MIN_VALUES,
                             col_name.as_str(),
                         ]),
                         crate::content_tree::UPPER_BOUND => Expression::column([
-                            "stats_parsed",
+                            STATS_PARSED_NAME,
                             DELTA_STATS_MAX_VALUES,
                             col_name.as_str(),
                         ]),
                         crate::content_tree::EXACT_BOUNDS => Expression::coalesce([
-                            Expression::column(["stats_parsed", DELTA_STATS_TIGHT_BOUNDS]),
+                            Expression::column([STATS_PARSED_NAME, DELTA_STATS_TIGHT_BOUNDS]),
                             Expression::literal(Scalar::Boolean(true)),
                         ]),
                         _ => Expression::null_literal(f.data_type().clone()),
@@ -1803,69 +1691,162 @@ fn build_content_stats_from_delta_stats_parsed(
     Ok(Expression::struct_from(col_exprs))
 }
 
-/// Schema for the 4 flat DV columns appended to scan-row data before the final transform.
-/// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg
-/// framing).
+/// Intermediate flat decoded-DV columns: path decoded from base85, sizes widened to LONG,
+/// `+8` bytes for Iceberg framing.
+const DV_LOCATION_FIELD_NAME: &str = "_dv_location";
+const DV_OFFSET_FIELD_NAME: &str = "_dv_offset";
+const DV_SIZE_IN_BYTES_FIELD_NAME: &str = "_dv_size_in_bytes";
+const DV_CARDINALITY_FIELD_NAME: &str = "_dv_cardinality";
+
+/// Schema of [`DV_LOCATION_FIELD_NAME`] etc., for [`EngineData::append_columns`].
 static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable("_dv_location", DataType::STRING),
-        StructField::nullable("_dv_offset", DataType::LONG),
-        StructField::nullable("_dv_size_in_bytes", DataType::LONG),
-        StructField::nullable("_dv_cardinality", DataType::LONG),
+        StructField::nullable(DV_LOCATION_FIELD_NAME, DataType::STRING),
+        StructField::nullable(DV_OFFSET_FIELD_NAME, DataType::LONG),
+        StructField::nullable(DV_SIZE_IN_BYTES_FIELD_NAME, DataType::LONG),
+        StructField::nullable(DV_CARDINALITY_FIELD_NAME, DataType::LONG),
     ]))
 });
 
-/// Builds an evaluator that projects `add.path`, `add.size`,
-/// `add.defaultRowCommitVersion` and parses `add.stats` JSON into a
-/// `stats_parsed` struct matching `delta_stats_schema`.
+/// Input schema for [`build_log_batch_evaluator`].
+static LOG_BATCH_EVALUATOR_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+        ]))),
+    )]))
+});
+
+/// `add.{path, size, defaultRowCommitVersion}`, threaded from the log-batch evaluator into
+/// the action-to-entry evaluator.
+fn log_add_projection_field() -> StructField {
+    StructField::nullable(
+        ADD_NAME,
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        ]))),
+    )
+}
+
+/// `dvInfo` from the flat decoded-DV columns; null when `_dv_location` is null (no DV).
+fn flat_dv_columns_to_dv_info_expr() -> Expression {
+    Expression::struct_with_nullability_from(
+        [
+            Expression::column([DV_LOCATION_FIELD_NAME]),
+            Expression::column([DV_OFFSET_FIELD_NAME]),
+            Expression::column([DV_SIZE_IN_BYTES_FIELD_NAME]),
+            Expression::column([DV_CARDINALITY_FIELD_NAME]),
+        ],
+        Expression::from_pred(Predicate::is_not_null(Expression::column([
+            DV_LOCATION_FIELD_NAME,
+        ]))),
+    )
+}
+
+/// Per-call-site inputs for [`build_content_tree_entry_expression`].
+struct ContentTreeEntryProjections {
+    status: TrackingStatus,
+    snapshot_id: i64,
+    location: Expression,
+    file_size_in_bytes: Expression,
+    /// Used for both `dataSequenceNumber` and `fileSequenceNumber`.
+    sequence_number: Expression,
+    /// `None` emits a null of the field's type.
+    dv_info: Option<Expression>,
+    record_count: Expression,
+    /// `None` emits a null of the field's type.
+    content_stats: Option<Expression>,
+}
+
+/// Builds the row-to-`ContentTreeNodeEntry` projection expression shared by the blind-append
+/// write, scan-row ingest, and AMT log-replay transforms; constant fields come from here,
+/// everything that varies between call sites comes from [`ContentTreeEntryProjections`].
+fn build_content_tree_entry_expression(
+    output_schema: &Schema,
+    projections: &ContentTreeEntryProjections,
+) -> Expression {
+    let tracking = Expression::struct_from([
+        Expression::literal(Scalar::Integer(projections.status as i32)),
+        Expression::literal(Scalar::Long(projections.snapshot_id)),
+        projections.sequence_number.clone(), // dataSequenceNumber
+        projections.sequence_number.clone(), // fileSequenceNumber
+        Expression::null_literal(DataType::LONG), // firstRowId
+        Expression::null_literal(DataType::BINARY), // changesDv
+    ]);
+
+    let field_exprs: Vec<Arc<Expression>> = output_schema
+        .fields()
+        .map(|field| {
+            let expr = match field.name().as_str() {
+                CONTENT_TYPE_FIELD_NAME => {
+                    Expression::literal(Scalar::Integer(DataContentType::Data as i32))
+                }
+                LOCATION_FIELD_NAME => projections.location.clone(),
+                FILE_FORMAT_FIELD_NAME => Expression::literal(Scalar::String("parquet".into())),
+                TRACKING_FIELD_NAME => tracking.clone(),
+                DV_INFO_FIELD_NAME => match &projections.dv_info {
+                    Some(expr) => expr.clone(),
+                    None => Expression::null_literal(field.data_type().clone()),
+                },
+                PARTITION_SPEC_ID_FIELD_NAME => Expression::literal(Scalar::Integer(0)),
+                SORT_ORDER_ID_FIELD_NAME => Expression::null_literal(DataType::INTEGER),
+                RECORD_COUNT_FIELD_NAME => projections.record_count.clone(),
+                CONTENT_STATS_FIELD_NAME => match &projections.content_stats {
+                    Some(expr) => expr.clone(),
+                    None => Expression::null_literal(field.data_type().clone()),
+                },
+                FILE_SIZE_IN_BYTES_FIELD_NAME => projections.file_size_in_bytes.clone(),
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            Arc::new(expr)
+        })
+        .collect();
+
+    Expression::struct_from(field_exprs)
+}
+
+/// Projects `add.{path, size, defaultRowCommitVersion}` and parses `add.stats` into
+/// `stats_parsed`, shaped to `delta_stats_schema`.
 fn build_log_batch_evaluator(
     engine: &dyn Engine,
     delta_stats_schema: &SchemaRef,
 ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
-    let input_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "add",
-        DataType::Struct(Box::new(StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-            StructField::nullable("stats", DataType::STRING),
-        ]))),
-    )]));
-
     let output_schema = DataType::Struct(Box::new(StructType::new_unchecked([
+        log_add_projection_field(),
         StructField::nullable(
-            "add",
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable("path", DataType::STRING),
-                StructField::nullable("size", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-            ]))),
-        ),
-        StructField::nullable(
-            "stats_parsed",
+            STATS_PARSED_NAME,
             DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
         ),
     ])));
 
     let expression = Arc::new(Expression::struct_from([
         Expression::struct_from([
-            Expression::column(["add", "path"]),
-            Expression::column(["add", "size"]),
-            Expression::column(["add", "defaultRowCommitVersion"]),
+            Expression::column([ADD_NAME, "path"]),
+            Expression::column([ADD_NAME, "size"]),
+            Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
         ]),
         Expression::parse_json(
-            Expression::column(["add", "stats"]),
+            Expression::column([ADD_NAME, "stats"]),
             delta_stats_schema.clone(),
         ),
     ]));
 
-    engine
-        .evaluation_handler()
-        .new_expression_evaluator(input_schema, expression, output_schema)
+    engine.evaluation_handler().new_expression_evaluator(
+        LOG_BATCH_EVALUATOR_INPUT_SCHEMA.clone(),
+        expression,
+        output_schema,
+    )
 }
 
-/// Builds an evaluator that assembles `ContentTreeNodeEntry` rows from the
-/// prepared log columns and decoded DV columns, shaped to `output_schema`.
+/// Builds an evaluator that assembles `ContentTreeNodeEntry` rows from the prepared log
+/// columns (`add.{path, size, defaultRowCommitVersion}` + parsed `stats_parsed`) and the
+/// flat decoded-DV columns, shaped to `output_schema`.
 fn build_action_to_content_tree_entry_evaluator(
     engine: &dyn Engine,
     snapshot_id: i64,
@@ -1873,8 +1854,7 @@ fn build_action_to_content_tree_entry_evaluator(
     delta_stats_schema: &SchemaRef,
     output_schema: &SchemaRef,
 ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
-    // Output schema's content_stats field is always a struct by construction;
-    // unwrap once and reuse across the field-expr loop.
+    // Output schema's content_stats field is always a struct by construction.
     let amt_content_stats_schema = match output_schema
         .field(CONTENT_STATS_FIELD_NAME)
         .map(|f| f.data_type())
@@ -1884,71 +1864,40 @@ fn build_action_to_content_tree_entry_evaluator(
     };
 
     let input_schema = Arc::new(StructType::new_unchecked(
-        [StructField::nullable(
-            "add",
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable("path", DataType::STRING),
-                StructField::nullable("size", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-            ]))),
-        )]
-        .into_iter()
-        .chain(DV_DECODED_FLAT_SCHEMA.fields().cloned())
-        .chain([StructField::nullable(
-            "stats_parsed",
-            DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
-        )])
-        .collect::<Vec<_>>(),
+        [log_add_projection_field()]
+            .into_iter()
+            .chain(DV_DECODED_FLAT_SCHEMA.fields().cloned())
+            .chain([StructField::nullable(
+                STATS_PARSED_NAME,
+                DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
+            )])
+            .collect::<Vec<_>>(),
     ));
 
-    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-    let null_if_no_dv =
-        Expression::from_pred(Predicate::is_not_null(Expression::column(["_dv_location"])));
-    let dv_info_expr = Expression::struct_with_nullability_from(
-        [
-            Expression::column(["_dv_location"]),
-            Expression::column(["_dv_offset"]),
-            Expression::column(["_dv_size_in_bytes"]),
-            Expression::column(["_dv_cardinality"]),
-        ],
-        null_if_no_dv,
-    );
-
-    let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
-    for field in output_schema.fields() {
-        let expr: Expression = match field.name().as_str() {
-            "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
-            "location" => Expression::column(["add", "path"]),
-            "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
-            "tracking" => Expression::struct_from([
-                Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
-                snapshot_id_expr.clone(),
-                Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
-                Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
-                Expression::null_literal(DataType::LONG),               // firstRowId
-                Expression::null_literal(DataType::BINARY),             // changesDv
-            ]),
-            "deletionVector" => dv_info_expr.clone(),
-            "specId" => Expression::literal(Scalar::Integer(0)),
-            "sortOrderId" => Expression::null_literal(DataType::INTEGER),
-            "recordCount" => Expression::coalesce([
-                Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS]),
-                // Remove actions have no stats; default the record count to 0.
-                Expression::literal(Scalar::Long(0)),
-            ]),
-            CONTENT_STATS_FIELD_NAME => build_content_stats_from_delta_stats_parsed(
-                table_schema,
-                &amt_content_stats_schema,
-            )?,
-            "fileSizeInBytes" => Expression::column(["add", "size"]),
-            _ => Expression::null_literal(field.data_type().clone()),
-        };
-        field_exprs.push(Arc::new(expr));
-    }
+    let projections = ContentTreeEntryProjections {
+        status: TrackingStatus::Existing,
+        snapshot_id,
+        location: Expression::column([ADD_NAME, "path"]),
+        file_size_in_bytes: Expression::column([ADD_NAME, "size"]),
+        sequence_number: Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+        dv_info: Some(flat_dv_columns_to_dv_info_expr()),
+        record_count: Expression::coalesce([
+            Expression::column([STATS_PARSED_NAME, DELTA_STATS_NUM_RECORDS]),
+            // Remove actions have no stats; default the record count to 0.
+            Expression::literal(Scalar::Long(0)),
+        ]),
+        content_stats: Some(build_content_stats_from_delta_stats_parsed(
+            table_schema,
+            &amt_content_stats_schema,
+        )?),
+    };
 
     engine.evaluation_handler().new_expression_evaluator(
         input_schema,
-        Arc::new(Expression::struct_from(field_exprs)),
+        Arc::new(build_content_tree_entry_expression(
+            output_schema,
+            &projections,
+        )),
         DataType::Struct(Box::new(output_schema.as_ref().clone())),
     )
 }
@@ -2340,10 +2289,10 @@ impl ContentRootRebuildProcessor {
         result
     }
 
-    /// Single-pass dedup over a log batch. Updates internal `log_action_keys`
-    /// and `leaf_removes`. Returns a selection vector where
-    /// `selection_vector[i] == true` indicates row `i` is the latest Add
-    /// action for that (data file, DV) pair.
+    /// Single-pass dedup over a log batch. Updates internal `log_action_keys` and
+    /// `leaf_removes`, and returns a selection vector of length `actions.len()` where
+    /// `selection_vector[i] == true` indicates row `i` is the latest `Add` action for that
+    /// (data file, DV) pair.
     fn dedup_log_batch(&mut self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
         let row_count = actions.len();
         let mut dedup = LogBatchDedupVisitor {
@@ -2356,11 +2305,27 @@ impl ContentRootRebuildProcessor {
         Ok(dedup.selection_vector)
     }
 }
+
 impl LogReplayProcessor for ContentRootRebuildProcessor {
     type Output = FilteredEngineData;
+
+    /// Dedups the batch, then transforms the surviving `Add` rows into `ContentTreeNodeEntry`
+    /// rows (decode DV columns, run the log-batch and action-to-entry evaluators) and returns
+    /// them paired with the selection vector.
     fn process_actions_batch(&mut self, batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let selection_vector = self.dedup_log_batch(batch.actions.as_ref())?;
+        require!(
+            selection_vector.len() == batch.actions.len(),
+            Error::InternalError(format!(
+                "dedup selection vector length {} does not match batch row count {}",
+                selection_vector.len(),
+                batch.actions.len()
+            ))
+        );
 
+        // Dedup eliminated every row (e.g. an all-`Remove` commit, or `Add`s all superseded by
+        // newer commits): skip the DV decode and evaluator passes and return the batch with the
+        // all-`false` vector so the caller drops it.
         if !selection_vector.iter().any(|&b| b) {
             return FilteredEngineData::try_new(batch.actions, selection_vector);
         }
@@ -2372,7 +2337,7 @@ impl LogReplayProcessor for ContentRootRebuildProcessor {
         dv_decoder.visit_rows_of(actions.as_ref())?;
         let intermediate = self.log_batch_evaluator.evaluate(actions.as_ref())?;
 
-        // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
+        // Append the decoded `_dv_*` columns for the action-to-entry evaluator.
         let augmented_with_dv = dv_decoder.append_decoded_dv_columns(intermediate.as_ref())?;
 
         let result = self
