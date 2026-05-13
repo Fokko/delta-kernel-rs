@@ -19,12 +19,11 @@ use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
-    metadata_entry_to_scalars, ContentTreeNode, ContentTreeNodeEntry,
-    ContentTreeNodeEntryBuilder, DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus,
-    CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES,
-    DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, DV_INFO,
-    FILE_FORMAT, FILE_SIZE_IN_BYTES, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID,
-    TRACKING,
+    metadata_entry_to_scalars, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
+    DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
+    CONTENT_TYPE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
+    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, DV_INFO, FILE_FORMAT, FILE_SIZE_IN_BYTES,
+    LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID, TRACKING,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
@@ -605,8 +604,11 @@ impl ContentTreeNodeBuilder {
         }
     }
 
-    /// Blind-append write transform (status [`TrackingStatus::Added`]). With `stats_struct =
-    /// Some(_)` the input `stats` is AMT-shaped and passes through; otherwise stats are null.
+    /// Build and evaluate a write metadata transformation expression.
+    ///
+    /// When `stats_struct` is `Some`, the input schema includes the AMT stats struct
+    /// and content_stats/recordCount are derived from it. When `None`, stats are treated
+    /// as an empty struct and content_stats is null with recordCount = 0.
     fn evaluate_write_transform(
         &self,
         engine: &dyn crate::Engine,
@@ -1170,9 +1172,16 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Scan-row ingest transform (status [`TrackingStatus::Existing`]). `scan_row_input_schema`
-    /// must include `stats_parsed` (Delta JSON-shaped); `deletionVector` comes from the flat
-    /// decoded-DV columns if present, else null.
+    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existing`
+    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON
+    /// format: `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is
+    /// converted to AMT format for `content_stats` using
+    /// [`build_content_stats_from_delta_stats_parsed`].
+    ///
+    /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
+    /// `add_from_existing_scan_rows`), `deletionVector` is projected from those columns with a
+    /// nullability predicate so non-DV rows produce a null struct. Otherwise `deletionVector` is
+    /// null.
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,

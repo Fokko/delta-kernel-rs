@@ -51,7 +51,7 @@ pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
 pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 
-/// Field names for the per-column sub-fields within `content_stats` (AMT format).
+/// Field names for the different fields within content_stats.
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
