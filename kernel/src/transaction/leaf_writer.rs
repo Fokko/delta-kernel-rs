@@ -45,7 +45,7 @@ pub struct LeafNodeWriter {
 
     /// Version of the snapshot being written
     /// TODO: This field should not be needed for leaf writer. It's currently required
-    /// as a workaround to force action tracking status to Existed (rather than Added).
+    /// as a workaround to force action tracking status to Existing (rather than Added).
     /// We need a better API - see usage at add_existing_actions() for details.
     version: Version,
 

@@ -676,7 +676,7 @@ impl ContentTreeNode {
     /// Builds selection vectors for Add vs Remove entries based on tracking.status.
     ///
     /// Returns (add_selection, remove_selection) where:
-    /// - add_selection[i] = true if entry i has status Existed (0) or Added (1)
+    /// - add_selection[i] = true if entry i has status Existing (0) or Added (1)
     /// - remove_selection[i] = true if entry i has status Deleted (2)
     ///
     /// Both exclude manifest entries (contentType 3, 4) and other non-data types.
@@ -719,7 +719,7 @@ impl ContentTreeNode {
                     if content_type == 0 {
                         match status {
                             0 | 1 => {
-                                // Existed or Added -> Add action
+                                // Existing or Added -> Add action
                                 self.add_selection.push(true);
                                 self.remove_selection.push(false);
                             }
@@ -1718,7 +1718,7 @@ impl From<DataFileFormat> for Scalar {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TrackingStatus {
-    Existed = 0,
+    Existing = 0,
     Added = 1,
     Deleted = 2,
     Replaced = 3,
@@ -3593,7 +3593,7 @@ mod tests {
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
@@ -3720,7 +3720,7 @@ mod tests {
         let entry3 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
@@ -3840,7 +3840,7 @@ mod tests {
 
         // Create entries with all tracking statuses
         let statuses = vec![
-            TrackingStatus::Existed,
+            TrackingStatus::Existing,
             TrackingStatus::Added,
             TrackingStatus::Deleted,
             TrackingStatus::Replaced,
@@ -4523,7 +4523,7 @@ mod tests {
         let delete_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DeleteManifest)
             .location("memory:///delete-manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -4578,7 +4578,7 @@ mod tests {
             let mut entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
                 .location("memory:///test.parquet")
                 .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
+                    status: TrackingStatus::Existing,
                     snapshot_id: Some(1),
                     sequence_number: Some(100),
                     file_sequence_number: Some(100),
@@ -4630,7 +4630,7 @@ mod tests {
         let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("memory:///data-manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -4750,7 +4750,7 @@ mod tests {
         let data_manifest_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location(child_manifest_url_1.as_str())
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -4773,7 +4773,7 @@ mod tests {
         let data_manifest_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location(child_manifest_url_2.as_str())
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),

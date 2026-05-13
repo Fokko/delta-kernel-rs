@@ -188,14 +188,22 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             // file3 and file4 were added by delta log commits at v3 and v4 respectively,
             // and are stored as Data entries directly in the root.
             // Sequence numbers must reflect the actual commit version, not the root version (5).
-            // Both should have Existed status since they were rolled up from prior versions.
+            // Both should have Existing status since they were rolled up from prior versions.
             let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
             let file3 = tracking.get("file3.parquet").expect("file3 in root");
             assert_eq!(file3.seq_num, Some(3), "file3 seq_num");
-            assert_eq!(file3.status, TrackingStatus::Existed as i32, "file3 status");
+            assert_eq!(
+                file3.status,
+                TrackingStatus::Existing as i32,
+                "file3 status"
+            );
             let file4 = tracking.get("file4.parquet").expect("file4 in root");
             assert_eq!(file4.seq_num, Some(4), "file4 seq_num");
-            assert_eq!(file4.status, TrackingStatus::Existed as i32, "file4 status");
+            assert_eq!(
+                file4.status,
+                TrackingStatus::Existing as i32,
+                "file4 status"
+            );
         }
     }
     Ok(())
@@ -343,14 +351,14 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                 "v3: New root manifest should contain 3 files (file2 removed) + 1 newly added file",
             );
 
-            // file1/file3/file4 were rolled up from v1 (Existed); file5 was added at v3 (Added).
+            // file1/file3/file4 were rolled up from v1 (Existing); file5 was added at v3 (Added).
             let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
             for name in ["file1.parquet", "file3.parquet", "file4.parquet"] {
                 let e = tracking
                     .get(name)
                     .unwrap_or_else(|| panic!("{name} in root"));
                 assert_eq!(e.seq_num, Some(1), "{name} seq_num");
-                assert_eq!(e.status, TrackingStatus::Existed as i32, "{name} status");
+                assert_eq!(e.status, TrackingStatus::Existing as i32, "{name} status");
             }
             let file5 = tracking.get("file5.parquet").expect("file5 in root");
             assert_eq!(file5.seq_num, Some(3), "file5 seq_num");
@@ -724,8 +732,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(file1_tracking.seq_num, Some(1), "file1 seq_num");
             assert_eq!(
                 file1_tracking.status,
-                TrackingStatus::Existed as i32,
-                "file1 status must be Existed (rolled up from v3 into v4 root)"
+                TrackingStatus::Existing as i32,
+                "file1 status must be Existing (rolled up from v3 into v4 root)"
             );
         }
     }
@@ -836,7 +844,7 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             assert!(s.checkpoint_action().is_some(), "v3 should have root");
         }
 
-        // Verify v3: file1 appears exactly once with DV from v2; rolled up as Existed
+        // Verify v3: file1 appears exactly once with DV from v2; rolled up as Existing
         {
             let snapshot: Arc<Snapshot> =
                 Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -859,8 +867,8 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             let file1 = tracking.get("file1.parquet").expect("file1 in root at v3");
             assert_eq!(
                 file1.status,
-                TrackingStatus::Existed as i32,
-                "v3: file1 rolled up from v2 log commit must be Existed"
+                TrackingStatus::Existing as i32,
+                "v3: file1 rolled up from v2 log commit must be Existing"
             );
             assert_eq!(file1.seq_num, Some(1), "v3: file1 seq_num");
         }
@@ -916,7 +924,8 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             assert!(s.checkpoint_action().is_some(), "v5 should have root");
         }
 
-        // Verify v5: file1 appears exactly once with DV from v4 (replacement); rolled up as Existed
+        // Verify v5: file1 appears exactly once with DV from v4 (replacement); rolled up as
+        // Existing
         {
             let snapshot: Arc<Snapshot> =
                 Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -939,8 +948,8 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             let file1 = tracking.get("file1.parquet").expect("file1 in root at v5");
             assert_eq!(
                 file1.status,
-                TrackingStatus::Existed as i32,
-                "v5: file1 rolled up from v4 log commit must be Existed"
+                TrackingStatus::Existing as i32,
+                "v5: file1 rolled up from v4 log commit must be Existing"
             );
             assert_eq!(file1.seq_num, Some(1), "v5: file1 seq_num");
         }
@@ -1048,7 +1057,7 @@ fn collect_files_with_dvs(
 
 /// Per-entry data collected from the root manifest parquet in a single read.
 struct TrackingEntry {
-    /// Raw tracking status: `TrackingStatus::Existed as i32 == 0`, `Added == 1`, `Deleted == 2`.
+    /// Raw tracking status: `TrackingStatus::Existing as i32 == 0`, `Added == 1`, `Deleted == 2`.
     status: i32,
     seq_num: Option<i64>,
 }
@@ -1132,7 +1141,7 @@ fn collect_root_manifest_tracking_info(
                 if let Some(path) = getters[0].get_opt(i, "location")? {
                     let status: i32 = getters[1]
                         .get_opt(i, "tracking.status")?
-                        .unwrap_or(TrackingStatus::Existed as i32);
+                        .unwrap_or(TrackingStatus::Existing as i32);
                     let seq_num: Option<i64> = getters[2].get_opt(i, "tracking.sequenceNumber")?;
                     self.entries.insert(path, TrackingEntry { status, seq_num });
                 }

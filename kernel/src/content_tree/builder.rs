@@ -324,11 +324,11 @@ impl ContentTreeNodeBuilder {
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
             // Preserve Added only for entries whose sequence_number matches new_version (no-op
-            // rebuild); everything else predates this commit and becomes Existed.
+            // rebuild); everything else predates this commit and becomes Existing.
             let entry = if entry.tracking.status == TrackingStatus::Added
                 && entry.tracking.sequence_number != Some(new_version as i64)
             {
-                entry.with_status(TrackingStatus::Existed)
+                entry.with_status(TrackingStatus::Existing)
             } else {
                 entry
             };
@@ -1026,7 +1026,7 @@ impl ContentTreeNodeBuilder {
                     added_files_count += 1;
                     added_rows_count += entry.record_count;
                 }
-                TrackingStatus::Existed => {
+                TrackingStatus::Existing => {
                     existing_files_count += 1;
                     existing_rows_count += entry.record_count;
                 }
@@ -1213,7 +1213,7 @@ impl ContentTreeNodeBuilder {
 
     /// Build and evaluate a scan-row transformation expression.
     ///
-    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
+    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existing`
     /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON
     /// format: `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is
     /// converted to AMT format for `content_stats` using
@@ -1269,7 +1269,7 @@ impl ContentTreeNodeBuilder {
                     }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
                     Expression::struct_from([
-                        Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                        Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
                         snapshot_id_expr,
                         Expression::literal(Scalar::Long(version_i64)),
                         Expression::literal(Scalar::Long(version_i64)),
@@ -1340,7 +1340,7 @@ impl ContentTreeNodeBuilder {
     /// Adds file metadata from existing scan rows to the leaf manifest.
     ///
     /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
-    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
+    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existing` entries.
     ///
     /// The input data must include a `stats_parsed` column (added by `include_stats_columns()` in
     /// the scan). All rows are processed via a single expression-evaluator path:
@@ -2094,7 +2094,7 @@ impl ContentRootRebuildProcessor {
                 "location" => Expression::column(["add", "path"]),
                 "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
                 "tracking" => Expression::struct_from([
-                    Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                    Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
                     snapshot_id_expr.clone(),
                     Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
                     Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
@@ -2214,7 +2214,7 @@ impl ContentRootRebuildProcessor {
     /// Processes a content root batch (`is_log_batch = false`).
     ///
     /// Emits entries whose `(path, dv_location)` key was not seen in a prior log batch.
-    /// Any entry still marked `Added` is normalized to `Existed` — entries from the previous
+    /// Any entry still marked `Added` is normalized to `Existing` — entries from the previous
     /// root all predate the current commit by definition.
     pub(crate) fn process_root_batch(
         &mut self,
@@ -2239,7 +2239,7 @@ impl ContentRootRebuildProcessor {
             // Mark previously "added" entries as "existing"
             // TODO: for DV replacements, "replaced" status?
             let entry = if entry.tracking.status == TrackingStatus::Added {
-                entry.with_status(TrackingStatus::Existed)
+                entry.with_status(TrackingStatus::Existing)
             } else {
                 entry
             };
@@ -4106,7 +4106,7 @@ mod tests {
             make_test_add("file1.parquet"),
             2,
             100,
-            TrackingStatus::Existed,
+            TrackingStatus::Existing,
         )?;
 
         assert_eq!(builder.pending_entries.len(), 1);
@@ -4119,8 +4119,8 @@ mod tests {
         );
         assert_eq!(
             ti.status,
-            TrackingStatus::Existed,
-            "file from an earlier version must have Existed status"
+            TrackingStatus::Existing,
+            "file from an earlier version must have Existing status"
         );
 
         Ok(())
