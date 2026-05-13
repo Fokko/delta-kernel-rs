@@ -1489,12 +1489,62 @@ pub(crate) fn absolute_to_relative_path(absolute_url: &Url, table_root: &Url) ->
     }
 }
 
-/// Parses a string as an absolute URL, or if that fails, joins it with the table root.
-/// This handles both absolute and relative manifest/file paths.
+/// Converts an absolute URL to a relative path by stripping the table location prefix. If the
+/// URL starts with the table location (without trailing `/`), the prefix is stripped and the
+/// remainder is returned (including the leading `/`). Otherwise the full absolute URL string
+/// is returned.
+///
+/// This produces Iceberg-convention relative paths (leading `/`) for manifest entry location
+/// fields. Delta checkpoint `contentRoot.path` values use [`absolute_to_relative_path`] instead,
+/// which strips the leading `/` per the Delta convention.
+// Modeled after Iceberg's `LocationUtil.relativizeLocation`.
+pub(crate) fn relativize_manifest_path(absolute_url: &Url, table_root: &Url) -> String {
+    let location = table_root.as_str().trim_end_matches('/');
+    let absolute = absolute_url.as_str();
+    match absolute.strip_prefix(location) {
+        Some(relative) if relative.is_empty() || relative.starts_with('/') => relative.to_string(),
+        _ => absolute.to_string(),
+    }
+}
+
+/// Returns true if the path starts with a URI scheme (e.g. `s3:`, `file:`, `hdfs:`), per
+/// [RFC 3986 section 3.1](https://datatracker.ietf.org/doc/html/rfc3986#section-3.1).
+///
+/// This is a fast string scan that avoids full URL parsing. A scheme is `ALPHA *( ALPHA /
+/// DIGIT / "+" / "-" / "." )` followed by `:`. Paths starting with `/` have no URI scheme.
+fn has_uri_scheme(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // RFC 3986: scheme starts with ALPHA. Non-alphabetic first char means no scheme.
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    for &ch in &bytes[1..] {
+        if ch == b':' {
+            return true;
+        }
+        if !ch.is_ascii_alphanumeric() && ch != b'+' && ch != b'-' && ch != b'.' {
+            return false;
+        }
+    }
+    false
+}
+
+/// Resolves a path string to an absolute URL.
+///
+/// If the path starts with a URI scheme it is already absolute. Otherwise it is relative and
+/// resolved by concatenating the table location (without trailing separator) with the path,
+/// inserting a `/` separator if the path doesn't already start with one. This handles both
+/// kernel-produced relative paths (no leading `/`) and Iceberg v4 manifest paths (leading `/`).
 pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url> {
-    Url::parse(path)
-        .or_else(|_| table_root.join(path))
-        .map_err(|e| Error::generic(format!("Failed to parse URL '{}': {}", path, e)))
+    if has_uri_scheme(path) {
+        return Url::parse(path).map_err(|e| {
+            Error::generic(format!("Failed to parse absolute path '{}': {}", path, e))
+        });
+    }
+    let root = table_root.as_str().trim_end_matches('/');
+    let sep = if path.starts_with('/') { "" } else { "/" };
+    Url::parse(&format!("{root}{sep}{path}"))
+        .map_err(|e| Error::generic(format!("Failed to resolve relative path '{}': {}", path, e)))
 }
 
 /// Converts a DeletionVectorDescriptor to a Scalar representation
@@ -2301,6 +2351,7 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use super::*;
@@ -2342,92 +2393,248 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_absolute_to_relative_path() {
-        // Test with memory:// URLs
-        let table_root = Url::parse("memory:///").unwrap();
-        let absolute_url = Url::parse("memory:///part-content-root.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "part-content-root.parquet");
+    // === has_uri_scheme ===
 
-        // Test with s3:// URLs
-        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
-        let absolute_url = Url::parse("s3://my-bucket/my-table/data/part-00000.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "data/part-00000.parquet");
-
-        // Test with nested paths
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let absolute_url = Url::parse("s3://bucket/table/year=2023/month=10/part.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "year=2023/month=10/part.parquet");
-
-        // Test with file:// URLs
-        let table_root = Url::parse("file:///path/to/table/").unwrap();
-        let absolute_url = Url::parse("file:///path/to/table/data/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "data/file.parquet");
+    #[rstest]
+    #[case("s3://bucket/path", true)]
+    #[case("file:///tmp/table", true)]
+    #[case("hdfs://namenode/path", true)]
+    #[case("gs+v2://bucket/path", true)]
+    #[case("/data/file.parquet", false)]
+    #[case("/metadata/root-1.parquet", false)]
+    #[case("data/file.parquet", false)]
+    #[case("", false)]
+    // RFC 3986: scheme must start with ALPHA, not a digit
+    #[case("123:foo", false)]
+    // Colon in a path segment is not a scheme
+    #[case("/data/partition=key:value/file.parquet", false)]
+    fn test_has_uri_scheme(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(has_uri_scheme(input), expected);
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_bucket() {
-        // Different S3 bucket: must return the full absolute URL, not a truncated path
-        let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
-        let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "s3://bucket-a/table-a/file.parquet");
+    // === absolute_to_relative_path ===
+
+    #[rstest]
+    // Same-bucket relative paths
+    #[case(
+        "memory:///",
+        "memory:///part-content-root.parquet",
+        "part-content-root.parquet"
+    )]
+    #[case(
+        "s3://my-bucket/my-table/",
+        "s3://my-bucket/my-table/data/part-00000.parquet",
+        "data/part-00000.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/year=2023/month=10/part.parquet",
+        "year=2023/month=10/part.parquet"
+    )]
+    #[case(
+        "file:///path/to/table/",
+        "file:///path/to/table/data/file.parquet",
+        "data/file.parquet"
+    )]
+    // Cross-bucket: returns full absolute URL
+    #[case(
+        "s3://bucket-b/table-b/",
+        "s3://bucket-a/table-a/file.parquet",
+        "s3://bucket-a/table-a/file.parquet"
+    )]
+    // Cross-scheme: returns full absolute URL
+    #[case(
+        "s3://bucket/table/",
+        "gs://bucket/table/file.parquet",
+        "gs://bucket/table/file.parquet"
+    )]
+    // Cross-port: returns full absolute URL
+    #[case(
+        "http://localhost:9000/bucket/table/",
+        "http://localhost:4566/bucket/table/file.parquet",
+        "http://localhost:4566/bucket/table/file.parquet"
+    )]
+    // Same host, path not under table root: returns full absolute URL
+    #[case(
+        "s3://bucket/table-a/",
+        "s3://bucket/table-b/file.parquet",
+        "s3://bucket/table-b/file.parquet"
+    )]
+    fn test_absolute_to_relative_path(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        assert_eq!(
+            absolute_to_relative_path(&absolute_url, &table_root),
+            expected
+        );
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_scheme() {
-        // Different scheme (s3 vs gs): must return the full absolute URL
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let absolute_url = Url::parse("gs://bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "gs://bucket/table/file.parquet");
+    // === parse_or_join_url ===
+
+    #[rstest]
+    // Leading '/' relative paths (Iceberg v4 convention)
+    #[case(
+        "s3://bucket/table/",
+        "/data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "/metadata/root-1.parquet",
+        "s3://bucket/table/metadata/root-1.parquet"
+    )]
+    // Table root without trailing slash
+    #[case(
+        "s3://bucket/table",
+        "/data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    // No leading '/' relative paths (Delta convention)
+    #[case(
+        "s3://bucket/table/",
+        "data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    #[case(
+        "file:///tmp/table/",
+        "data/file.parquet",
+        "file:///tmp/table/data/file.parquet"
+    )]
+    // file:// scheme with leading '/'
+    #[case(
+        "file:///tmp/table/",
+        "/data/file.parquet",
+        "file:///tmp/table/data/file.parquet"
+    )]
+    // Absolute URLs returned unchanged
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "hdfs://namenode/path/file.parquet",
+        "hdfs://namenode/path/file.parquet"
+    )]
+    // Colons in path segments (not a scheme)
+    #[case(
+        "s3://bucket/table/",
+        "/data/partition=key:value/file.parquet",
+        "s3://bucket/table/data/partition=key:value/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "/metadata/snap-123:456.avro",
+        "s3://bucket/table/metadata/snap-123:456.avro"
+    )]
+    // Percent-encoded paths
+    #[case(
+        "s3://bucket/table/",
+        "/data/year%3D2023/file.parquet",
+        "s3://bucket/table/data/year%3D2023/file.parquet"
+    )]
+    fn test_parse_or_join_url(#[case] root: &str, #[case] path: &str, #[case] expected: &str) {
+        let table_root = Url::parse(root).unwrap();
+        let resolved = parse_or_join_url(path, &table_root).unwrap();
+        assert_eq!(resolved, Url::parse(expected).unwrap());
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_port() {
-        // Same host, different port: must return full absolute URL
-        let table_root = Url::parse("http://localhost:9000/bucket/table/").unwrap();
-        let absolute_url = Url::parse("http://localhost:4566/bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "http://localhost:4566/bucket/table/file.parquet");
+    // === relativize_manifest_path ===
+
+    #[rstest]
+    // Same-bucket: produces leading '/' per Iceberg convention
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/metadata/root.parquet",
+        "/metadata/root.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/data/00000-0.parquet",
+        "/data/00000-0.parquet"
+    )]
+    // Cross-bucket: returns full absolute URL
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    // Prefix collision: "s3://bucket/tab/" should NOT match "s3://bucket/table/..."
+    #[case(
+        "s3://bucket/tab/",
+        "s3://bucket/table/file.parquet",
+        "s3://bucket/table/file.parquet"
+    )]
+    fn test_relativize_manifest_path(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        assert_eq!(
+            relativize_manifest_path(&absolute_url, &table_root),
+            expected
+        );
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_same_host_different_path() {
-        // Same bucket but path is not under the table root
-        let table_root = Url::parse("s3://bucket/table-a/").unwrap();
-        let absolute_url = Url::parse("s3://bucket/table-b/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "s3://bucket/table-b/file.parquet");
-    }
+    // === Round-trip tests ===
 
-    #[test]
-    fn test_absolute_to_relative_path_round_trips_with_parse_or_join() {
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-
-        // Relative path round-trips through parse_or_join_url
-        let absolute_url = Url::parse("s3://bucket/table/data/file.parquet").unwrap();
+    #[rstest]
+    // absolute_to_relative_path -> parse_or_join_url round-trip (no leading '/')
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/data/file.parquet",
+        "data/file.parquet"
+    )]
+    // Cross-bucket absolute URL preserved through round-trip
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/ext/file.parquet",
+        "s3://other-bucket/ext/file.parquet"
+    )]
+    fn test_absolute_to_relative_path_round_trips(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected_relative: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
         let relative = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(relative, "data/file.parquet");
+        assert_eq!(relative, expected_relative);
         let resolved = parse_or_join_url(&relative, &table_root).unwrap();
         assert_eq!(resolved, absolute_url);
+    }
 
-        // Cross-bucket absolute URL round-trips through parse_or_join_url
-        let external_url = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&external_url, &table_root);
-        assert_eq!(preserved, "s3://other-bucket/ext/file.parquet");
-        let resolved = parse_or_join_url(&preserved, &table_root).unwrap();
-        assert_eq!(resolved, external_url);
-
-        // Round-trip via Url::join (as used by content_root.path consumers)
-        let cross_bucket = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&cross_bucket, &table_root);
-        let resolved = table_root.join(&preserved).unwrap();
-        assert_eq!(resolved, cross_bucket);
+    #[rstest]
+    // relativize_manifest_path -> parse_or_join_url round-trip (leading '/')
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/metadata/root.parquet",
+        "/metadata/root.parquet"
+    )]
+    // Cross-bucket absolute URL preserved through round-trip
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    fn test_relativize_manifest_path_round_trips(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected_relative: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        let relative = relativize_manifest_path(&absolute_url, &table_root);
+        assert_eq!(relative, expected_relative);
+        let resolved = parse_or_join_url(&relative, &table_root).unwrap();
+        assert_eq!(resolved, absolute_url);
     }
 
     #[test]

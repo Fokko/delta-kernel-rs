@@ -16,8 +16,8 @@ use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
-    DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
+    ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder, DataContentType,
+    DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
     DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS,
 };
@@ -996,7 +996,8 @@ impl ContentTreeNodeBuilder {
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
         let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
-        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root);
+        let manifest_path =
+            super::relativize_manifest_path(&write_result.location, &self.table_root);
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
         // ParquetObjectReader::with_file_size when reading the leaf manifest back.
         let manifest_file_size = write_result.size_in_bytes as i64;
@@ -2268,7 +2269,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
-    use crate::content_tree::ContentTreeNode;
+    use crate::content_tree::{absolute_to_relative_path, parse_or_join_url, ContentTreeNode};
     use crate::expressions::StructData;
 
     /// Helper: builds a root manifest, writes it to disk, and reads it back.
@@ -2282,7 +2283,7 @@ mod tests {
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
             .location;
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root);
+        let root_path = absolute_to_relative_path(&root_url, &table_root);
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &root_url,
@@ -3243,7 +3244,7 @@ mod tests {
         assert_eq!(treemap.len(), 1);
 
         // Step 4: Read the leaf and apply manifest DV to verify filtering
-        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_url = parse_or_join_url(&leaf_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_url,
@@ -3322,7 +3323,7 @@ mod tests {
         assert_eq!(treemap.len(), 3);
 
         // Apply manifest DV and verify filtering
-        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_url = parse_or_join_url(&leaf_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_url,

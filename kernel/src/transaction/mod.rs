@@ -2086,7 +2086,7 @@ mod tests {
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::content_tree::builder::ContentTreeNodeBuilder;
     use crate::content_tree::writer::ContentTreeNodeWriter;
-    use crate::content_tree::{ContentTreeNode, DataContentType};
+    use crate::content_tree::{parse_or_join_url, ContentTreeNode, DataContentType};
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -3370,9 +3370,7 @@ mod tests {
         let deleted_index = deleted_indices.iter().next().unwrap();
 
         // Read the leaf manifest and verify the entry at the deleted index
-        let leaf_manifest_url = table_root
-            .join(&leaf_manifest_path)
-            .map_err(|e| Error::generic(format!("Failed to parse leaf manifest URL: {e}")))?;
+        let leaf_manifest_url = parse_or_join_url(&leaf_manifest_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_manifest_url,
