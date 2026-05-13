@@ -12,7 +12,9 @@ use crate::actions::ADD_NAME;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
 use crate::content_tree::stats::{self, aggregate_content_stats};
 #[cfg(test)]
-use crate::content_tree::stats::{merge_partition_values_into_stats, parse_delta_add_stats};
+use crate::content_tree::stats::{
+    delta_json_stats_to_content_stats, merge_partition_values_into_stats,
+};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
@@ -492,7 +494,16 @@ impl ContentTreeNodeBuilder {
             .map(extract_deletion_vector_content)
             .transpose()?;
 
-        let (content_stats, record_count) = parse_delta_add_stats(
+        let record_count = match add.stats.as_deref() {
+            Some(json) => serde_json::from_str::<serde_json::Value>(json)
+                .map_err(|e| Error::generic(format!("failed to parse stats JSON: {e}")))?
+                .get("numRecords")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| Error::missing_data("numRecords"))?,
+            None => 0, /* TODO: Stats must exist containing at least recordCount when
+                        * icebergV4MetadataTree is enabled */
+        };
+        let content_stats = delta_json_stats_to_content_stats(
             add.stats.as_deref(),
             &self.table_schema,
             add.deletion_vector.is_some().then_some(false),
