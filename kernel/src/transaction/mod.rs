@@ -1050,16 +1050,9 @@ impl<S> Transaction<S> {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Setting metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
-        self.add_domain_metadata_in_place(domain, configuration);
-        self
-    }
-
-    /// In-place variant of [`with_domain_metadata`] that takes `&mut self` instead of consuming
-    /// the transaction. Equivalent to `with_domain_metadata` semantically, but useful for FFI
-    /// callers that hold a `&mut Transaction` via [`Handle::as_mut`] and cannot move out of it.
-    pub fn add_domain_metadata_in_place(&mut self, domain: String, configuration: String) {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
+        self
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether

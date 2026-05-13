@@ -214,39 +214,6 @@ fn with_domain_metadata_impl(
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
-/// In-place variant of [`with_domain_metadata`]: borrows the transaction via [`Handle::as_mut`]
-/// and pushes the domain metadata onto its pending additions list. Does NOT consume the handle,
-/// so the same handle remains valid after this call — equivalent in semantics to
-/// [`with_explicit_root_manifest`]. Returns `true` on success (the bool is purely a unit
-/// placeholder; the C FFI boundary has no `void` success representation).
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. Borrows the transaction handle; does NOT
-/// consume it.
-#[no_mangle]
-pub unsafe extern "C" fn with_domain_metadata_mut(
-    mut txn: Handle<ExclusiveTransaction>,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<bool> {
-    let txn = unsafe { txn.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    with_domain_metadata_mut_impl(txn, domain, configuration).into_extern_result(&engine)
-}
-
-fn with_domain_metadata_mut_impl(
-    txn: &mut Transaction,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-) -> DeltaResult<bool> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    txn.add_domain_metadata_in_place(domain, configuration);
-    Ok(true)
-}
-
 /// Remove domain metadata from the table in this transaction. A tombstone action with
 /// `removed: true` will be written to the Delta log when the transaction is committed.
 ///
