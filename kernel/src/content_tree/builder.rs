@@ -21,11 +21,10 @@ use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
     metadata_entry_to_scalars, ContentTreeNode, ContentTreeNodeEntry,
     ContentTreeNodeEntryBuilder, DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus,
-    CONTENT_STATS_FIELD_NAME, CONTENT_TYPE_FIELD_NAME, DELTA_STATS_MAX_VALUES,
-    DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS,
-    DELTA_STATS_TIGHT_BOUNDS, DV_INFO_FIELD_NAME, FILE_FORMAT_FIELD_NAME,
-    FILE_SIZE_IN_BYTES_FIELD_NAME, LOCATION_FIELD_NAME, PARTITION_SPEC_ID_FIELD_NAME,
-    RECORD_COUNT_FIELD_NAME, SORT_ORDER_ID_FIELD_NAME, TRACKING_FIELD_NAME,
+    CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES,
+    DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, DV_INFO,
+    FILE_FORMAT, FILE_SIZE_IN_BYTES, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID,
+    TRACKING,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
@@ -1186,9 +1185,7 @@ impl ContentTreeNodeBuilder {
         let stats_struct = stats::stats_schema(&self.table_schema)?;
 
         // Detect whether flat decoded DV columns are present in the input schema.
-        let has_decoded_dv = scan_row_input_schema
-            .field(DV_LOCATION_FIELD_NAME)
-            .is_some();
+        let has_decoded_dv = scan_row_input_schema.field(DV_LOCATION).is_some();
 
         let projections = ContentTreeEntryProjections {
             status: TrackingStatus::Existing,
@@ -1704,18 +1701,18 @@ fn build_content_stats_from_delta_stats_parsed(
 
 /// Intermediate flat decoded-DV columns: path decoded from base85, sizes widened to LONG,
 /// `+8` bytes for Iceberg framing.
-const DV_LOCATION_FIELD_NAME: &str = "_dv_location";
-const DV_OFFSET_FIELD_NAME: &str = "_dv_offset";
-const DV_SIZE_IN_BYTES_FIELD_NAME: &str = "_dv_size_in_bytes";
-const DV_CARDINALITY_FIELD_NAME: &str = "_dv_cardinality";
+const DV_LOCATION: &str = "_dv_location";
+const DV_OFFSET: &str = "_dv_offset";
+const DV_SIZE_IN_BYTES: &str = "_dv_size_in_bytes";
+const DV_CARDINALITY: &str = "_dv_cardinality";
 
-/// Schema of [`DV_LOCATION_FIELD_NAME`] etc., for [`EngineData::append_columns`].
+/// Schema of [`DV_LOCATION`] etc., for [`EngineData::append_columns`].
 static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(DV_LOCATION_FIELD_NAME, DataType::STRING),
-        StructField::nullable(DV_OFFSET_FIELD_NAME, DataType::LONG),
-        StructField::nullable(DV_SIZE_IN_BYTES_FIELD_NAME, DataType::LONG),
-        StructField::nullable(DV_CARDINALITY_FIELD_NAME, DataType::LONG),
+        StructField::nullable(DV_LOCATION, DataType::STRING),
+        StructField::nullable(DV_OFFSET, DataType::LONG),
+        StructField::nullable(DV_SIZE_IN_BYTES, DataType::LONG),
+        StructField::nullable(DV_CARDINALITY, DataType::LONG),
     ]))
 });
 
@@ -1749,14 +1746,12 @@ fn log_add_projection_field() -> StructField {
 fn flat_dv_columns_to_dv_info_expr() -> Expression {
     Expression::struct_with_nullability_from(
         [
-            Expression::column([DV_LOCATION_FIELD_NAME]),
-            Expression::column([DV_OFFSET_FIELD_NAME]),
-            Expression::column([DV_SIZE_IN_BYTES_FIELD_NAME]),
-            Expression::column([DV_CARDINALITY_FIELD_NAME]),
+            Expression::column([DV_LOCATION]),
+            Expression::column([DV_OFFSET]),
+            Expression::column([DV_SIZE_IN_BYTES]),
+            Expression::column([DV_CARDINALITY]),
         ],
-        Expression::from_pred(Predicate::is_not_null(Expression::column([
-            DV_LOCATION_FIELD_NAME,
-        ]))),
+        Expression::from_pred(Predicate::is_not_null(Expression::column([DV_LOCATION]))),
     )
 }
 
@@ -1795,24 +1790,22 @@ fn build_content_tree_entry_expression(
         .fields()
         .map(|field| {
             let expr = match field.name().as_str() {
-                CONTENT_TYPE_FIELD_NAME => {
-                    Expression::literal(Scalar::Integer(DataContentType::Data as i32))
-                }
-                LOCATION_FIELD_NAME => projections.location.clone(),
-                FILE_FORMAT_FIELD_NAME => Expression::literal(Scalar::String("parquet".into())),
-                TRACKING_FIELD_NAME => tracking.clone(),
-                DV_INFO_FIELD_NAME => match &projections.dv_info {
+                CONTENT_TYPE => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+                LOCATION => projections.location.clone(),
+                FILE_FORMAT => Expression::literal(Scalar::String("parquet".into())),
+                TRACKING => tracking.clone(),
+                DV_INFO => match &projections.dv_info {
                     Some(expr) => expr.clone(),
                     None => Expression::null_literal(field.data_type().clone()),
                 },
-                PARTITION_SPEC_ID_FIELD_NAME => Expression::literal(Scalar::Integer(0)),
-                SORT_ORDER_ID_FIELD_NAME => Expression::null_literal(DataType::INTEGER),
-                RECORD_COUNT_FIELD_NAME => projections.record_count.clone(),
+                PARTITION_SPEC_ID => Expression::literal(Scalar::Integer(0)),
+                SORT_ORDER_ID => Expression::null_literal(DataType::INTEGER),
+                RECORD_COUNT => projections.record_count.clone(),
                 CONTENT_STATS_FIELD_NAME => match &projections.content_stats {
                     Some(expr) => expr.clone(),
                     None => Expression::null_literal(field.data_type().clone()),
                 },
-                FILE_SIZE_IN_BYTES_FIELD_NAME => projections.file_size_in_bytes.clone(),
+                FILE_SIZE_IN_BYTES => projections.file_size_in_bytes.clone(),
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             Arc::new(expr)
