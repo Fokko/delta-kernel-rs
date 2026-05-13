@@ -1603,8 +1603,6 @@ mod tests {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
         let fields = vec![
@@ -1670,9 +1668,12 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        // Verify data was correctly matched by field ID
+        // Verify data was correctly matched by field ID and output uses kernel schema names
         assert_eq!(data.len(), 1);
         let batch = &data[0];
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "user_id");
+        assert_eq!(schema.field(1).name(), "user_name");
 
         let id_col = batch
             .column(0)

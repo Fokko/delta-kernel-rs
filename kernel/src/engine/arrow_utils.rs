@@ -180,7 +180,7 @@ impl RowIndexBuilder {
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
-/// If `target_schema` is provided, coerces the batch's field nullability to match it.
+/// If `target_schema` is provided, coerces the batch's field names and nullability to match it.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
@@ -196,14 +196,14 @@ pub(crate) fn fixup_parquet_read(
         // Type mismatches are already handled by `reorder_struct_array` above,
         // we don't do anything more strict here.
         let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
-        coerce_batch_nullability(batch, schema, Some(&allow_all))?.into()
+        coerce_batch_schema(batch, schema, Some(&allow_all))?.into()
     } else {
         data
     };
     Ok(data.into())
 }
 
-/// Coerces a [`RecordBatch`]'s field nullability to match a target Arrow schema.
+/// Coerces a [`RecordBatch`]'s field names and nullability to match a target Arrow schema.
 ///
 /// For example, given a source batch whose schema is:
 ///
@@ -218,17 +218,17 @@ pub(crate) fn fixup_parquet_read(
 /// and a target schema:
 ///
 /// ```text
-/// x: Int64 (non-null)          ← was nullable
-/// a: Struct (nullable)          ← was non-null
-///   ├── b: Utf8 (non-null)     ← was nullable
-///   └── c: Struct (non-null)   ← was nullable
-///         └── d: Int32 (nullable) ← was non-null
+/// x_renamed: Int64 (non-null)   <- renamed, was nullable
+/// a: Struct (nullable)           <- was non-null
+///   ├── b: Utf8 (non-null)      <- was nullable
+///   └── c: Struct (non-null)    <- was nullable
+///         └── d: Int32 (nullable) <- was non-null
 /// ```
 ///
-/// this function returns a new `RecordBatch` whose schema matches the target exactly — every
-/// field's nullability flag (including deeply nested ones like `a.c.d`) is updated to match,
-/// recursing into structs and maps. The underlying array data is unchanged; only the nullability
-/// flag is adjusted.
+/// this function returns a new `RecordBatch` whose schema matches the target exactly -- every
+/// field's name and nullability flag (including deeply nested ones like `a.c.d`) is updated to
+/// match, recursing into structs, lists, and maps. The underlying array data is unchanged; only
+/// the schema metadata (names, nullability) is adjusted.
 ///
 /// **Complexity:** O(F) time and space where F is the total number of fields (including nested)
 /// in the schema. The actual row data (Arrow buffers) is shared via `Arc` and never copied.
@@ -240,7 +240,7 @@ pub(crate) fn fixup_parquet_read(
 type TypeMismatchValidator<'a> =
     Option<&'a dyn Fn(&ArrowFieldRef, &ArrowFieldRef) -> DeltaResult<()>>;
 
-pub(crate) fn coerce_batch_nullability(
+pub(crate) fn coerce_batch_schema(
     batch: RecordBatch,
     target_schema: &ArrowSchemaRef,
     type_mismatch_validator: TypeMismatchValidator<'_>,
@@ -258,7 +258,7 @@ pub(crate) fn coerce_batch_nullability(
         let src_struct = src_column
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::generic("expected Struct array during nullability coercion"))?;
+            .ok_or_else(|| Error::generic("expected Struct array during schema coercion"))?;
         let (coerced_columns, coerced_fields): (Vec<Arc<dyn ArrowArray>>, Vec<ArrowFieldRef>) =
             src_struct
                 .columns()
@@ -283,7 +283,7 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
-    // Map type: recurse into entries struct to fix nested nullability
+    // Map type: recurse into entries struct to fix nested fields
     fn coerce_map(
         src_column: &Arc<dyn ArrowArray>,
         src_entries_field: &ArrowFieldRef,
@@ -293,9 +293,9 @@ pub(crate) fn coerce_batch_nullability(
         let src_map = src_column
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| Error::generic("expected Map array during nullability coercion"))?;
+            .ok_or_else(|| Error::generic("expected Map array during schema coercion"))?;
         // Discard the source entries field; the recursive `coerce` call below
-        // produces `coerced_entries_field` with the target's nullability applied.
+        // produces `coerced_entries_field` with the target's fields applied.
         let (_, src_offsets, src_entries, src_nulls, src_ordered) = src_map.clone().into_parts();
         let (coerced_entries_col, coerced_entries_field) = coerce(
             Arc::new(src_entries),
@@ -307,7 +307,7 @@ pub(crate) fn coerce_batch_nullability(
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| {
-                Error::generic("expected Struct array for Map entries during nullability coercion")
+                Error::generic("expected Struct array for Map entries during schema coercion")
             })?
             .clone();
         Ok(Arc::new(MapArray::try_new(
@@ -319,7 +319,7 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
-    // List type: recurse into element to fix nested nullability
+    // List type: recurse into element to fix nested fields
     fn coerce_list(
         src_column: &Arc<dyn ArrowArray>,
         src_element: &ArrowFieldRef,
@@ -329,9 +329,9 @@ pub(crate) fn coerce_batch_nullability(
         let src_list = src_column
             .as_any()
             .downcast_ref::<GenericListArray<i32>>()
-            .ok_or_else(|| Error::generic("expected List array during nullability coercion"))?;
+            .ok_or_else(|| Error::generic("expected List array during schema coercion"))?;
         // Discard the source element field; the recursive `coerce` call below
-        // produces `coerced_element_field` with the target's nullability applied.
+        // produces `coerced_element_field` with the target's fields applied.
         let (_, src_offsets, src_values, src_nulls) = src_list.clone().into_parts();
         let (coerced_values, coerced_element_field) = coerce(
             src_values,
@@ -347,8 +347,9 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
-    // Recursively coerces nullability for a column+field pair. For struct columns, recurses
-    // into children; for leaf columns, just adjusts the field's nullability flag.
+    // Recursively coerces a column+field pair to match the target field's name and nullability.
+    // For struct/list/map columns, recurses into children; for leaf columns, adjusts the field
+    // metadata directly.
     fn coerce(
         src_column: Arc<dyn ArrowArray>,
         src_field: &ArrowFieldRef,
@@ -401,13 +402,16 @@ pub(crate) fn coerce_batch_nullability(
                             )));
                         }
                     }
-                    let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
+                    let coerced_field = if src_field.name() == target_field.name()
+                        && src_field.is_nullable() == target_field.is_nullable()
+                    {
                         src_field.clone()
                     } else {
                         Arc::new(
                             src_field
                                 .as_ref()
                                 .clone()
+                                .with_name(target_field.name())
                                 .with_nullable(target_field.is_nullable()),
                         )
                     };
@@ -418,6 +422,7 @@ pub(crate) fn coerce_batch_nullability(
             src_field
                 .as_ref()
                 .clone()
+                .with_name(target_field.name())
                 .with_data_type(coerced_array.data_type().clone())
                 .with_nullable(target_field.is_nullable()),
         );
@@ -4247,7 +4252,7 @@ mod tests {
         create_data_list(), create_data_map(), create_data_list_in_map(),
         create_data_map_in_struct(),
     ], false)]
-    fn test_coerce_batch_nullability(
+    fn test_coerce_batch_schema(
         #[case] data: Vec<(CoerceTestCase, CoerceTestCase)>,
         #[case] to_nullable: bool,
     ) {
@@ -4267,28 +4272,28 @@ mod tests {
         let target_schema = Arc::new(ArrowSchema::new(tgt_fields));
         assert_ne!(src_schema, target_schema);
         let batch = RecordBatch::try_new(src_schema, cols).unwrap();
-        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
+        let result = coerce_batch_schema(batch, &target_schema, None).unwrap();
         assert_eq!(*result.schema(), *target_schema);
     }
 
     #[test]
-    fn test_coerce_batch_nullability_schema_already_matches() {
+    fn test_coerce_batch_schema_schema_already_matches() {
         let field = ArrowField::new("a", ArrowDataType::Int32, false);
         let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
         let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
-        let result = coerce_batch_nullability(batch.clone(), &schema, None).unwrap();
+        let result = coerce_batch_schema(batch.clone(), &schema, None).unwrap();
         assert_eq!(result, batch);
     }
 
     #[test]
-    fn test_coerce_batch_nullability_type_mismatch_rejected_without_validator() {
+    fn test_coerce_batch_schema_type_mismatch_rejected_without_validator() {
         let ((int_src_field, _, int_col), _) = create_data_int();
         let (_, (_, string_tgt_field, _)) = create_data_string();
         let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
         let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
         let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
-        let result = coerce_batch_nullability(batch, &target_schema, None);
+        let result = coerce_batch_schema(batch, &target_schema, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -4298,14 +4303,14 @@ mod tests {
     }
 
     #[test]
-    fn test_coerce_batch_nullability_type_mismatch_allowed_with_validator() {
+    fn test_coerce_batch_schema_type_mismatch_allowed_with_validator() {
         let ((int_src_field, _, int_col), _) = create_data_int();
         let ((_, string_tgt_field, _), _) = create_data_string();
         let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
         let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
         let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
         let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
-        let result = coerce_batch_nullability(batch, &target_schema, Some(&allow_all)).unwrap();
+        let result = coerce_batch_schema(batch, &target_schema, Some(&allow_all)).unwrap();
         assert_eq!(result.schema().field(0).data_type(), &ArrowDataType::Int32);
         assert!(result.schema().field(0).is_nullable());
     }
@@ -4313,7 +4318,7 @@ mod tests {
     /// Verifies metadata is preserved at every nesting level (struct, list, map) after coercion.
     /// Schema: s: Struct { lst: List[Int32], mp: Map<Utf8, Int32> }, all non-null → nullable.
     #[test]
-    fn test_coerce_batch_nullability_preserves_field_metadata() {
+    fn test_coerce_batch_schema_preserves_field_metadata() {
         use std::collections::HashMap;
 
         let meta = |key: &str| HashMap::from([(key.to_string(), "val".to_string())]);
@@ -4407,7 +4412,7 @@ mod tests {
         let src_schema = Arc::new(ArrowSchema::new(vec![src_struct]));
         let target_schema = Arc::new(ArrowSchema::new(vec![tgt_struct]));
         let batch = RecordBatch::try_new(src_schema, vec![struct_col]).unwrap();
-        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
+        let result = coerce_batch_schema(batch, &target_schema, None).unwrap();
 
         // Walk the result schema and assert metadata + nullability at every level
         let schema = result.schema();
@@ -4441,6 +4446,60 @@ mod tests {
         };
         assert_eq!(map_val.metadata(), &meta("value"));
         assert!(map_val.is_nullable());
+    }
+
+    #[test]
+    fn test_coerce_batch_renames_nested_struct_field() {
+        // Source: struct "src_struct" with non-null child "src_x"
+        let src_child = Arc::new(ArrowField::new("src_x", ArrowDataType::Int32, false));
+        let src_struct = ArrowField::new(
+            "src_struct",
+            ArrowDataType::Struct(ArrowFields::from(vec![Arc::clone(&src_child)])),
+            false,
+        );
+
+        // Target: renamed outer to "tgt_struct", renamed child to "tgt_x" (nullable)
+        let tgt_child = Arc::new(ArrowField::new("tgt_x", ArrowDataType::Int32, true));
+        let tgt_struct = ArrowField::new(
+            "tgt_struct",
+            ArrowDataType::Struct(ArrowFields::from(vec![tgt_child])),
+            true,
+        );
+
+        let inner_array = Arc::new(Int32Array::from(vec![42])) as Arc<dyn ArrowArray>;
+        let struct_col: Arc<dyn ArrowArray> = Arc::new(
+            StructArray::try_new(ArrowFields::from(vec![src_child]), vec![inner_array], None)
+                .unwrap(),
+        );
+
+        let src_schema = Arc::new(ArrowSchema::new(vec![src_struct]));
+        let tgt_schema = Arc::new(ArrowSchema::new(vec![tgt_struct]));
+        let batch = RecordBatch::try_new(src_schema, vec![struct_col]).unwrap();
+        let result = coerce_batch_schema(batch, &tgt_schema, None).unwrap();
+
+        let schema = result.schema();
+        let field = schema.field(0);
+        assert_eq!(field.name(), "tgt_struct");
+        assert!(field.is_nullable());
+
+        let children = match field.data_type() {
+            ArrowDataType::Struct(f) => f,
+            other => panic!("expected Struct, got {other:?}"),
+        };
+        assert_eq!(children[0].name(), "tgt_x");
+        assert!(children[0].is_nullable());
+
+        let struct_arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let inner = struct_arr
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(inner.values(), &[42]);
     }
 
     // --- Tests for build_json_reorder_indices and json_arrow_schema ---
