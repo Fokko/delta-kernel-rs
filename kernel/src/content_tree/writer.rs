@@ -1,5 +1,6 @@
 use tracing::instrument;
 use url::Url;
+use uuid::Uuid;
 
 use crate::content_tree::ContentTreeNode;
 use crate::path::ParsedLogPath;
@@ -8,6 +9,9 @@ use crate::{DeltaResult, Engine, ParquetCompression, ParquetWriterConfig};
 /// Orchestrates the process of creating a V3 checkpoint for a table.
 pub(crate) struct ContentTreeNodeWriter {
     pub(crate) metadata: ContentTreeNode,
+    /// `None` for a root manifest, `Some(uuid)` for a leaf manifest. Drives the on-disk
+    /// filename via [`checkpoint_path`](Self::checkpoint_path).
+    leaf: Option<Uuid>,
 }
 
 /// The result of writing a content tree node to a parquet file.
@@ -17,9 +21,21 @@ pub(crate) struct ContentTreeWriteResult {
 }
 
 impl ContentTreeNodeWriter {
-    /// Creates a new [`ContentTreeNodeWriter`] for given content root metadata.
+    /// Creates a writer for a root content manifest. The output filename omits the leaf UUID.
     pub(crate) fn try_new(metadata: ContentTreeNode) -> DeltaResult<Self> {
-        Ok(Self { metadata })
+        Ok(Self {
+            metadata,
+            leaf: None,
+        })
+    }
+
+    /// Creates a writer for a leaf content manifest, generating a fresh UUID for filename
+    /// disambiguation.
+    pub(crate) fn try_new_leaf(metadata: ContentTreeNode) -> DeltaResult<Self> {
+        Ok(Self {
+            metadata,
+            leaf: Some(Uuid::new_v4()),
+        })
     }
 
     /// Returns the URL where the content metadata file should be written.
@@ -42,7 +58,7 @@ impl ContentTreeNodeWriter {
         ParsedLogPath::new_content_metadata_path(
             &self.metadata.table_root,
             self.metadata.version,
-            self.metadata.leaf(),
+            self.leaf,
         )
         .map(|parsed| parsed.location)
     }
@@ -50,7 +66,7 @@ impl ContentTreeNodeWriter {
     #[instrument(
         name = "content_tree.write_manifest",
         skip_all,
-        fields(is_leaf = self.metadata.leaf().is_some()),
+        fields(is_leaf = self.leaf.is_some()),
         err
     )]
     pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<ContentTreeWriteResult> {
