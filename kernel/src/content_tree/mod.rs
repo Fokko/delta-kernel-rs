@@ -2352,6 +2352,7 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -5161,7 +5162,7 @@ mod tests {
                     .location
                     .as_ref()
                     .expect("DataManifest should have location");
-                let manifest_url = table_url.join(manifest_path)?;
+                let manifest_url = parse_or_join_url(manifest_path, &table_url)?;
                 let (iter, version, path_in_log) = ContentTreeNode::open_stream(
                     engine.parquet_handler(),
                     &manifest_url,
@@ -5201,15 +5202,15 @@ mod tests {
         // Also check root-level Data entries (DV-updated entries are re-added to root).
         for entry in &root_entries {
             if entry.content_type == DataContentType::Data {
-                if let Some(dv_info) = &entry.dv_info {
+                if let Some(deletion_vector) = &entry.deletion_vector {
                     let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
                     assert_eq!(
-                        dv_info.size_in_bytes,
+                        deletion_vector.size_in_bytes,
                         expected_iceberg_size,
-                        "Persisted dv_info.size_in_bytes should be {} (Delta {} + 8 framing), got {}",
+                        "Persisted deletion_vector.size_in_bytes should be {} (Delta {} + 8 framing), got {}",
                         expected_iceberg_size,
                         known_dv_size_in_bytes,
-                        dv_info.size_in_bytes
+                        deletion_vector.size_in_bytes
                     );
                     found_position_deletes_count += 1;
                 }
