@@ -3907,8 +3907,8 @@ mod tests {
 
         let read_metadata = build_and_roundtrip(vec![entry.clone()], 6, &table_root_url, &engine)?;
 
-        // build_and_roundtrip runs assign_first_row_ids which assigns first_row_id=Some(0)
-        // to Added entries that have first_row_id=None
+        // build_and_roundtrip runs assign_first_row_ids_to_pending which assigns
+        // first_row_id=Some(0) to Added entries that have first_row_id=None
         let mut expected_entry = entry;
         expected_entry.tracking.first_row_id = Some(0);
 

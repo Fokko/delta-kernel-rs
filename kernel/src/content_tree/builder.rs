@@ -1131,7 +1131,7 @@ impl ContentTreeNodeBuilder {
         self.serialize_dvs_to_entries(snapshot_id)?;
 
         // Assign first_row_id values
-        self.assign_first_row_ids(allocator);
+        self.assign_first_row_ids_to_pending(allocator);
         self.assign_first_row_ids_pre_built(engine, allocator)?;
 
         // Use cached schema with content_stats based on table schema
@@ -1193,7 +1193,7 @@ impl ContentTreeNodeBuilder {
         self.serialize_dvs_to_entries(snapshot_id)?;
 
         // Assign first_row_id values
-        self.assign_first_row_ids(allocator);
+        self.assign_first_row_ids_to_pending(allocator);
         self.assign_first_row_ids_pre_built(engine, allocator)?;
 
         // Use cached schema with content_stats based on table schema
@@ -1370,7 +1370,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// Uses the given `allocator` to reserve row ID ranges. For entries with existing IDs,
     /// the allocator cursor is advanced past their range without allocating new IDs.
-    fn assign_first_row_ids(&mut self, allocator: &mut CursorRowIdAllocator) {
+    fn assign_first_row_ids_to_pending(&mut self, allocator: &mut CursorRowIdAllocator) {
         for entry in &mut self.pending_entries {
             let ti = &mut entry.tracking;
 
@@ -1420,7 +1420,8 @@ impl ContentTreeNodeBuilder {
             record_counts_visitor.visit_rows_of(batch.as_ref())?;
 
             // Step 2: Compute first_row_id for each row, preserving existing non-null values.
-            // This mirrors `assign_first_row_ids` which checks `is_none()` before allocating.
+            // This mirrors `assign_first_row_ids_to_pending` which checks `is_none()` before
+            // allocating.
             let mut first_row_ids = Vec::with_capacity(record_counts_visitor.record_counts.len());
             for (rc, existing_id) in record_counts_visitor
                 .record_counts
@@ -4326,7 +4327,7 @@ mod tests {
 
     // Disabled complex unit test - see note above
 
-    // --- Tests for assign_first_row_ids ---
+    // --- Tests for assign_first_row_ids_to_pending ---
 
     fn make_data_entry(
         record_count: i64,
@@ -4398,7 +4399,7 @@ mod tests {
             .push(make_data_entry(50, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(allocator.current(), 350);
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
@@ -4419,7 +4420,7 @@ mod tests {
             .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(allocator.current(), 400);
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
@@ -4443,7 +4444,7 @@ mod tests {
 
         // Allocator starts at HWM+1 = 300 (existed entry covers [0, 300))
         let mut allocator = CursorRowIdAllocator::new(300);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
         assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(300));
@@ -4466,7 +4467,7 @@ mod tests {
             .push(make_data_entry(50, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
         assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(999));
@@ -4490,7 +4491,7 @@ mod tests {
             .push(make_data_entry(75, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
         assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
@@ -4511,7 +4512,7 @@ mod tests {
             .push(make_data_entry(200, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(501);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(501));
         assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(601));
@@ -4538,7 +4539,7 @@ mod tests {
 
         let manifest_first_row_id = 42i64;
         let mut allocator = CursorRowIdAllocator::new(manifest_first_row_id);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         // Verify Iceberg inheritance equivalence:
         // file[i].first_row_id == manifest_first_row_id + sum(record_counts[0..i])
@@ -4577,7 +4578,7 @@ mod tests {
             .push(make_data_entry(50, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         // The Existed entry should be assigned first_row_id=0
         assert_eq!(
@@ -4642,7 +4643,7 @@ mod tests {
             .push(make_data_entry(75, TrackingStatus::Added, None));
 
         let mut allocator = CursorRowIdAllocator::new(0);
-        builder.assign_first_row_ids(&mut allocator);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
 
         // Data entry gets assigned
         assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));

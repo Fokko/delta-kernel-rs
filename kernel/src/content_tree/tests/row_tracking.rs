@@ -1,16 +1,18 @@
 //! Tests for `first_row_id` assignment that exercise the public builder API end-to-end,
 //! including parquet write/read round-trips.
 //!
-//! Unit tests for the internal `assign_first_row_ids` method live in `builder::tests`
+//! Unit tests for the internal `assign_first_row_ids_to_pending` method live in `builder::tests`
 //! where they can access private fields directly.
 
 use std::sync::Arc;
 
+use rstest::rstest;
+
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntryBuilder, DataContentType,
-    TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
+    DataContentType, ManifestInfo, TrackingInfo, TrackingStatus,
 };
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
@@ -32,11 +34,7 @@ fn test_table_schema() -> Schema {
     ])
 }
 
-fn make_data_entry(
-    path: &str,
-    record_count: i64,
-    status: TrackingStatus,
-) -> crate::content_tree::ContentTreeNodeEntry {
+fn make_data_entry(path: &str, record_count: i64, status: TrackingStatus) -> ContentTreeNodeEntry {
     ContentTreeNodeEntryBuilder::new(DataContentType::Data)
         .location(path)
         .tracking(TrackingInfo {
@@ -66,127 +64,78 @@ fn setup_engine_and_builder() -> (
     (engine, builder)
 }
 
-/// Builds a root manifest with row tracking, writes to parquet, reads back,
-/// and verifies that first_row_id values survive the round-trip.
-#[test]
-fn test_first_row_id_roundtrip_through_root_manifest() -> DeltaResult<()> {
-    let (engine, mut builder) = setup_engine_and_builder();
-
-    builder.add_entry(make_data_entry(
-        "file-a.parquet",
-        100,
-        TrackingStatus::Added,
-    ));
-    builder.add_entry(make_data_entry(
-        "file-b.parquet",
-        200,
-        TrackingStatus::Added,
-    ));
-
-    // Build with row tracking starting at 42
-    let mut allocator = CursorRowIdAllocator::new(42);
-    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
-    assert_eq!(allocator.current(), 342);
-
-    // Write to parquet and read back
+/// Builds the manifest, writes it to parquet, reads it back, and returns the
+/// round-tripped entries. Shared by every test in this file.
+fn build_and_roundtrip(
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    mut builder: ContentTreeNodeBuilder,
+    allocator: &mut CursorRowIdAllocator,
+) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+    let root_metadata = builder.build(engine, 1, allocator)?;
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-        .write(&engine)?
+        .write(engine)?
         .location;
     let root_path = absolute_to_relative_path(&root_url, &table_root);
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
     let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-    let entries = root.entries()?;
-
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].tracking.first_row_id, Some(42));
-    assert_eq!(entries[1].tracking.first_row_id, Some(142));
-
-    Ok(())
+    root.entries()
 }
 
-/// Verifies that deleted entries receive null first_row_id after a round-trip,
-/// and that subsequent entries are assigned correctly.
-#[test]
-fn test_first_row_id_deleted_entries_null_after_roundtrip() -> DeltaResult<()> {
+/// Builds a root manifest from plain data entries, writes/reads it, and verifies
+/// `first_row_id` assignment under different mixes of statuses and starting HWMs.
+///
+/// Deleted entries do not consume IDs and receive null `first_row_id` after the
+/// round-trip; Added entries consume `record_count` IDs each contiguously.
+#[rstest]
+#[case::two_added_from_42(
+    vec![(100, TrackingStatus::Added), (200, TrackingStatus::Added)],
+    42,
+    342,
+    vec![Some(42), Some(142)],
+)]
+#[case::deleted_entry_yields_null(
+    vec![
+        (100, TrackingStatus::Added),
+        (200, TrackingStatus::Deleted),
+        (50, TrackingStatus::Added),
+    ],
+    0,
+    150,
+    vec![Some(0), None, Some(100)],
+)]
+#[case::nonzero_starting_hwm(
+    vec![(100, TrackingStatus::Added), (200, TrackingStatus::Added)],
+    501,
+    801,
+    vec![Some(501), Some(601)],
+)]
+fn test_first_row_id_data_entries_roundtrip(
+    #[case] entries: Vec<(i64, TrackingStatus)>,
+    #[case] starting_hwm: i64,
+    #[case] expected_current: i64,
+    #[case] expected_first_row_ids: Vec<Option<i64>>,
+) -> DeltaResult<()> {
     let (engine, mut builder) = setup_engine_and_builder();
 
-    builder.add_entry(make_data_entry(
-        "file-a.parquet",
-        100,
-        TrackingStatus::Added,
-    ));
-    builder.add_entry(make_data_entry(
-        "file-deleted.parquet",
-        200,
-        TrackingStatus::Deleted,
-    ));
-    builder.add_entry(make_data_entry("file-b.parquet", 50, TrackingStatus::Added));
+    for (i, (record_count, status)) in entries.iter().enumerate() {
+        builder.add_entry(make_data_entry(
+            &format!("file-{i}.parquet"),
+            *record_count,
+            *status,
+        ));
+    }
 
-    let mut allocator = CursorRowIdAllocator::new(0);
-    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
-    // Deleted entry does not consume IDs: 0 + 100 + 50 = 150
-    assert_eq!(allocator.current(), 150);
+    let mut allocator = CursorRowIdAllocator::new(starting_hwm);
+    let result_entries = build_and_roundtrip(&engine, builder, &mut allocator)?;
+    assert_eq!(allocator.current(), expected_current);
 
-    let table_root = root_metadata.table_root.clone();
-    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-        .write(&engine)?
-        .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root);
-    let (iter, version, path_in_log) =
-        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
-    let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-    let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-    let entries = root.entries()?;
-
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].tracking.first_row_id, Some(0));
-    // Deleted entry has null first_row_id
-    assert_eq!(entries[1].tracking.first_row_id, None);
-    assert_eq!(entries[2].tracking.first_row_id, Some(100));
-
-    Ok(())
-}
-
-/// Verifies that a nonzero starting HWM offsets all assigned first_row_id values correctly
-/// after a round-trip.
-#[test]
-fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
-    let (engine, mut builder) = setup_engine_and_builder();
-
-    builder.add_entry(make_data_entry(
-        "file-a.parquet",
-        100,
-        TrackingStatus::Added,
-    ));
-    builder.add_entry(make_data_entry(
-        "file-b.parquet",
-        200,
-        TrackingStatus::Added,
-    ));
-
-    // Starting from HWM of 500 (so starting_row_id = 501)
-    let mut allocator = CursorRowIdAllocator::new(501);
-    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
-    assert_eq!(allocator.current(), 801);
-
-    let table_root = root_metadata.table_root.clone();
-    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-        .write(&engine)?
-        .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root);
-    let (iter, version, path_in_log) =
-        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
-    let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-    let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-    let entries = root.entries()?;
-
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].tracking.first_row_id, Some(501));
-    assert_eq!(entries[1].tracking.first_row_id, Some(601));
-
+    assert_eq!(result_entries.len(), expected_first_row_ids.len());
+    for (i, expected) in expected_first_row_ids.iter().enumerate() {
+        assert_eq!(result_entries[i].tracking.first_row_id, *expected);
+    }
     Ok(())
 }
 
@@ -195,8 +144,6 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
 /// manifest list first_row_id computation), and survives a parquet round-trip.
 #[test]
 fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
-    use crate::content_tree::ManifestInfo;
-
     let (engine, mut builder) = setup_engine_and_builder();
 
     // Manifest 1: 100 added + 200 existing = 300 row ID slots
@@ -260,21 +207,9 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
     );
 
     let mut allocator = CursorRowIdAllocator::new(1000);
-    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
+    let entries = build_and_roundtrip(&engine, builder, &mut allocator)?;
     // 1000 + 300 + 100 = 1400
     assert_eq!(allocator.current(), 1400);
-
-    // Write and read back
-    let table_root = root_metadata.table_root.clone();
-    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-        .write(&engine)?
-        .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root);
-    let (iter, version, path_in_log) =
-        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
-    let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-    let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-    let entries = root.entries()?;
 
     assert_eq!(entries.len(), 2);
     assert_eq!(
@@ -312,21 +247,9 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
 
     // Allocator starts at HWM+1 = 600 (existed entry covers [500, 600))
     let mut allocator = CursorRowIdAllocator::new(600);
-    let root_metadata = builder.build(&engine, 1, &mut allocator)?;
+    let entries = build_and_roundtrip(&engine, builder, &mut allocator)?;
     // Added file gets [600, 650)
     assert_eq!(allocator.current(), 650);
-
-    // Write and read back
-    let table_root = root_metadata.table_root.clone();
-    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
-        .write(&engine)?
-        .location;
-    let root_path = absolute_to_relative_path(&root_url, &table_root);
-    let (iter, version, path_in_log) =
-        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
-    let data = iter.collect::<DeltaResult<Vec<_>>>()?;
-    let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
-    let entries = root.entries()?;
 
     assert_eq!(entries.len(), 2);
     assert_eq!(

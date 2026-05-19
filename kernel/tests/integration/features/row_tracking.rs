@@ -1434,10 +1434,7 @@ async fn test_batch_commit_row_tracking_parallel_leaf_writers(
         mc.add_leaf(result_c)?;
     }
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     // HWM = 100 + 50 + 200 - 1 = 349
