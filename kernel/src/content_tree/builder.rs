@@ -5,30 +5,36 @@ use bytes::Bytes;
 use tracing::instrument;
 use url::Url;
 
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+#[cfg(test)]
 use crate::actions::Add;
-use crate::content_tree::stats::{
-    aggregate_content_stats, delta_json_stats_to_content_stats, merge_partition_values_into_stats,
-};
+use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+#[cfg(test)]
+use crate::content_tree::stats::merge_partition_values_into_stats;
+use crate::content_tree::stats::{aggregate_content_stats, parse_delta_add_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
-use crate::content_tree::ManifestStats;
+use crate::content_tree::ManifestInfo;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
-    DataContentType, DvInfo, TrackingInfo, TrackingStatus, DELTA_STATS_MAX_VALUES,
-    DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS,
-    DELTA_STATS_TIGHT_BOUNDS,
+    ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder, DataContentType,
+    DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
+    DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
+    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS,
 };
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, StructData, Transform};
+use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
+use crate::log_replay::{ActionsBatch, FileActionKey};
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{
-    ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, StructField,
-    StructType,
+    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+    StructField, StructType,
 };
+use crate::utils::require;
 #[cfg(test)]
 use crate::utils::try_parse_uri;
-use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, FilteredEngineData, Version,
+};
 
 /// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
 const ROARING_BITMAP_PORTABLE_MAGIC_BYTES: [u8; 4] = 1681511377u32.to_be_bytes();
@@ -92,15 +98,14 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// - `size_in_bytes` represents the total blob size including all framing
 /// - This includes the size prefix + bitmap data + CRC checksum
 ///
-/// Therefore, when converting from Delta to Iceberg's [`DvInfo`], we add 8 bytes
+/// Therefore, when converting from Delta to Iceberg's [`DeletionVectorInfo`], we add 8 bytes
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
 /// # Returns
-/// A [`DvInfo`] containing the DV location and size information.
+/// A [`DeletionVectorInfo`] containing the DV location and size information.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<DvInfo> {
-    use crate::actions::deletion_vector::DeletionVectorStorageType;
+) -> DeltaResult<DeletionVectorInfo> {
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -120,47 +125,12 @@ pub(crate) fn extract_deletion_vector_content(
     // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
     // - 4 bytes: size prefix
     // - 4 bytes: CRC checksum
-    Ok(DvInfo {
+    Ok(DeletionVectorInfo {
         location,
         offset: dv.offset.map(|v| v as i64).unwrap_or(0),
         size_in_bytes: dv.size_in_bytes as i64 + 8,
         cardinality: dv.cardinality,
     })
-}
-
-/// Extracts record_count from content_stats by finding the first column's value_count.
-///
-/// In the content_stats format, each column has a stats struct containing value_count,
-/// which represents the number of records in the file. This value is the same for all
-/// columns in a properly formed stats struct.
-///
-/// # Arguments
-/// * `content_stats` - Optional reference to the content_stats StructData
-///
-/// # Returns
-/// The record count (value_count from the first column's stats), or 0 if not available.
-fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
-    use crate::expressions::Scalar;
-
-    let Some(stats) = content_stats else {
-        return 0;
-    };
-
-    // Iterate through the columns to find the first one with value_count
-    for value in stats.values() {
-        if let Scalar::Struct(column_stats) = value {
-            // Look for value_count field in the column's stats struct
-            for (field, field_value) in column_stats.fields().iter().zip(column_stats.values()) {
-                if field.name() == crate::content_tree::VALUE_COUNT {
-                    if let Scalar::Long(count) = field_value {
-                        return *count;
-                    }
-                }
-            }
-        }
-    }
-
-    0
 }
 
 /// Cache for DV bitmaps with lazy deserialization
@@ -179,7 +149,7 @@ struct DvCache {
     dirty: bool,
 
     /// Total number of entries in the manifest (for bounds checking)
-    /// Cached from manifest_stats to avoid O(n) scans
+    /// Cached from manifest_info to avoid O(n) scans
     total_entry_count: i64,
 }
 
@@ -253,9 +223,15 @@ pub(crate) struct ContentTreeNodeBuilder {
 
 /// Lightweight aggregate stats computed when adding pre-built columnar batches.
 struct BatchAggregates {
-    added_file_count: i64,
-    existing_file_count: i64,
+    added_file_count: i32,
+    existing_file_count: i32,
     total_record_count: i64,
+}
+
+/// Converts a `usize` length to an `i32` file count, returning an error on overflow.
+fn file_count_from_len(len: usize) -> DeltaResult<i32> {
+    len.try_into()
+        .map_err(|_| Error::generic(format!("file count {len} exceeds i32::MAX")))
 }
 
 impl std::fmt::Debug for ContentTreeNodeBuilder {
@@ -348,10 +324,12 @@ impl ContentTreeNodeBuilder {
         let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
+            // Preserve Added only for entries whose sequence_number matches new_version (no-op
+            // rebuild); everything else predates this commit and becomes Existing.
             let entry = if entry.tracking.status == TrackingStatus::Added
                 && entry.tracking.sequence_number != Some(new_version as i64)
             {
-                entry.with_status(TrackingStatus::Existed)
+                entry.with_status(TrackingStatus::Existing)
             } else {
                 entry
             };
@@ -385,9 +363,7 @@ impl ContentTreeNodeBuilder {
             // Only process manifest entries
             if !matches!(
                 entry.content_type,
-                DataContentType::DataManifest
-                    | DataContentType::DeleteManifest
-                    | DataContentType::CombinedManifest
+                DataContentType::DataManifest | DataContentType::DeleteManifest
             ) {
                 continue;
             }
@@ -406,20 +382,27 @@ impl ContentTreeNodeBuilder {
                 continue;
             }
 
-            // Serialize manifest_dv if it was deserialized
+            // Serialize manifest DV into manifest_info.dv
             if let Some(ref manifest_dv) = cache.manifest_dv {
-                entry.manifest_dv = Some(serialize_roaring_treemap(manifest_dv)?);
+                let dv_bytes = serialize_roaring_treemap(manifest_dv)?;
+                let cardinality: i64 = manifest_dv.len().try_into().map_err(|_| {
+                    crate::Error::generic(format!(
+                        "manifest DV cardinality {} exceeds i64::MAX",
+                        manifest_dv.len()
+                    ))
+                })?;
 
-                // Update tracking status based on DV cardinality
+                let manifest_info = entry.manifest_info.as_mut().ok_or_else(|| {
+                    crate::Error::generic(
+                        "manifest entry has a dirty DV cache but no manifest_info",
+                    )
+                })?;
+                manifest_info.dv = Some(dv_bytes);
+                manifest_info.dv_cardinality = Some(cardinality);
+
                 // If all active entries are deleted, mark manifest as Deleted
-                if let Some(ref manifest_stats) = entry.manifest_stats {
-                    let active_entry_count =
-                        manifest_stats.added_files_count + manifest_stats.existing_files_count;
-                    let cardinality = manifest_dv.len() as i64;
-
-                    if cardinality == active_entry_count {
-                        entry.tracking.status = TrackingStatus::Deleted;
-                    }
+                if cardinality == manifest_info.active_entry_count() {
+                    entry.tracking.status = TrackingStatus::Deleted;
                 }
             }
 
@@ -465,8 +448,6 @@ impl ContentTreeNodeBuilder {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     #[cfg(test)]
     fn path_to_absolute(&self, path: &str) -> Result<String, crate::Error> {
-        use url::Url;
-
         // Try to parse the path as an absolute URL
         if let Ok(url) = Url::parse(path) {
             // If it parses successfully, it's an absolute URL
@@ -485,79 +466,31 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    /// Add a data file entry, deduplicating by file path.
-    ///
-    /// Accepts pre-computed content_stats directly as a [`StructData`], avoiding the need
-    /// to serialize/deserialize JSON stats.
-    ///
-    /// # Arguments
-    /// * `path` - The file path (relative to table root)
-    /// * `size` - The file size in bytes
-    /// * `content_stats` - Optional content_stats as StructData
-    /// * `version` - The version to use for tracking info
-    /// * `snapshot_id` - The snapshot ID for tracking info
-    /// * `dv_info` - Optional deletion vector info
-    pub(crate) fn add_file(
+    /// Adds an [`Add`] action as a [`ContentTreeNodeEntry`] with an explicit tracking status,
+    /// skipping duplicate paths. `version` is stored as the entry's `sequence_number`.
+    #[cfg(test)]
+    pub(crate) fn add_with_status(
         &mut self,
-        path: String,
-        size: i64,
-        content_stats: Option<StructData>,
+        add: Add,
         version: Version,
         snapshot_id: i64,
-        dv_info: Option<DvInfo>,
+        status: TrackingStatus,
     ) -> DeltaResult<()> {
-        // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(path.clone()) {
-            // Already seen this file path - skip it
+        if !self.values_seen.insert(add.path.clone()) {
             return Ok(());
         }
 
-        // Extract record_count from the content_stats (from any column's value_count)
-        let record_count = extract_record_count_from_stats(content_stats.as_ref());
-
-        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-            .location(path)
-            .with_tracking(version, self.version, snapshot_id)
-            .dv_info_opt(dv_info)
-            .record_count(record_count)
-            .file_size_in_bytes(size)
-            .content_stats_opt(content_stats)
-            .build();
-
-        self.pending_entries.push(data_file_entry);
-        Ok(())
-    }
-
-    /// Add an entry from an [`Add`] action, deduplicating by file path.
-    ///
-    /// Extracts deletion vector content, parses and converts stats from the `Add` action,
-    /// then delegates to [`add_file`](Self::add_file).
-    ///
-    /// # Arguments
-    /// * `add` - The Add action to convert to a ContentTreeNodeEntry
-    /// * `version` - The version to use for tracking info
-    /// * `snapshot_id` - The snapshot ID for tracking info
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
-        // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
             .as_ref()
             .map(extract_deletion_vector_content)
             .transpose()?;
 
-        // TODO: Check if parsed_stats is set and prefer that over the JSON blob
-        // Convert Delta JSON stats to content_stats. When the file has a deletion vector and
-        // tightBounds is null/absent, treat bounds as not tight (safe for data skipping).
-        let content_stats = delta_json_stats_to_content_stats(
+        let (content_stats, record_count) = parse_delta_add_stats(
             add.stats.as_deref(),
             &self.table_schema,
             add.deletion_vector.is_some().then_some(false),
         )?;
-
-        // Merge partition values into content_stats. Delta JSON stats only cover data columns;
-        // partition column values live in add.partitionValues and need to be recorded as
-        // constant-value statistics in the AMT content_stats.
-        let record_count = extract_record_count_from_stats(content_stats.as_ref());
         let content_stats = merge_partition_values_into_stats(
             content_stats,
             &add.partition_values,
@@ -565,14 +498,23 @@ impl ContentTreeNodeBuilder {
             Some(record_count),
         )?;
 
-        self.add_file(
-            add.path,
-            add.size,
-            content_stats,
-            version,
-            snapshot_id,
-            dv_content,
-        )
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(add.path)
+            .with_tracking(status, version, snapshot_id)
+            .deletion_vector_opt(dv_content)
+            .record_count(record_count)
+            .file_size_in_bytes(add.size)
+            .content_stats_opt(content_stats)
+            .build();
+        self.pending_entries.push(entry);
+        Ok(())
+    }
+
+    /// Adds an [`Add`] action as a new file (status = [`TrackingStatus::Added`]).
+    /// `version` is stored as the entry's `sequence_number`.
+    #[cfg(test)]
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
+        self.add_with_status(add, version, snapshot_id, TrackingStatus::Added)
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
@@ -737,15 +679,13 @@ impl ContentTreeNodeBuilder {
                         Expression::null_literal(DataType::BINARY), // changesDv
                     ])
                 }
-                "dvInfo" => Expression::null_literal(field.data_type().clone()),
-                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
-                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "deletionVector" => Expression::null_literal(field.data_type().clone()),
+                "specId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestStats" => Expression::null_literal(field.data_type().clone()),
-                "referencedFile" => Expression::null_literal(DataType::STRING),
-                "manifestDv" => Expression::null_literal(DataType::BINARY),
+                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             field_exprs.push(Arc::new(expr));
@@ -767,46 +707,12 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            added_file_count: engine_data.len() as i64,
+            added_file_count: file_count_from_len(engine_data.len())?,
             existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
         };
 
         Ok((transformed, aggregates))
-    }
-
-    /// Adds file metadata from scan row format `EngineData` to the metadata.
-    ///
-    /// This method is designed for scenarios where the data comes from a scan operation
-    /// and has the scan row schema format (path, size, modificationTime, stats at top level,
-    /// with fileConstantValues.partitionValues nested).
-    ///
-    /// # Arguments
-    /// * `engine_data` - The engine data containing scan row records to extract and add
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error visiting the engine data
-    pub(crate) fn add_from_scan_row_data(
-        &mut self,
-        engine_data: &dyn EngineData,
-        version: Version,
-        snapshot_id: i64,
-    ) -> Result<(), crate::Error> {
-        let mut visitor = ScanRowToAddVisitor {
-            adds: vec![],
-            selection_vector: vec![],
-            row_offset: 0,
-        };
-        visitor.visit_rows_of(engine_data)?;
-
-        for add in visitor.adds {
-            self.add(add, version, snapshot_id)?;
-        }
-
-        Ok(())
     }
 
     /// Adds a raw ContentTreeNodeEntry to the builder.
@@ -816,23 +722,19 @@ impl ContentTreeNodeBuilder {
         // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
-            DataContentType::DataManifest
-                | DataContentType::DeleteManifest
-                | DataContentType::CombinedManifest
+            DataContentType::DataManifest | DataContentType::DeleteManifest
         ) {
             if let Some(ref location) = entry.location {
-                // Get total entry count from manifest_stats for bounds checking
-                let total_entry_count = if let Some(ref manifest_stats) = entry.manifest_stats {
-                    manifest_stats.added_files_count
-                        + manifest_stats.existing_files_count
-                        + manifest_stats.deletes_files_count
-                } else {
-                    0
-                };
+                // Get total entry count from manifest_info for bounds checking
+                let total_entry_count = entry
+                    .manifest_info
+                    .as_ref()
+                    .map_or(0, |mi| mi.total_entry_count());
 
-                // Keep serialized manifest_dv bytes in entry, clone into cache
+                // Read DV bytes from manifest_info.dv, clone into cache
                 // Bytes is Rc-based, so clone is cheap (just increments refcount)
-                let cache = DvCache::new(entry.manifest_dv.clone(), total_entry_count);
+                let dv_bytes = entry.manifest_info.as_ref().and_then(|mi| mi.dv.clone());
+                let cache = DvCache::new(dv_bytes, total_entry_count);
                 self.dv_cache.insert(location.clone(), cache);
 
                 // Always clear changes_dv from entries (starts empty for new commit)
@@ -849,8 +751,17 @@ impl ContentTreeNodeBuilder {
         !self.pending_entries.is_empty() || !self.pre_built_data.is_empty()
     }
 
+    /// Returns `true` if the builder has a leaf manifest entry registered at `path`.
+    ///
+    /// Used to distinguish leaf removes that target the current content root (and must be applied
+    /// via [`delete_multiple_from_leaf`](Self::delete_multiple_from_leaf)) from removes that
+    /// reference an older content root (which are already handled by file-key deduplication).
+    pub(crate) fn has_leaf_manifest(&self, path: &str) -> bool {
+        self.dv_cache.contains_key(path)
+    }
+
     /// Remove data file entries by path. Only used when moving values in the root
-    /// to the leaves (otherwise mark deleted it should be used.
+    /// to the leaves (otherwise mark_deleted should be used).
     ///
     /// This removes entries where the location matches and there is no referenced_file
     /// (i.e., data file entries, not DV entries).
@@ -918,9 +829,7 @@ impl ContentTreeNodeBuilder {
             .filter(|entry| {
                 !matches!(
                     entry.content_type,
-                    DataContentType::DataManifest
-                        | DataContentType::DeleteManifest
-                        | DataContentType::CombinedManifest
+                    DataContentType::DataManifest | DataContentType::DeleteManifest
                 )
             })
             .filter_map(|entry| entry.location.clone())
@@ -931,9 +840,7 @@ impl ContentTreeNodeBuilder {
             // Remove actual data/DV entries from root
             matches!(
                 entry.content_type,
-                DataContentType::DataManifest
-                    | DataContentType::DeleteManifest
-                    | DataContentType::CombinedManifest
+                DataContentType::DataManifest | DataContentType::DeleteManifest
             )
         });
 
@@ -1002,7 +909,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of
+    /// * `Err` if the leaf manifest is not found, missing manifest_info, any index is out of
     ///   bounds, or serialization fails
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
@@ -1081,10 +988,10 @@ impl ContentTreeNodeBuilder {
     /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
     #[instrument(name = "content_tree.write_leaf", skip_all, err)]
-    /// Builds and writes a leaf manifest, returning the CombinedManifest entry for the root.
+    /// Builds and writes a leaf manifest, returning the DataManifest entry for the root.
     ///
     /// Assigns sequential `first_row_id` values to data entries in the leaf using the given
-    /// `allocator`. The returned CombinedManifest entry will have its `first_row_id` set to
+    /// `allocator`. The returned DataManifest entry will have its `first_row_id` set to
     /// the allocator's cursor position at the time of this call. The allocator is advanced past
     /// all assigned row IDs.
     pub(crate) fn write_leaf(
@@ -1099,7 +1006,8 @@ impl ContentTreeNodeBuilder {
         let leaf_metadata = self.build_leaf(engine, snapshot_id, allocator)?;
 
         let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
-        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root);
+        let manifest_path =
+            super::relativize_manifest_path(&write_result.location, &self.table_root);
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
         // ParquetObjectReader::with_file_size when reading the leaf manifest back.
         let manifest_file_size = write_result.size_in_bytes as i64;
@@ -1108,12 +1016,14 @@ impl ContentTreeNodeBuilder {
         let mut record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
 
         // Calculate manifest stats (entry counts by status)
-        let mut added_files_count = 0i64;
-        let mut existing_files_count = 0i64;
-        let mut deletes_files_count = 0i64;
+        let mut added_files_count = 0i32;
+        let mut existing_files_count = 0i32;
+        let mut deleted_files_count = 0i32;
+        let mut replaced_files_count = 0i32;
         let mut added_rows_count = 0i64;
         let mut existing_rows_count = 0i64;
-        let mut delete_rows_count = 0i64;
+        let mut deleted_rows_count = 0i64;
+        let mut replaced_rows_count = 0i64;
         let mut min_sequence_number = i64::MAX;
 
         for entry in &self.pending_entries {
@@ -1126,13 +1036,23 @@ impl ContentTreeNodeBuilder {
                     added_files_count += 1;
                     added_rows_count += entry.record_count;
                 }
-                TrackingStatus::Existed => {
+                TrackingStatus::Existing => {
                     existing_files_count += 1;
                     existing_rows_count += entry.record_count;
                 }
                 TrackingStatus::Deleted => {
-                    deletes_files_count += 1;
-                    delete_rows_count += entry.record_count;
+                    deleted_files_count += 1;
+                    deleted_rows_count += entry.record_count;
+                }
+                // Currently always 0: mark_deleted() uses Deleted for all removals.
+                // Per the v4 spec, a Remove+Add for the same file with a new DV should
+                // mark the old entry as Replaced, but the transaction layer does not yet
+                // correlate removes with adds to distinguish deletes from replacements.
+                // TODO: Update mark_deleted() to set Replaced when the same file is re-added
+                // with a new DV in the same commit.
+                TrackingStatus::Replaced => {
+                    replaced_files_count += 1;
+                    replaced_rows_count += entry.record_count;
                 }
             }
         }
@@ -1151,14 +1071,17 @@ impl ContentTreeNodeBuilder {
             min_sequence_number = 0;
         }
 
-        let manifest_stats = Some(crate::content_tree::ManifestStats {
+        let manifest_info = Some(crate::content_tree::ManifestInfo {
             added_files_count,
             existing_files_count,
-            deletes_files_count,
+            deleted_files_count,
+            replaced_files_count,
             added_rows_count,
             existing_rows_count,
-            delete_rows_count,
+            deleted_rows_count,
+            replaced_rows_count,
             min_sequence_number,
+            ..Default::default()
         });
 
         // Aggregate content_stats from all pending entries
@@ -1169,7 +1092,7 @@ impl ContentTreeNodeBuilder {
         );
 
         Ok(
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+            ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
                 .location(manifest_path)
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -1186,7 +1109,7 @@ impl ContentTreeNodeBuilder {
                 .record_count(record_count)
                 .file_size_in_bytes(manifest_file_size)
                 .content_stats_opt(content_stats)
-                .manifest_stats_opt(manifest_stats)
+                .manifest_info_opt(manifest_info)
                 .build(),
         )
     }
@@ -1317,15 +1240,16 @@ impl ContentTreeNodeBuilder {
 
     /// Build and evaluate a scan-row transformation expression.
     ///
-    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
+    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existing`
     /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON
     /// format: `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is
     /// converted to AMT format for `content_stats` using
     /// [`build_content_stats_from_delta_stats_parsed`].
     ///
     /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
-    /// `add_from_existing_scan_rows`), `dvInfo` is projected from those columns with a
-    /// nullability predicate so non-DV rows produce a null struct. Otherwise `dvInfo` is null.
+    /// `add_from_existing_scan_rows`), `deletionVector` is projected from those columns with a
+    /// nullability predicate so non-DV rows produce a null struct. Otherwise `deletionVector` is
+    /// null.
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,
@@ -1372,7 +1296,7 @@ impl ContentTreeNodeBuilder {
                     }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
                     Expression::struct_from([
-                        Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                        Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
                         snapshot_id_expr,
                         Expression::literal(Scalar::Long(version_i64)),
                         Expression::literal(Scalar::Long(version_i64)),
@@ -1380,14 +1304,14 @@ impl ContentTreeNodeBuilder {
                         Expression::null_literal(DataType::BINARY), // changesDv
                     ])
                 }
-                "dvInfo" => {
+                "deletionVector" => {
                     if has_decoded_dv {
-                        // Flat decoded DV columns: project into dvInfo struct.
+                        // Flat decoded DV columns: project into deletionVector struct.
                         // Nullability predicate: null struct for non-DV rows (_dv_location is
                         // null).
                         if !matches!(field.data_type(), DataType::Struct(_)) {
                             return Err(crate::Error::generic(
-                                "dvInfo field should be a struct type",
+                                "deletionVector field should be a struct type",
                             ));
                         }
                         let nullability =
@@ -1407,14 +1331,12 @@ impl ContentTreeNodeBuilder {
                         Expression::null_literal(field.data_type().clone())
                     }
                 }
-                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
-                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "specId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
                 "recordCount" => record_count_expr.clone(),
                 "fileSizeInBytes" => Expression::column(["size"]),
                 CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
-                "manifestStats" => Expression::null_literal(field.data_type().clone()),
-                "referencedFile" => Expression::null_literal(DataType::STRING),
-                "manifestDv" => Expression::null_literal(DataType::BINARY),
+                "manifestInfo" => Expression::null_literal(field.data_type().clone()),
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             field_exprs.push(Arc::new(expr));
@@ -1435,7 +1357,7 @@ impl ContentTreeNodeBuilder {
 
         let aggregates = BatchAggregates {
             added_file_count: 0,
-            existing_file_count: engine_data.len() as i64,
+            existing_file_count: file_count_from_len(engine_data.len())?,
             total_record_count: agg_visitor.total_record_count,
         };
 
@@ -1444,7 +1366,7 @@ impl ContentTreeNodeBuilder {
 
     /// Assigns `first_row_id` to entries that need it, following the spec rules:
     /// - Preserve existing `first_row_id` for entries that already have one
-    /// - Assign sequential IDs for Data and CombinedManifest entries without `first_row_id`
+    /// - Assign sequential IDs for Data and DataManifest entries without `first_row_id`
     ///
     /// Uses the given `allocator` to reserve row ID ranges. For entries with existing IDs,
     /// the allocator cursor is advanced past their range without allocating new IDs.
@@ -1461,11 +1383,11 @@ impl ContentTreeNodeBuilder {
                 DataContentType::Data if ti.first_row_id.is_none() => {
                     ti.first_row_id = Some(allocator.reserve_row_ids(entry.record_count));
                 }
-                DataContentType::CombinedManifest if ti.first_row_id.is_none() => {
+                DataContentType::DataManifest if ti.first_row_id.is_none() => {
                     let row_increment = entry
-                        .manifest_stats
+                        .manifest_info
                         .as_ref()
-                        .map(|ms| ms.added_rows_count + ms.existing_rows_count)
+                        .map(|mi| mi.added_rows_count + mi.existing_rows_count)
                         .unwrap_or(0);
                     ti.first_row_id = Some(allocator.reserve_row_ids(row_increment));
                 }
@@ -1561,7 +1483,7 @@ impl ContentTreeNodeBuilder {
     /// Adds file metadata from existing scan rows to the leaf manifest.
     ///
     /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
-    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
+    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existing` entries.
     ///
     /// The input data must include a `stats_parsed` column (added by `include_stats_columns()` in
     /// the scan). All rows are processed via a single expression-evaluator path:
@@ -1584,7 +1506,7 @@ impl ContentTreeNodeBuilder {
 
         // Step 1: Detect + decode DV columns in one pass from the original engine_data.
         // (Done first so we can use the original data's nullable DV fields directly.)
-        let mut dv_visitor = DecodedDvVisitor::with_capacity(engine_data.len());
+        let mut dv_visitor = DecodedDvVisitor::for_scan_rows(engine_data.len());
         dv_visitor.visit_rows_of(engine_data)?;
 
         // Step 2: Produce {path, size, stats_parsed} via coalesce(stats_parsed, parse_json(stats)).
@@ -1669,12 +1591,37 @@ impl ContentTreeNodeBuilder {
 
         let aggregates = BatchAggregates {
             added_file_count: 0,
-            existing_file_count: filtered.len() as i64,
+            existing_file_count: file_count_from_len(filtered.len())?,
             total_record_count: agg_visitor.total_record_count,
         };
         self.pre_built_data.push(filtered);
         self.pre_built_aggregates.push(aggregates);
 
+        Ok(())
+    }
+
+    /// Adds a pre-transformed log batch (already in ContentTreeNodeEntry schema) to this builder.
+    ///
+    /// Called during AMT rollup to incorporate Add actions replayed from delta log commits.
+    /// The input must be in ContentTreeNodeEntry schema — produced by
+    /// [`ContentRootRebuildProcessor::process_log_batch`] — with the selection vector already
+    /// applied.
+    ///
+    /// # Arguments
+    /// * `data` - ContentTreeNodeEntry-schema engine data with zero or more rows.
+    pub(crate) fn add_pre_built_log_batch(&mut self, data: Box<dyn EngineData>) -> DeltaResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut agg_visitor = TransformedAggregateVisitor::default();
+        agg_visitor.visit_rows_of(data.as_ref())?;
+        let aggregates = BatchAggregates {
+            added_file_count: 0,
+            existing_file_count: file_count_from_len(data.len())?,
+            total_record_count: agg_visitor.total_record_count,
+        };
+        self.pre_built_data.push(data);
+        self.pre_built_aggregates.push(aggregates);
         Ok(())
     }
 }
@@ -1689,7 +1636,6 @@ struct TransformedAggregateVisitor {
 
 impl RowVisitor for TransformedAggregateVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::column_name;
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let names = vec![column_name!("recordCount")];
             let types = vec![DataType::LONG];
@@ -1749,6 +1695,50 @@ impl RowVisitor for RecordCountVisitor {
     }
 }
 
+/// Returns the minimal schema for reading log commit files during AMT rollup.
+///
+/// Projects only the fields used by [`LogBatchDedupVisitor`], [`DecodedDvVisitor`], and
+/// the `action_evaluator` in [`ContentRootRebuildProcessor`]:
+///
+/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `deletionVector` (all 5 DV
+///   sub-fields for z85 decode)
+/// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
+///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
+pub(crate) fn log_replay_schema() -> SchemaRef {
+    let add_dv = DataType::Struct(Box::new(StructType::new_unchecked([
+        StructField::nullable("storageType", DataType::STRING),
+        StructField::nullable("pathOrInlineDv", DataType::STRING),
+        StructField::nullable("offset", DataType::INTEGER),
+        StructField::nullable("sizeInBytes", DataType::INTEGER),
+        StructField::nullable("cardinality", DataType::LONG),
+    ])));
+    let remove_dv = DataType::Struct(Box::new(StructType::new_unchecked([
+        StructField::nullable("storageType", DataType::STRING),
+        StructField::nullable("pathOrInlineDv", DataType::STRING),
+    ])));
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable(
+            "add",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("path", DataType::STRING),
+                StructField::nullable("size", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("stats", DataType::STRING),
+                StructField::nullable("deletionVector", add_dv),
+            ]))),
+        ),
+        StructField::nullable(
+            "remove",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("path", DataType::STRING),
+                StructField::nullable("deletionVector", remove_dv),
+                StructField::nullable("dataManifestPath", DataType::STRING),
+                StructField::nullable("dataManifestPosition", DataType::LONG),
+            ]))),
+        ),
+    ]))
+}
+
 /// Builds the Delta JSON stats schema for a given table schema.
 ///
 /// The Delta JSON stats format is:
@@ -1763,7 +1753,6 @@ impl RowVisitor for RecordCountVisitor {
 pub(crate) fn build_delta_stats_schema(
     table_schema: &crate::schema::StructType,
 ) -> crate::schema::StructType {
-    use crate::schema::{StructField, StructType};
     let value_fields: Vec<StructField> = table_schema
         .fields()
         .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
@@ -1804,7 +1793,6 @@ fn build_content_stats_from_delta_stats_parsed(
     table_schema: &crate::schema::StructType,
     amt_schema: &crate::schema::StructType,
 ) -> DeltaResult<crate::expressions::Expression> {
-    use crate::expressions::{Expression, Scalar};
     let col_exprs: Vec<Arc<Expression>> = table_schema
         .fields()
         .zip(amt_schema.fields())
@@ -1869,7 +1857,6 @@ fn build_content_stats_from_delta_stats_parsed(
 /// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg
 /// framing).
 static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::schema::{StructField, StructType};
     Arc::new(StructType::new_unchecked(vec![
         StructField::nullable("_dv_location", DataType::STRING),
         StructField::nullable("_dv_offset", DataType::LONG),
@@ -1878,7 +1865,7 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Visits all scan-row rows in one pass, accumulating decoded DV columns.
+/// Visits rows in one pass, accumulating decoded DV columns.
 ///
 /// For rows with a DV: decodes path (base85 UUID → relative path), widens offset/sizeInBytes
 /// to LONG, adds 8 to sizeInBytes (Delta → Iceberg framing), stores cardinality.
@@ -1888,15 +1875,27 @@ struct DecodedDvVisitor {
     decoded_offsets: Vec<crate::expressions::Scalar>,
     decoded_sizes: Vec<crate::expressions::Scalar>,
     decoded_cardinalities: Vec<crate::expressions::Scalar>,
+    is_log_batch: bool,
 }
 
 impl DecodedDvVisitor {
-    fn with_capacity(n: usize) -> Self {
+    fn for_scan_rows(n: usize) -> Self {
         Self {
             decoded_paths: Vec::with_capacity(n),
             decoded_offsets: Vec::with_capacity(n),
             decoded_sizes: Vec::with_capacity(n),
             decoded_cardinalities: Vec::with_capacity(n),
+            is_log_batch: false,
+        }
+    }
+
+    fn for_log_batch(n: usize) -> Self {
+        Self {
+            decoded_paths: Vec::with_capacity(n),
+            decoded_offsets: Vec::with_capacity(n),
+            decoded_sizes: Vec::with_capacity(n),
+            decoded_cardinalities: Vec::with_capacity(n),
+            is_log_batch: true,
         }
     }
 
@@ -1907,33 +1906,48 @@ impl DecodedDvVisitor {
 
 impl RowVisitor for DecodedDvVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::column_name;
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("deletionVector.storageType"),
-                column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("deletionVector.offset"),
-                column_name!("deletionVector.sizeInBytes"),
-                column_name!("deletionVector.cardinality"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::STRING,
-                DataType::INTEGER,
-                DataType::INTEGER,
-                DataType::LONG,
-            ];
-            (names, types).into()
-        });
-        NAMES_AND_TYPES.as_ref()
+        if self.is_log_batch {
+            static LOG_BATCH: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                let names = vec![
+                    column_name!("add.deletionVector.storageType"),
+                    column_name!("add.deletionVector.pathOrInlineDv"),
+                    column_name!("add.deletionVector.offset"),
+                    column_name!("add.deletionVector.sizeInBytes"),
+                    column_name!("add.deletionVector.cardinality"),
+                ];
+                let types = vec![
+                    DataType::STRING,
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                ];
+                (names, types).into()
+            });
+            LOG_BATCH.as_ref()
+        } else {
+            static SCAN_ROW: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                let names = vec![
+                    column_name!("deletionVector.storageType"),
+                    column_name!("deletionVector.pathOrInlineDv"),
+                    column_name!("deletionVector.offset"),
+                    column_name!("deletionVector.sizeInBytes"),
+                    column_name!("deletionVector.cardinality"),
+                ];
+                let types = vec![
+                    DataType::STRING,
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                ];
+                (names, types).into()
+            });
+            SCAN_ROW.as_ref()
+        }
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        use crate::actions::deletion_vector::{
-            DeletionVectorDescriptor, DeletionVectorStorageType,
-        };
-        use crate::expressions::Scalar;
-
         for i in 0..row_count {
             let storage_type_opt: Option<String> =
                 getters[0].get_opt(i, "deletionVector.storageType")?;
@@ -1952,12 +1966,15 @@ impl RowVisitor for DecodedDvVisitor {
                     size_in_bytes,
                     cardinality,
                 };
-                let dv_info = extract_deletion_vector_content(&dv)?;
-                self.decoded_paths.push(Scalar::String(dv_info.location));
-                self.decoded_offsets.push(Scalar::Long(dv_info.offset));
-                self.decoded_sizes.push(Scalar::Long(dv_info.size_in_bytes));
+                let deletion_vector = extract_deletion_vector_content(&dv)?;
+                self.decoded_paths
+                    .push(Scalar::String(deletion_vector.location));
+                self.decoded_offsets
+                    .push(Scalar::Long(deletion_vector.offset));
+                self.decoded_sizes
+                    .push(Scalar::Long(deletion_vector.size_in_bytes));
                 self.decoded_cardinalities
-                    .push(Scalar::Long(dv_info.cardinality));
+                    .push(Scalar::Long(deletion_vector.cardinality));
             } else {
                 self.decoded_paths.push(Scalar::Null(DataType::STRING));
                 self.decoded_offsets.push(Scalar::Null(DataType::LONG));
@@ -1970,136 +1987,461 @@ impl RowVisitor for DecodedDvVisitor {
     }
 }
 
-/// Visitor that extracts Add-like data from scan row schema.
-///
-/// The scan row schema has a different structure than the log Add action schema:
-/// - path (direct, not nested under "add")
-/// - size (direct)
-/// - modificationTime (direct)
-/// - stats (direct)
-/// - fileConstantValues.partitionValues (nested)
-/// - deletionVector (nested)
-///
-/// This visitor extracts these fields and constructs Add structs.
-#[derive(Default)]
-struct ScanRowToAddVisitor {
-    pub adds: Vec<Add>,
-    /// Selection vector controlling which rows to process. Empty means all rows selected.
-    selection_vector: Vec<bool>,
-    /// Running row offset across multiple `visit()` calls (for multi-batch inputs).
-    row_offset: usize,
+/// Identifies a specific row within a leaf manifest by its path and position.
+struct LeafManifestIndex {
+    /// Path to the leaf manifest file.
+    path: String,
+    /// Row position within the leaf manifest.
+    position: u64,
 }
 
-impl RowVisitor for ScanRowToAddVisitor {
+// ===========================================================================================
+// AMT log replay helpers
+// ===========================================================================================
+
+/// Parses `add.stats` JSON into `(record_count, content_stats)` for selected rows only.
+/// Non-selected rows get `0` / null to keep output lengths consistent with `row_count`.
+struct LogBatchStatsVisitor<'a> {
+    table_schema: &'a crate::schema::StructType,
+    content_stats_type: DataType,
+    selection_vector: &'a [bool],
+    record_counts: Vec<crate::expressions::Scalar>,
+    content_stats_scalars: Vec<crate::expressions::Scalar>,
+}
+
+impl RowVisitor for LogBatchStatsVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType};
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let names = vec![
-                column_name!("path"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats"),
-                column_name!("deletionVector.storageType"),
-                column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("deletionVector.offset"),
-                column_name!("deletionVector.sizeInBytes"),
-                column_name!("deletionVector.cardinality"),
-                column_name!("fileConstantValues.partitionValues"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
+                column_name!("add.stats"),
+                column_name!("add.deletionVector.storageType"),
             ];
-            let types = vec![
-                DataType::STRING,
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::STRING,  // deletionVector.storageType
-                DataType::STRING,  // deletionVector.pathOrInlineDv
-                DataType::INTEGER, // deletionVector.offset
-                DataType::INTEGER, // deletionVector.sizeInBytes
-                DataType::LONG,    // deletionVector.cardinality
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::STRING,
-                DataType::LONG,
-            ];
+            let types = vec![DataType::STRING, DataType::STRING];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        use crate::actions::deletion_vector::{
-            DeletionVectorDescriptor, DeletionVectorStorageType,
-        };
-
         for i in 0..row_count {
-            let global_i = self.row_offset + i;
-            if global_i < self.selection_vector.len() && !self.selection_vector[global_i] {
+            if !self.selection_vector[i] {
+                self.record_counts.push(Scalar::Long(0));
+                self.content_stats_scalars
+                    .push(Scalar::Null(self.content_stats_type.clone()));
+                continue;
+            }
+            let stats_json: Option<String> = getters[0].get_opt(i, "add.stats")?;
+            let has_dv: bool = getters[1]
+                .get_opt(i, "add.deletionVector.storageType")?
+                .map(|_: String| true)
+                .unwrap_or(false);
+            let tight_bounds_when_null = has_dv.then_some(false);
+            let (content_stats, record_count) = parse_delta_add_stats(
+                stats_json.as_deref(),
+                self.table_schema,
+                tight_bounds_when_null,
+            )?;
+            self.record_counts.push(Scalar::Long(record_count));
+            match content_stats {
+                Some(sd) => self.content_stats_scalars.push(Scalar::Struct(sd)),
+                None => self
+                    .content_stats_scalars
+                    .push(Scalar::Null(self.content_stats_type.clone())),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Single-pass visitor that deduplicates a log batch for AMT replay.
+/// Sets `selection_vector[i] = true` for first-seen Add rows; updates `log_action_keys`
+/// and `leaf_removes` for Remove rows.
+struct LogBatchDedupVisitor<'a> {
+    log_action_keys: &'a mut HashSet<FileActionKey>,
+    leaf_removes: &'a mut Vec<LeafManifestIndex>,
+    /// `true` for surviving Add rows; `false` for all other rows.
+    selection_vector: Vec<bool>,
+}
+
+impl LogBatchDedupVisitor<'_> {
+    const ADD_PATH: usize = 0;
+    const ADD_DV_ST: usize = 1;
+    const ADD_DV_PATH: usize = 2;
+    const REM_PATH: usize = 3;
+    const REM_DV_ST: usize = 4;
+    const REM_DV_PATH: usize = 5;
+    const REM_MANIFEST_PATH: usize = 6;
+    const REM_MANIFEST_POS: usize = 7;
+
+    /// Returns the DV location string from raw storage-type and path column getters, or `None`
+    /// when no DV is present (storageType is null).
+    ///
+    /// Uses the same decode logic as [`extract_deletion_vector_content`] so that
+    /// [`FileActionKey`] values built here match those built in [`process_content_root_batch`].
+    fn dv_location<'a>(
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        st_idx: usize,
+        path_idx: usize,
+    ) -> DeltaResult<Option<String>> {
+        let Some(storage_type): Option<String> =
+            getters[st_idx].get_opt(i, "deletionVector.storageType")?
+        else {
+            return Ok(None);
+        };
+        let path_or_inline: String = getters[path_idx].get(i, "deletionVector.pathOrInlineDv")?;
+        // Build a minimal descriptor to reuse existing location-decode logic.
+        let dv = DeletionVectorDescriptor {
+            storage_type: storage_type.parse()?,
+            path_or_inline_dv: path_or_inline,
+            offset: None,
+            size_in_bytes: 0,
+            cardinality: 0,
+        };
+        Ok(Some(extract_deletion_vector_content(&dv)?.location))
+    }
+}
+
+impl RowVisitor for LogBatchDedupVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const LONG: DataType = DataType::LONG;
+            let types_and_names = vec![
+                (STRING, column_name!("add.path")),
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (STRING, column_name!("remove.path")),
+                (STRING, column_name!("remove.deletionVector.storageType")),
+                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+                (STRING, column_name!("remove.dataManifestPath")),
+                (LONG, column_name!("remove.dataManifestPosition")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 8,
+            Error::InternalError(format!(
+                "Wrong number of LogBatchDedupVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            let add_path: Option<String> = getters[Self::ADD_PATH].get_opt(i, "add.path")?;
+            if let Some(path) = add_path {
+                // Add row: check dedup and update selection_vector.
+                let dv_loc: Option<String> =
+                    Self::dv_location(i, getters, Self::ADD_DV_ST, Self::ADD_DV_PATH)?;
+                let key = FileActionKey::new(path, dv_loc);
+                if self.log_action_keys.contains(&key) {
+                    // Duplicate: superseded by a newer commit already processed.
+                    self.selection_vector[i] = false;
+                } else {
+                    self.log_action_keys.insert(key);
+                    self.selection_vector[i] = true;
+                }
+            } else {
+                // Remove row: never emitted as a content root entry.
+                self.selection_vector[i] = false;
+                let rem_path: Option<String> = getters[Self::REM_PATH].get_opt(i, "remove.path")?;
+                let Some(path) = rem_path else { continue };
+                let dv_loc = Self::dv_location(i, getters, Self::REM_DV_ST, Self::REM_DV_PATH)?;
+                self.log_action_keys
+                    .insert(FileActionKey::new(path, dv_loc));
+                // Collect leaf removes for post-replay DV bitmap updates.
+                let leaf_path: Option<String> =
+                    getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.dataManifestPath")?;
+                let position: Option<i64> =
+                    getters[Self::REM_MANIFEST_POS].get_opt(i, "remove.dataManifestPosition")?;
+                if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
+                    let pos = u64::try_from(pos).map_err(|_| {
+                        Error::generic(format!("negative manifest position: {pos}"))
+                    })?;
+                    self.leaf_removes.push(LeafManifestIndex {
+                        path: leaf_path,
+                        position: pos,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================================
+// ContentRootRebuildProcessor
+// ===========================================================================================
+
+/// Stateful processor for replaying delta log commits during AMT root manifest rebuild.
+///
+/// Processes delta log commits in **descending** order (newest first) followed by the existing
+/// content root (as a "checkpoint" batch) to build the complete set of entries for a new content
+/// root. Uses `(path, dv_location)` deduplication as per spec: first-seen wins, so the newest
+/// action for each logical file is authoritative.
+///
+/// - Log batches (`is_log_batch = true`): [`LogBatchDedupVisitor`] is the single visitor pass; it
+///   builds a selection vector marking surviving Add rows. The surviving rows are then converted to
+///   ContentTreeNodeEntry schema via a pre-built expression evaluator and returned as a
+///   [`FilteredEngineData`].
+/// - Content root batches (`is_log_batch = false`): entries whose `(path, dv_location)` key was NOT
+///   seen in a prior log batch are emitted unchanged; seen entries are suppressed.
+///
+/// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
+/// accumulated for a post-replay pass via [`deleted_leaf_positions_by_location`].
+///
+/// [`deleted_leaf_positions_by_location`]: ContentRootRebuildProcessor::deleted_leaf_positions_by_location
+pub(crate) struct ContentRootRebuildProcessor {
+    log_action_keys: HashSet<FileActionKey>,
+    leaf_removes: Vec<LeafManifestIndex>,
+    /// Physical table schema; passed to `LogBatchStatsVisitor` for per-row stats parsing.
+    table_schema: StructType,
+    /// Type of the `content_stats` column; used to build null scalars for unselected rows.
+    content_stats_type: DataType,
+    /// Pre-built evaluator: raw log batch + `_dv_*` + `_stats_*` columns → ContentTreeNodeEntry
+    /// schema.
+    action_evaluator: Arc<dyn ExpressionEvaluator>,
+}
+
+impl ContentRootRebuildProcessor {
+    /// Creates a new processor and pre-builds the expression evaluator.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for constructing expression evaluators.
+    /// - `snapshot_id`: Stamped into tracking info for each emitted log-batch entry.
+    /// - `table_schema`: Physical table schema. Used to derive the content_stats output schema.
+    pub(crate) fn new(
+        engine: &dyn Engine,
+        snapshot_id: i64,
+        table_schema: Schema,
+    ) -> DeltaResult<Self> {
+        // Output schema: ContentTreeNodeEntry with content_stats derived from delta stats schema.
+        let delta_stats_schema = Arc::new(build_delta_stats_schema(&table_schema));
+        let output_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+        )?);
+
+        // content_stats type: extracted from output schema for building null scalars and the
+        // stats-decoded append schema.
+        let content_stats_type = output_schema
+            .field(CONTENT_STATS_FIELD_NAME)
+            .map(|f| f.data_type().clone())
+            .unwrap_or_else(|| DataType::Struct(Box::new(StructType::new_unchecked([]))));
+
+        // Schema for the two stats columns appended by LogBatchStatsVisitor.
+        let stats_decoded_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("_stats_record_count", DataType::LONG),
+            StructField::nullable("_stats_content_stats", content_stats_type.clone()),
+        ]));
+
+        // Input schema: add.{path, size, defaultRowCommitVersion} + decoded DV columns + stats
+        // columns.
+        let action_input_schema = Arc::new(StructType::new_unchecked(
+            [StructField::nullable(
+                "add",
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("path", DataType::STRING),
+                    StructField::nullable("size", DataType::LONG),
+                    StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                ]))),
+            )]
+            .into_iter()
+            .chain(DV_DECODED_FLAT_SCHEMA.fields().cloned())
+            .chain(stats_decoded_schema.fields().cloned())
+            .collect::<Vec<_>>(),
+        ));
+
+        let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
+        let null_if_no_dv =
+            Expression::from_pred(Predicate::is_not_null(Expression::column(["_dv_location"])));
+        let deletion_vector_expr = Expression::struct_with_nullability_from(
+            [
+                Expression::column(["_dv_location"]),
+                Expression::column(["_dv_offset"]),
+                Expression::column(["_dv_size_in_bytes"]),
+                Expression::column(["_dv_cardinality"]),
+            ],
+            null_if_no_dv,
+        );
+
+        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+        for field in output_schema.fields() {
+            let expr: Expression = match field.name().as_str() {
+                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+                "location" => Expression::column(["add", "path"]),
+                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
+                "tracking" => Expression::struct_from([
+                    Expression::literal(Scalar::Integer(TrackingStatus::Existing as i32)),
+                    snapshot_id_expr.clone(),
+                    Expression::column(["add", "defaultRowCommitVersion"]), // dataSequence number
+                    Expression::column(["add", "defaultRowCommitVersion"]), // fileSequence number
+                    Expression::null_literal(DataType::LONG),               // firstRowId
+                    Expression::null_literal(DataType::BINARY),             // changesDv
+                ]),
+                "deletionVector" => deletion_vector_expr.clone(),
+                "specId" => Expression::literal(Scalar::Integer(0)),
+                "sortOrderId" => Expression::null_literal(DataType::INTEGER),
+                // recordCount and content_stats come from LogBatchStatsVisitor pre-parsed columns.
+                "recordCount" => Expression::column(["_stats_record_count"]),
+                "fileSizeInBytes" => Expression::column(["add", "size"]),
+                CONTENT_STATS_FIELD_NAME => Expression::column(["_stats_content_stats"]),
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            field_exprs.push(Arc::new(expr));
+        }
+        let action_evaluator = engine.evaluation_handler().new_expression_evaluator(
+            action_input_schema,
+            Arc::new(Expression::struct_from(field_exprs)),
+            DataType::Struct(Box::new(output_schema.as_ref().clone())),
+        )?;
+
+        Ok(Self {
+            log_action_keys: HashSet::new(),
+            leaf_removes: Vec::new(),
+            table_schema,
+            content_stats_type,
+            action_evaluator,
+        })
+    }
+
+    /// Processes a log batch (`is_log_batch = true`).
+    ///
+    /// [`LogBatchDedupVisitor`] is the single visitor pass: it builds a selection vector marking
+    /// surviving Add rows and accumulates leaf removes. The surviving rows are converted to
+    /// ContentTreeNodeEntry schema via the pre-built expression evaluator and returned as a
+    /// [`FilteredEngineData`] paired with the selection vector.
+    ///
+    /// Returns `None` when all rows are filtered out (no surviving Add actions in this batch).
+    pub(crate) fn process_log_batch(
+        &mut self,
+        batch: ActionsBatch,
+    ) -> DeltaResult<Option<FilteredEngineData>> {
+        let row_count = batch.actions.len();
+
+        let mut dedup = LogBatchDedupVisitor {
+            log_action_keys: &mut self.log_action_keys,
+            leaf_removes: &mut self.leaf_removes,
+            selection_vector: vec![false; row_count],
+        };
+        dedup.visit_rows_of(batch.actions.as_ref())?;
+
+        if !dedup.selection_vector.iter().any(|&b| b) {
+            return Ok(None);
+        }
+
+        // Decode DV columns: z85 path decoding cannot be expressed as a kernel expression.
+        let mut dv_decoder = DecodedDvVisitor::for_log_batch(row_count);
+        dv_decoder.visit_rows_of(batch.actions.as_ref())?;
+
+        let mut stats_visitor = LogBatchStatsVisitor {
+            table_schema: &self.table_schema,
+            content_stats_type: self.content_stats_type.clone(),
+            selection_vector: &dedup.selection_vector,
+            record_counts: Vec::with_capacity(row_count),
+            content_stats_scalars: Vec::with_capacity(row_count),
+        };
+        stats_visitor.visit_rows_of(batch.actions.as_ref())?;
+
+        // Append decoded DV columns and pre-parsed stats columns for the expression evaluator.
+        let inner_actions = batch.actions;
+        let augmented_with_dv = inner_actions.append_columns(
+            DV_DECODED_FLAT_SCHEMA.clone(),
+            vec![
+                ArrayData::try_new(
+                    ArrayType::new(DataType::STRING, true),
+                    dv_decoder.decoded_paths,
+                )?,
+                ArrayData::try_new(
+                    ArrayType::new(DataType::LONG, true),
+                    dv_decoder.decoded_offsets,
+                )?,
+                ArrayData::try_new(
+                    ArrayType::new(DataType::LONG, true),
+                    dv_decoder.decoded_sizes,
+                )?,
+                ArrayData::try_new(
+                    ArrayType::new(DataType::LONG, true),
+                    dv_decoder.decoded_cardinalities,
+                )?,
+            ],
+        )?;
+
+        let stats_decoded_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("_stats_record_count", DataType::LONG),
+            StructField::nullable("_stats_content_stats", self.content_stats_type.clone()),
+        ]));
+        let augmented = augmented_with_dv.append_columns(
+            stats_decoded_schema,
+            vec![
+                ArrayData::try_new(
+                    ArrayType::new(DataType::LONG, true),
+                    stats_visitor.record_counts,
+                )?,
+                ArrayData::try_new(
+                    ArrayType::new(self.content_stats_type.clone(), true),
+                    stats_visitor.content_stats_scalars,
+                )?,
+            ],
+        )?;
+
+        let result = self.action_evaluator.evaluate(augmented.as_ref())?;
+        FilteredEngineData::try_new(result, dedup.selection_vector).map(Some)
+    }
+
+    /// Processes a content root batch (`is_log_batch = false`).
+    ///
+    /// Emits entries whose `(path, dv_location)` key was not seen in a prior log batch.
+    /// Any entry still marked `Added` is normalized to `Existing` — entries from the previous
+    /// root all predate the current commit by definition.
+    pub(crate) fn process_root_batch(
+        &mut self,
+        batch: FilteredEngineData,
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let mut visitor = ContentTreeNodeEntryVisitor::default();
+        FilteredRowVisitor::visit_rows_of(&mut visitor, &batch)?;
+
+        let mut entries = Vec::new();
+        for entry in visitor.entries {
+            let Some(path) = entry.location.as_deref() else {
+                continue;
+            };
+            let dv_loc = entry.deletion_vector.as_ref().map(|d| d.location.clone());
+            let key = FileActionKey::new(path, dv_loc);
+
+            if self.log_action_keys.contains(&key) {
+                // Superseded by a log action — skip.
                 continue;
             }
 
-            if let Some(path) = getters[0].get_opt(i, "scanRow.path")? {
-                let size: i64 = getters[1].get(i, "scanRow.size")?;
-                let modification_time: i64 = getters[2].get(i, "scanRow.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(i, "scanRow.stats")?;
+            // Mark previously "added" entries as "existing"
+            // TODO: for DV replacements, "replaced" status?
+            let entry = if entry.tracking.status == TrackingStatus::Added {
+                entry.with_status(TrackingStatus::Existing)
+            } else {
+                entry
+            };
 
-                let storage_type_str_opt: Option<String> =
-                    getters[4].get_opt(i, "scanRow.deletionVector.storageType")?;
-                let deletion_vector = if let Some(storage_type_str) = storage_type_str_opt {
-                    let storage_type: DeletionVectorStorageType = storage_type_str.parse()?;
-                    let path_or_inline_dv: String =
-                        getters[5].get(i, "scanRow.deletionVector.pathOrInlineDv")?;
-                    let offset: Option<i32> =
-                        getters[6].get_opt(i, "scanRow.deletionVector.offset")?;
-                    let size_in_bytes: i32 =
-                        getters[7].get(i, "scanRow.deletionVector.sizeInBytes")?;
-                    let cardinality: i64 =
-                        getters[8].get(i, "scanRow.deletionVector.cardinality")?;
-
-                    Some(DeletionVectorDescriptor {
-                        storage_type,
-                        path_or_inline_dv,
-                        offset,
-                        size_in_bytes,
-                        cardinality,
-                    })
-                } else {
-                    None
-                };
-
-                let partition_values: HashMap<String, String> = getters[9]
-                    .get_opt(i, "scanRow.fileConstantValues.partitionValues")?
-                    .unwrap_or_default();
-
-                let data_manifest_path: Option<String> =
-                    getters[10].get_opt(i, "scanRow.fileConstantValues.dataManifestPath")?;
-                let data_manifest_position: Option<i64> =
-                    getters[11].get_opt(i, "scanRow.fileConstantValues.dataManifestPosition")?;
-
-                let add = Add {
-                    path,
-                    partition_values,
-                    size,
-                    modification_time,
-                    data_change: true,
-                    stats,
-                    tags: None,
-                    deletion_vector,
-                    base_row_id: None,
-                    default_row_commit_version: None,
-                    clustering_provider: None,
-                    data_manifest_path,
-                    data_manifest_position,
-                };
-                self.adds.push(add);
-            }
+            entries.push(entry);
         }
-        self.row_offset += row_count;
-        Ok(())
+
+        Ok(entries)
+    }
+
+    /// Drains accumulated leaf manifest deletions, grouped by leaf path.
+    pub(crate) fn deleted_leaf_positions_by_location(
+        &mut self,
+    ) -> HashMap<String, roaring::RoaringTreemap> {
+        let mut result: HashMap<String, roaring::RoaringTreemap> =
+            HashMap::with_capacity(self.leaf_removes.len());
+        for lr in self.leaf_removes.drain(..) {
+            result.entry(lr.path).or_default().insert(lr.position);
+        }
+        result
     }
 }
 
@@ -2109,7 +2451,8 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
-    use crate::content_tree::ContentTreeNode;
+    use crate::content_tree::{absolute_to_relative_path, parse_or_join_url, ContentTreeNode};
+    use crate::expressions::StructData;
 
     /// Helper: builds a root manifest, writes it to disk, and reads it back.
     fn build_and_read_root(
@@ -2123,7 +2466,7 @@ mod tests {
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
             .location;
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root);
+        let root_path = absolute_to_relative_path(&root_url, &table_root);
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &root_url,
@@ -2308,7 +2651,7 @@ mod tests {
             builder.add_entry(
                 ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                     .location(path)
-                    .with_tracking(1, 1, 1)
+                    .with_tracking(TrackingStatus::Added, 1, 1)
                     .record_count(record_count)
                     .file_size_in_bytes(1024)
                     .build(),
@@ -2724,7 +3067,7 @@ mod tests {
 
         let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data/part-00000.parquet")
-            .with_tracking(1, 1, 1)
+            .with_tracking(TrackingStatus::Added, 1, 1)
             .record_count(100)
             .file_size_in_bytes(1024)
             .content_stats_opt(content_stats_1)
@@ -2737,7 +3080,7 @@ mod tests {
 
         let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data/part-00001.parquet")
-            .with_tracking(1, 1, 1)
+            .with_tracking(TrackingStatus::Added, 1, 1)
             .record_count(150)
             .file_size_in_bytes(2048)
             .content_stats_opt(content_stats_2)
@@ -2838,7 +3181,7 @@ mod tests {
         // Create entries without content_stats
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data/part-00000.parquet")
-            .with_tracking(1, 1, 1)
+            .with_tracking(TrackingStatus::Added, 1, 1)
             .record_count(100)
             .file_size_in_bytes(1024)
             .build();
@@ -2875,18 +3218,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let deletion_vector = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path
         assert_eq!(
-            dv_info.location,
+            deletion_vector.location,
             "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(dv_info.offset, 4);
-        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(dv_info.cardinality, 6);
+        assert_eq!(deletion_vector.offset, 4);
+        assert_eq!(deletion_vector.size_in_bytes, 48); // 40 + 8
+        assert_eq!(deletion_vector.cardinality, 6);
 
         Ok(())
     }
@@ -2906,18 +3249,18 @@ mod tests {
             cardinality: 2,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let deletion_vector = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path (no prefix directory)
         assert_eq!(
-            dv_info.location,
+            deletion_vector.location,
             "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(dv_info.offset, 1);
-        assert_eq!(dv_info.size_in_bytes, 44); // 36 + 8
-        assert_eq!(dv_info.cardinality, 2);
+        assert_eq!(deletion_vector.offset, 1);
+        assert_eq!(deletion_vector.size_in_bytes, 44); // 36 + 8
+        assert_eq!(deletion_vector.cardinality, 2);
 
         Ok(())
     }
@@ -2936,18 +3279,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let deletion_vector = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
-            dv_info.location,
+            deletion_vector.location,
             "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8)
-        assert_eq!(dv_info.offset, 4);
-        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(dv_info.cardinality, 6);
+        assert_eq!(deletion_vector.offset, 4);
+        assert_eq!(deletion_vector.size_in_bytes, 48); // 40 + 8
+        assert_eq!(deletion_vector.cardinality, 6);
 
         Ok(())
     }
@@ -3040,7 +3383,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("data/part-{:05}.parquet", i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3064,20 +3407,19 @@ mod tests {
         // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
-        // Should have: 1 CombinedManifest (DV is now inline on this entry)
+        // Should have: 1 DataManifest entry
         assert_eq!(root_entries.len(), 1);
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
         // Verify the manifest_dv field contains the deleted index
         let manifest_dv_bytes = data_manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         assert!(
             manifest_dv_bytes.len() >= 4,
@@ -3088,7 +3430,7 @@ mod tests {
         assert_eq!(treemap.len(), 1);
 
         // Step 4: Read the leaf and apply manifest DV to verify filtering
-        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_url = parse_or_join_url(&leaf_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_url,
@@ -3130,7 +3472,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("data/part-{:05}.parquet", i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3152,15 +3494,15 @@ mod tests {
 
         // Build, write, and read back the root to verify
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
-        assert_eq!(root_entries.len(), 1); // CombinedManifest (DV is inline)
+        assert_eq!(root_entries.len(), 1); // DataManifest entry
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
 
         // Verify all deleted indices in manifest_dv field
-        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let manifest_dv_bytes = data_manifest.manifest_dv_bytes().unwrap();
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(2));
         assert!(treemap.contains(5));
@@ -3168,7 +3510,7 @@ mod tests {
         assert_eq!(treemap.len(), 3);
 
         // Apply manifest DV and verify filtering
-        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_url = parse_or_join_url(&leaf_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_url,
@@ -3203,7 +3545,7 @@ mod tests {
         for i in 0..3 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("data/part-{:05}.parquet", i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3230,7 +3572,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::CombinedManifest
+                e.content_type == DataContentType::DataManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3257,7 +3599,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("data/part-{:05}.parquet", i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3326,7 +3668,7 @@ mod tests {
         for i in 0..5 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("data/part-{:05}.parquet", i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3352,13 +3694,13 @@ mod tests {
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
         // Verify the deletion was recorded in manifest_dv
-        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let manifest_dv_bytes = data_manifest.manifest_dv_bytes().unwrap();
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(3));
 
@@ -3382,24 +3724,25 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Create a manifest entry with manifest_stats showing:
+        // Create a manifest entry with manifest_info showing:
         // - 2 added files (indices 0, 1)
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
-        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("leaf-manifest.parquet")
-            .with_tracking(1, 1, 1)
+            .with_tracking(TrackingStatus::Added, 1, 1)
             .record_count(5) // Total entries in the leaf
             .file_size_in_bytes(2048)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 2,
                 existing_files_count: 1,
-                deletes_files_count: 2, // 2 entries are already deleted
+                deleted_files_count: 2, // 2 entries are already deleted
                 added_rows_count: 200,
                 existing_rows_count: 100,
-                delete_rows_count: 200,
+                deleted_rows_count: 200,
                 min_sequence_number: 1,
+                ..Default::default()
             })
             .build();
 
@@ -3420,7 +3763,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::CombinedManifest
+                e.content_type == DataContentType::DataManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3437,8 +3780,7 @@ mod tests {
 
         // Verify manifest_dv has cardinality 3 (not 5)
         let manifest_dv_bytes = leaf_manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
 
         let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
@@ -3468,7 +3810,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("{}data/part-{:05}.parquet", table_root, i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3491,13 +3833,12 @@ mod tests {
         let entries_v1 = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest_v1 = entries_v1
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains both deletions (2 and 5)
         let manifest_dv_v1 = manifest_v1
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v1 = RoaringTreemap::deserialize_from(&manifest_dv_v1[4..])?;
         assert!(cumulative_v1.contains(2));
@@ -3532,13 +3873,12 @@ mod tests {
         let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, 2)?;
         let manifest_v2 = entries_v2
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
         let manifest_dv_v2 = manifest_v2
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v2 = RoaringTreemap::deserialize_from(&manifest_dv_v2[4..])?;
         assert!(cumulative_v2.contains(2));
@@ -3587,13 +3927,12 @@ mod tests {
         let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, 3)?;
         let manifest_v3 = entries_v3
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
         let manifest_dv_v3 = manifest_v3
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v3 = RoaringTreemap::deserialize_from(&manifest_dv_v3[4..])?;
         assert!(cumulative_v3.contains(2));
@@ -3644,7 +3983,7 @@ mod tests {
         // Step 12: Make an unrelated change - add a new data entry (no deletions)
         let new_data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(format!("{}data/part-{:05}.parquet", table_root, 100))
-            .with_tracking(4, 4, 4)
+            .with_tracking(TrackingStatus::Added, 4, 4)
             .record_count(100)
             .file_size_in_bytes(1024)
             .build();
@@ -3654,13 +3993,12 @@ mod tests {
         let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, 4)?;
         let manifest_v4 = entries_v4
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
         let manifest_dv_v4 = manifest_v4
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative_v4 = RoaringTreemap::deserialize_from(&manifest_dv_v4[4..])?;
         assert_eq!(
@@ -3696,7 +4034,7 @@ mod tests {
         for i in 0..5 {
             let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                 .location(format!("{}data/part-{:05}.parquet", table_root, i))
-                .with_tracking(1, 1, 1)
+                .with_tracking(TrackingStatus::Added, 1, 1)
                 .record_count(100)
                 .file_size_in_bytes(1024)
                 .build();
@@ -3725,13 +4063,12 @@ mod tests {
         let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
-            .expect("CombinedManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
         // Verify manifest_dv contains the deletions (for internal tracking)
         let manifest_dv = manifest
-            .manifest_dv
-            .as_ref()
+            .manifest_dv_bytes()
             .expect("manifest_dv should exist");
         let cumulative = RoaringTreemap::deserialize_from(&manifest_dv[4..])?;
         assert!(cumulative.contains(2));
@@ -3866,7 +4203,7 @@ mod tests {
         // Add two data entries; data1 has inline DV info, data2 doesn't
         let data_entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data1.parquet")
-            .dv_info(DvInfo {
+            .deletion_vector(DeletionVectorInfo {
                 location: "dv1.bin".to_string(),
                 offset: 0,
                 size_in_bytes: 48,
@@ -3929,6 +4266,58 @@ mod tests {
         Ok(())
     }
 
+    /// Helper that creates a minimal Add action for unit tests.
+    fn make_test_add(path: &str) -> Add {
+        Add {
+            path: path.to_string(),
+            partition_values: HashMap::new(),
+            size: 1024,
+            modification_time: 1000000,
+            data_change: true,
+            stats: None,
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+        }
+    }
+
+    #[test]
+    fn test_add_stamps_entry_with_commit_version() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Builder version is 5 (new root being built).
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
+
+        builder.add_with_status(
+            make_test_add("file1.parquet"),
+            2,
+            100,
+            TrackingStatus::Existing,
+        )?;
+
+        assert_eq!(builder.pending_entries.len(), 1);
+        let entry = &builder.pending_entries[0];
+        let ti = &entry.tracking;
+        assert_eq!(
+            ti.sequence_number,
+            Some(2),
+            "sequence_number must be the commit version, not the root version"
+        );
+        assert_eq!(
+            ti.status,
+            TrackingStatus::Existing,
+            "file from an earlier version must have Existing status"
+        );
+
+        Ok(())
+    }
+
     // Note: Deletion vector extraction from scan rows is tested through integration tests
     // since creating mock scan row data with the complex nested schema structure is difficult.
     // The extraction logic is verified through:
@@ -3965,7 +4354,7 @@ mod tests {
         status: TrackingStatus,
         first_row_id: Option<i64>,
     ) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+        ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location(format!("manifest-{}-{}.parquet", added_rows, existing_rows))
             .tracking(TrackingInfo {
                 status,
@@ -3977,14 +4366,18 @@ mod tests {
             })
             .record_count(added_rows + existing_rows)
             .file_size_in_bytes(2048)
-            .manifest_stats_opt(Some(ManifestStats {
+            .manifest_info_opt(Some(ManifestInfo {
                 added_files_count: 1,
                 existing_files_count: 1,
-                deletes_files_count: 0,
+                deleted_files_count: 0,
+                replaced_files_count: 0,
                 added_rows_count: added_rows,
                 existing_rows_count: existing_rows,
-                delete_rows_count: 0,
+                deleted_rows_count: 0,
+                replaced_rows_count: 0,
                 min_sequence_number: 1,
+                dv: None,
+                dv_cardinality: None,
             }))
             .build()
     }
@@ -4041,7 +4434,7 @@ mod tests {
         builder.pending_entries.push(make_manifest_entry(
             100,
             200,
-            TrackingStatus::Existed,
+            TrackingStatus::Existing,
             Some(0),
         ));
         builder
@@ -4177,7 +4570,7 @@ mod tests {
         // Existed entry with null first_row_id (e.g., from table upgrade or scan rebuild)
         builder
             .pending_entries
-            .push(make_data_entry(100, TrackingStatus::Existed, None));
+            .push(make_data_entry(100, TrackingStatus::Existing, None));
         // Added entry after it
         builder
             .pending_entries

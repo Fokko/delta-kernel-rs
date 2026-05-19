@@ -27,8 +27,7 @@ use url::Url;
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
-use crate::log_replay::ActionsBatch;
-use crate::path::ParsedLogPath;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, StructField, StructType};
 use crate::{
@@ -66,7 +65,7 @@ type ParquetStreamResult = (
 );
 
 /// Flat schema for DV columns appended by `append_inline_dv_columns`.
-/// Contains the 5 fields extracted from `dvInfo.*` on each Data entry.
+/// Contains the 5 fields extracted from `deletionVector.*` on each Data entry.
 static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("dv_cardinality", DataType::LONG, true),
@@ -208,7 +207,7 @@ impl ContentTreeNode {
     /// Construct ContentTreeNode from batches with a specific version (for content root reading).
     ///
     /// Validates that the root manifest only contains supported entry types
-    /// (`Data` and `CombinedManifest`). Returns an error if any unsupported
+    /// (`Data` and `DataManifest`). Returns an error if any unsupported
     /// manifest type is found.
     pub(crate) fn from_batches_with_version(
         data: Vec<Box<dyn EngineData>>,
@@ -229,9 +228,8 @@ impl ContentTreeNode {
 
     /// Validates that the root manifest only contains supported entry types.
     ///
-    /// In the CombinedManifest model, the only supported manifest type is
-    /// `CombinedManifest` (value=5). `Data` entries (value=0) are also allowed.
-    /// Any other active entry type (DataManifest, DeleteManifest, PositionDeletes,
+    /// The only supported manifest type is `DataManifest` (value=3). `Data` entries (value=0)
+    /// are also allowed. Any other active entry type (DeleteManifest, PositionDeletes,
     /// EqualityDeletes) causes an `Error::unsupported`.
     fn validate_root_manifest_entries(&self) -> DeltaResult<()> {
         use std::sync::LazyLock;
@@ -270,11 +268,10 @@ impl ContentTreeNode {
                     }
 
                     match content_type_int {
-                        0 | 5 => {} // Data or CombinedManifest — supported
-                        3 | 4 => {
+                        0 | 3 => {} // Data or DataManifest — supported
+                        4 => {
                             return Err(Error::unsupported(
-                                "DataManifest/DeleteManifest format is not supported; \
-                                 only CombinedManifest (type 5) is supported in the content tree",
+                                "DeleteManifest format is not supported in the content tree",
                             ))
                         }
                         1 => return Err(Error::unsupported(
@@ -479,12 +476,12 @@ impl ContentTreeNode {
         Ok(Arc::new(Expression::struct_from(top_level_exprs)))
     }
 
-    /// Appends 5 flat DV columns extracted directly from `dvInfo.*` on each Data entry.
+    /// Appends 5 flat DV columns extracted directly from `deletionVector.*` on each Data entry.
     ///
-    /// For Data entries (contentType=0): parses dvInfo.location into storageType/pathOrInlineDv,
-    /// casts dvInfo.offset i64→i32, subtracts 8 from dvInfo.sizeInBytes then casts i64→i32,
-    /// reads dvInfo.cardinality directly.
-    /// For non-Data entries: all 5 columns are null.
+    /// For Data entries (contentType=0): parses deletionVector.location into
+    /// storageType/pathOrInlineDv, casts deletionVector.offset i64→i32, subtracts 8 from
+    /// deletionVector.sizeInBytes then casts i64→i32, reads deletionVector.cardinality
+    /// directly. For non-Data entries: all 5 columns are null.
     /// Returns `None` if no Data entries in the batch had a DV (all DV columns would be null),
     /// avoiding unnecessary column allocation. Returns `Some` with DV columns appended otherwise.
     fn append_inline_dv_columns(
@@ -527,10 +524,10 @@ impl ContentTreeNode {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["dvInfo", "cardinality"]),
-                        ColumnName::new(["dvInfo", "location"]),
-                        ColumnName::new(["dvInfo", "offset"]),
-                        ColumnName::new(["dvInfo", "sizeInBytes"]),
+                        ColumnName::new(["deletionVector", "cardinality"]),
+                        ColumnName::new(["deletionVector", "location"]),
+                        ColumnName::new(["deletionVector", "offset"]),
+                        ColumnName::new(["deletionVector", "sizeInBytes"]),
                     ]
                 });
                 static TYPES: &[DataType] = &[
@@ -553,7 +550,7 @@ impl ContentTreeNode {
 
                     // Only Data entries (contentType=0) can carry a DV location.
                     let location_opt: Option<&str> = if content_type == 0 {
-                        getters[2].get_opt(i, "dvInfo.location")?
+                        getters[2].get_opt(i, "deletionVector.location")?
                     } else {
                         None
                     };
@@ -591,13 +588,14 @@ impl ContentTreeNode {
 
                         // Push cardinality, offset, sizeInBytes for this DV row.
                         let cardinality: Option<i64> =
-                            getters[1].get_opt(i, "dvInfo.cardinality")?;
+                            getters[1].get_opt(i, "deletionVector.cardinality")?;
                         self.cardinalities.push(match cardinality {
                             Some(v) => Scalar::Long(v),
                             None => Scalar::Null(DataType::LONG),
                         });
 
-                        let offset_opt: Option<i64> = getters[3].get_opt(i, "dvInfo.offset")?;
+                        let offset_opt: Option<i64> =
+                            getters[3].get_opt(i, "deletionVector.offset")?;
                         self.offsets.push(match offset_opt {
                             Some(v) => Scalar::Integer(i32::try_from(v).map_err(|_| {
                                 Error::generic(format!(
@@ -610,7 +608,8 @@ impl ContentTreeNode {
                             None => Scalar::Null(DataType::INTEGER),
                         });
 
-                        let size_opt: Option<i64> = getters[4].get_opt(i, "dvInfo.sizeInBytes")?;
+                        let size_opt: Option<i64> =
+                            getters[4].get_opt(i, "deletionVector.sizeInBytes")?;
                         self.size_in_bytes.push(match size_opt {
                             Some(v) => {
                                 let adjusted = v.checked_sub(8).ok_or_else(|| {
@@ -681,7 +680,7 @@ impl ContentTreeNode {
     /// Builds selection vectors for Add vs Remove entries based on tracking.status.
     ///
     /// Returns (add_selection, remove_selection) where:
-    /// - add_selection[i] = true if entry i has status Existed (0) or Added (1)
+    /// - add_selection[i] = true if entry i has status Existing (0) or Added (1)
     /// - remove_selection[i] = true if entry i has status Deleted (2)
     ///
     /// Both exclude manifest entries (contentType 3, 4) and other non-data types.
@@ -724,7 +723,7 @@ impl ContentTreeNode {
                     if content_type == 0 {
                         match status {
                             0 | 1 => {
-                                // Existed or Added -> Add action
+                                // Existing or Added -> Add action
                                 self.add_selection.push(true);
                                 self.remove_selection.push(false);
                             }
@@ -1065,13 +1064,13 @@ impl ContentTreeNode {
     /// This method implements the hierarchical metadata tree structure described in the
     /// Iceberg Single File Commits specification. It parses the root manifest and identifies:
     ///
-    /// - **CombinedManifest files** (content_type = CombinedManifest): References to child
-    ///   manifests containing actual data file entries with optional inline DV info
-    /// - **Manifest deletion vectors**: Stored inline in the `manifest_dv` field of
-    ///   CombinedManifest entries. Applied during manifest reading to filter out deleted entries.
+    /// - **DataManifest files** (content_type = DataManifest): References to child manifests
+    ///   containing actual data file entries with optional inline DV info
+    /// - **Manifest deletion vectors**: Stored inline in the `manifest_dv` field of DataManifest
+    ///   entries. Applied during manifest reading to filter out deleted entries.
     ///
     /// # Returns
-    /// A `LeafReferences` containing one `ManifestReference` per CombinedManifest in the root.
+    /// A `LeafReferences` containing one `ManifestReference` per DataManifest in the root.
     ///
     ///
     /// # Parameters
@@ -1184,17 +1183,16 @@ impl ContentTreeNode {
         };
 
         // Separate entries by type
-        let mut combined_manifest_entries = Vec::new();
+        let mut data_manifest_entries = Vec::new();
         let mut data_file_entries = Vec::new();
 
         for entry in entries {
             match entry.content_type {
-                DataContentType::CombinedManifest => combined_manifest_entries.push(entry),
+                DataContentType::DataManifest => data_manifest_entries.push(entry),
                 DataContentType::Data => data_file_entries.push(entry),
-                DataContentType::DataManifest | DataContentType::DeleteManifest => {
+                DataContentType::DeleteManifest => {
                     return Err(Error::generic(
-                        "Old DataManifest/DeleteManifest format is no longer supported; \
-                         use CombinedManifest format",
+                        "DeleteManifest format is not supported in the content tree",
                     ));
                 }
                 DataContentType::PositionDeletes => {
@@ -1208,9 +1206,9 @@ impl ContentTreeNode {
             }
         }
 
-        // CombinedManifest entries have inline DV info — no joining needed.
+        // DataManifest entries have inline DV info — no joining needed.
         // Each entry produces a ManifestReference.
-        let manifest_references: Vec<ManifestReference> = combined_manifest_entries
+        let manifest_references: Vec<ManifestReference> = data_manifest_entries
             .into_iter()
             .map(|data_entry| ManifestReference {
                 data_manifest: FilteredManifest::new(data_entry),
@@ -1335,11 +1333,10 @@ impl ContentTreeNode {
 
     /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
     ///
-    /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
-    ///
     /// # Returns
     /// A tuple of (batch_iterator, version, path_in_log) that can be used to construct
-    /// ContentTreeNode later.
+    /// a `ContentTreeNode` via [`Self::from_batches_with_version`]. The version component is
+    /// always 0 on this path (see TODO below).
     pub(crate) fn open_stream(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
@@ -1388,12 +1385,15 @@ impl ContentTreeNode {
             size: 0,
         };
 
-        let parsed =
-            ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
-
         let read_result_iter = parquet_handler.read_parquet_files(&[file], read_schema, None)?;
 
-        Ok((read_result_iter, parsed.version, path_in_log))
+        // Content tree manifests can live at any path (e.g. Iceberg AMT manifests under
+        // `metadata/`), not just Delta log paths. Nodes from this read path are only used for
+        // entry extraction, not writing, so the version field is irrelevant. We pass 0 here.
+        // TODO: Remove version from ParquetStreamResult and from_batches_with_version. The
+        // write path should get version from ContentTreeNodeBuilder directly instead of
+        // threading it through the read-side struct.
+        Ok((read_result_iter, 0, path_in_log))
     }
 }
 
@@ -1493,12 +1493,62 @@ pub(crate) fn absolute_to_relative_path(absolute_url: &Url, table_root: &Url) ->
     }
 }
 
-/// Parses a string as an absolute URL, or if that fails, joins it with the table root.
-/// This handles both absolute and relative manifest/file paths.
+/// Converts an absolute URL to a relative path by stripping the table location prefix. If the
+/// URL starts with the table location (without trailing `/`), the prefix is stripped and the
+/// remainder is returned (including the leading `/`). Otherwise the full absolute URL string
+/// is returned.
+///
+/// This produces Iceberg-convention relative paths (leading `/`) for manifest entry location
+/// fields. Delta checkpoint `contentRoot.path` values use [`absolute_to_relative_path`] instead,
+/// which strips the leading `/` per the Delta convention.
+// Modeled after Iceberg's `LocationUtil.relativizeLocation`.
+pub(crate) fn relativize_manifest_path(absolute_url: &Url, table_root: &Url) -> String {
+    let location = table_root.as_str().trim_end_matches('/');
+    let absolute = absolute_url.as_str();
+    match absolute.strip_prefix(location) {
+        Some(relative) if relative.is_empty() || relative.starts_with('/') => relative.to_string(),
+        _ => absolute.to_string(),
+    }
+}
+
+/// Returns true if the path starts with a URI scheme (e.g. `s3:`, `file:`, `hdfs:`), per
+/// [RFC 3986 section 3.1](https://datatracker.ietf.org/doc/html/rfc3986#section-3.1).
+///
+/// This is a fast string scan that avoids full URL parsing. A scheme is `ALPHA *( ALPHA /
+/// DIGIT / "+" / "-" / "." )` followed by `:`. Paths starting with `/` have no URI scheme.
+fn has_uri_scheme(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // RFC 3986: scheme starts with ALPHA. Non-alphabetic first char means no scheme.
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    for &ch in &bytes[1..] {
+        if ch == b':' {
+            return true;
+        }
+        if !ch.is_ascii_alphanumeric() && ch != b'+' && ch != b'-' && ch != b'.' {
+            return false;
+        }
+    }
+    false
+}
+
+/// Resolves a path string to an absolute URL.
+///
+/// If the path starts with a URI scheme it is already absolute. Otherwise it is relative and
+/// resolved by concatenating the table location (without trailing separator) with the path,
+/// inserting a `/` separator if the path doesn't already start with one. This handles both
+/// kernel-produced relative paths (no leading `/`) and Iceberg v4 manifest paths (leading `/`).
 pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url> {
-    Url::parse(path)
-        .or_else(|_| table_root.join(path))
-        .map_err(|e| Error::generic(format!("Failed to parse URL '{}': {}", path, e)))
+    if has_uri_scheme(path) {
+        return Url::parse(path).map_err(|e| {
+            Error::generic(format!("Failed to parse absolute path '{}': {}", path, e))
+        });
+    }
+    let root = table_root.as_str().trim_end_matches('/');
+    let sep = if path.starts_with('/') { "" } else { "/" };
+    Url::parse(&format!("{root}{sep}{path}"))
+        .map_err(|e| Error::generic(format!("Failed to resolve relative path '{}': {}", path, e)))
 }
 
 /// Converts a DeletionVectorDescriptor to a Scalar representation
@@ -1534,13 +1584,15 @@ pub(crate) fn metadata_entry_to_scalars(
                 ];
                 Scalar::Struct(StructData::new_unchecked(struct_fields, values))
             }
-            "dvInfo" => match &entry.dv_info {
+            "deletionVector" => match &entry.deletion_vector {
                 Some(dv) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
                             st.fields().cloned().collect::<Vec<_>>()
                         } else {
-                            return Err(crate::Error::generic("dvInfo field should be a struct"));
+                            return Err(crate::Error::generic(
+                                "deletionVector field should be a struct",
+                            ));
                         };
                     let values = vec![
                         Scalar::from(dv.location.clone()),
@@ -1552,7 +1604,7 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "partitionSpecId" => Scalar::from(entry.partition_spec_id),
+            "specId" => Scalar::from(entry.spec_id),
             "sortOrderId" => Scalar::from(entry.sort_order_id),
             "recordCount" => Scalar::from(entry.record_count),
             "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
@@ -1560,24 +1612,28 @@ pub(crate) fn metadata_entry_to_scalars(
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "manifestStats" => match &entry.manifest_stats {
+            "manifestInfo" => match &entry.manifest_info {
                 Some(ms) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
                             st.fields().cloned().collect::<Vec<_>>()
                         } else {
                             return Err(crate::Error::generic(
-                                "manifestStats field should be a struct",
+                                "manifestInfo field should be a struct",
                             ));
                         };
                     let values = vec![
                         Scalar::from(ms.added_files_count),
                         Scalar::from(ms.existing_files_count),
-                        Scalar::from(ms.deletes_files_count),
+                        Scalar::from(ms.deleted_files_count),
+                        Scalar::from(ms.replaced_files_count),
                         Scalar::from(ms.added_rows_count),
                         Scalar::from(ms.existing_rows_count),
-                        Scalar::from(ms.delete_rows_count),
+                        Scalar::from(ms.deleted_rows_count),
+                        Scalar::from(ms.replaced_rows_count),
                         Scalar::from(ms.min_sequence_number),
+                        Scalar::from(ms.dv.clone()),
+                        Scalar::from(ms.dv_cardinality),
                     ];
                     Scalar::Struct(StructData::new_unchecked(struct_fields, values))
                 }
@@ -1586,7 +1642,6 @@ pub(crate) fn metadata_entry_to_scalars(
             "keyMetadata" => Scalar::from(entry.key_metadata.clone()),
             "splitOffsets" => entry.split_offsets.clone().try_into()?,
             "equalityIds" => entry.equality_ids.clone().try_into()?,
-            "manifestDv" => Scalar::from(entry.manifest_dv.clone()),
             _ => Scalar::Null(field.data_type().clone()),
         };
 
@@ -1603,9 +1658,8 @@ pub enum DataContentType {
     PositionDeletes = 1,
     EqualityDeletes = 2,
     // Types below are only allowed in the root
-    DataManifest = 3,     // kept for backwards compat reading
-    DeleteManifest = 4,   // kept for backwards compat reading
-    CombinedManifest = 5, // unified manifest with inline DV info
+    DataManifest = 3,   // manifest of data files with inline DV info
+    DeleteManifest = 4, // kept for backwards compat reading only
 }
 
 // ToDataType implementations for enums
@@ -1668,9 +1722,10 @@ impl From<DataFileFormat> for Scalar {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TrackingStatus {
-    Existed = 0,
+    Existing = 0,
     Added = 1,
     Deleted = 2,
+    Replaced = 3,
 }
 
 impl ToDataType for TrackingStatus {
@@ -1686,7 +1741,7 @@ impl From<TrackingStatus> for Scalar {
 }
 
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct DvInfo {
+pub(crate) struct DeletionVectorInfo {
     /// Path to location that DV is stored in.
     #[field_id = 155]
     pub(crate) location: String,
@@ -1695,17 +1750,19 @@ pub(crate) struct DvInfo {
     #[field_id = 144]
     pub(crate) offset: i64,
 
-    /// The length of thea referenced content stored in the file;
+    /// The length of the referenced content stored in the file;
     /// required if content_offset is present.
     #[field_id = 145]
     pub(crate) size_in_bytes: i64,
 
+    /// Number of set bits (deleted rows) in the deletion vector.
     #[field_id = 156]
     pub(crate) cardinality: i64,
 }
 
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub struct TrackingInfo {
+    /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
     pub(crate) status: TrackingStatus,
 
@@ -1766,40 +1823,78 @@ impl From<TrackingInfo> for Scalar {
     }
 }
 
-#[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct ManifestStats {
+#[derive(Debug, Clone, Default, PartialEq, ToSchema, IntoEngineData)]
+pub(crate) struct ManifestInfo {
+    /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
-    pub(crate) added_files_count: i64,
+    pub(crate) added_files_count: i32,
+    /// Number of entries with EXISTING status in the manifest.
     #[field_id = 505]
-    pub(crate) existing_files_count: i64,
+    pub(crate) existing_files_count: i32,
+    /// Number of entries with DELETED status in the manifest.
     #[field_id = 506]
-    pub(crate) deletes_files_count: i64,
+    pub(crate) deleted_files_count: i32,
+    /// Number of entries with REPLACED status in the manifest.
+    #[field_id = 520]
+    pub(crate) replaced_files_count: i32,
 
+    /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
     pub(crate) added_rows_count: i64,
+    /// Total row count across all EXISTING entries in the manifest.
     #[field_id = 513]
     pub(crate) existing_rows_count: i64,
+    /// Total row count across all DELETED entries in the manifest.
     #[field_id = 514]
-    pub(crate) delete_rows_count: i64,
+    pub(crate) deleted_rows_count: i64,
+    /// Total row count across all REPLACED entries in the manifest.
+    #[field_id = 521]
+    pub(crate) replaced_rows_count: i64,
 
+    /// Minimum data sequence number of all entries in the manifest.
     #[field_id = 516]
     pub(crate) min_sequence_number: i64,
+
+    #[field_id = 522]
+    pub(crate) dv: Option<Bytes>,
+    #[field_id = 523]
+    pub(crate) dv_cardinality: Option<i64>,
 }
 
-impl From<ManifestStats> for Scalar {
-    fn from(value: ManifestStats) -> Self {
+impl ManifestInfo {
+    /// Number of active (ADDED + EXISTING) entries, widened to i64 for comparison with
+    /// i64 values like `dv_cardinality`.
+    pub(crate) fn active_entry_count(&self) -> i64 {
+        i64::from(self.added_files_count) + i64::from(self.existing_files_count)
+    }
+
+    /// Total number of entries (ADDED + EXISTING + DELETED + REPLACED), widened to i64 for use
+    /// as bounds in structures like `DvCache`.
+    pub(crate) fn total_entry_count(&self) -> i64 {
+        self.active_entry_count()
+            + i64::from(self.deleted_files_count)
+            + i64::from(self.replaced_files_count)
+    }
+}
+
+impl From<ManifestInfo> for Scalar {
+    fn from(value: ManifestInfo) -> Self {
         use crate::expressions::StructData;
         use crate::schema::ToSchema;
 
-        let fields = ManifestStats::to_schema().into_fields().collect();
+        let fields = ManifestInfo::to_schema().into_fields().collect();
         let values = vec![
             value.added_files_count.into(),
             value.existing_files_count.into(),
-            value.deletes_files_count.into(),
+            value.deleted_files_count.into(),
+            value.replaced_files_count.into(),
             value.added_rows_count.into(),
             value.existing_rows_count.into(),
-            value.delete_rows_count.into(),
+            value.deleted_rows_count.into(),
+            value.replaced_rows_count.into(),
             value.min_sequence_number.into(),
+            value.dv.into(),
+            value.dv_cardinality.into(),
         ];
 
         // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
@@ -1827,15 +1922,15 @@ pub(super) struct ContentTreeNodeEntry {
     pub tracking: TrackingInfo,
 
     #[field_id = 148]
-    pub(crate) dv_info: Option<DvInfo>,
+    pub(crate) deletion_vector: Option<DeletionVectorInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     #[field_id = 141]
-    pub(crate) partition_spec_id: i64,
+    pub(crate) spec_id: i32,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
     #[field_id = 140]
-    pub(crate) sort_order_id: Option<i64>,
+    pub(crate) sort_order_id: Option<i32>,
 
     /// Number of records in this file, or the cardinality of a deletion vector
     #[field_id = 103]
@@ -1856,7 +1951,7 @@ pub(super) struct ContentTreeNodeEntry {
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
     #[field_id = 150]
-    pub(crate) manifest_stats: Option<ManifestStats>,
+    pub(crate) manifest_info: Option<ManifestInfo>,
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete
@@ -1871,17 +1966,15 @@ pub(super) struct ContentTreeNodeEntry {
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must
     /// be sorted ascending
     #[field_id = 132]
+    #[element_field_id = 133]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     #[field_id = 135]
+    #[element_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
-
-    /// DV that applies to the manifest linked to from this entry.
-    #[field_id = 151]
-    pub(crate) manifest_dv: Option<Bytes>,
 }
 
 impl ContentTreeNodeEntry {
@@ -1892,6 +1985,20 @@ impl ContentTreeNodeEntry {
     }
 }
 
+#[cfg(test)]
+impl ContentTreeNodeEntry {
+    /// Returns the manifest deletion vector bytes, if present.
+    pub(crate) fn manifest_dv_bytes(&self) -> Option<&Bytes> {
+        self.manifest_info.as_ref().and_then(|mi| mi.dv.as_ref())
+    }
+}
+
+impl HasSelectionVector for Vec<ContentTreeNodeEntry> {
+    fn has_selected_rows(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
 /// Builder for [`ContentTreeNodeEntry`] that eliminates boilerplate by providing
 /// sensible defaults for most fields.
 ///
@@ -1899,7 +2006,7 @@ impl ContentTreeNodeEntry {
 /// ```ignore
 /// ContentTreeNodeEntryBuilder::new(DataContentType::Data)
 ///     .location("path/to/file.parquet")
-///     .with_tracking(entry_version, current_version, snapshot_id)
+///     .with_tracking(TrackingStatus::Added, entry_version, snapshot_id)
 ///     .record_count(100)
 ///     .file_size_in_bytes(1024)
 ///     .build()
@@ -1909,14 +2016,13 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     location: Option<String>,
     file_format: DataFileFormat,
     tracking: TrackingInfo,
-    dv_info: Option<DvInfo>,
-    partition_spec_id: i64,
-    sort_order_id: Option<i64>,
+    deletion_vector: Option<DeletionVectorInfo>,
+    spec_id: i32,
+    sort_order_id: Option<i32>,
     record_count: i64,
     file_size_in_bytes: Option<i64>,
     content_stats: Option<StructData>,
-    manifest_stats: Option<ManifestStats>,
-    manifest_dv: Option<Bytes>,
+    manifest_info: Option<ManifestInfo>,
     key_metadata: Option<Bytes>,
     split_offsets: Option<Vec<i64>>,
     equality_ids: Option<Vec<i32>>,
@@ -1924,7 +2030,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
 
 impl ContentTreeNodeEntryBuilder {
     /// Create a new builder with the given content type. All other fields start at
-    /// sensible defaults: `file_format=Parquet`, `partition_spec_id=0`, `record_count=0`,
+    /// sensible defaults: `file_format=Parquet`, `spec_id=0`, `record_count=0`,
     /// and all optional fields are `None`.
     pub(crate) fn new(content_type: DataContentType) -> Self {
         Self {
@@ -1939,14 +2045,13 @@ impl ContentTreeNodeEntryBuilder {
                 first_row_id: None,
                 changes_dv: None,
             },
-            dv_info: None,
-            partition_spec_id: 0,
+            deletion_vector: None,
+            spec_id: 0,
             sort_order_id: None,
             record_count: 0,
             file_size_in_bytes: None,
             content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
+            manifest_info: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -1958,19 +2063,14 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    /// Set tracking info by computing status from `entry_version` vs `current_version`.
-    /// If the file was written at `current_version`, its status is `Added`; otherwise `Existed`.
+    /// Set tracking info with the given `status`, `entry_version`, and `snapshot_id`.
+    #[cfg(test)]
     pub(crate) fn with_tracking(
         mut self,
+        status: TrackingStatus,
         entry_version: Version,
-        current_version: Version,
         snapshot_id: i64,
     ) -> Self {
-        let status = if entry_version == current_version {
-            TrackingStatus::Added
-        } else {
-            TrackingStatus::Existed
-        };
         self.tracking = TrackingInfo {
             status,
             snapshot_id: Some(snapshot_id),
@@ -1989,8 +2089,12 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    pub(crate) fn dv_info_opt(mut self, dv_info: Option<DvInfo>) -> Self {
-        self.dv_info = dv_info;
+    #[cfg(test)]
+    pub(crate) fn deletion_vector_opt(
+        mut self,
+        deletion_vector: Option<DeletionVectorInfo>,
+    ) -> Self {
+        self.deletion_vector = deletion_vector;
         self
     }
 
@@ -2009,8 +2113,8 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    pub(crate) fn manifest_stats_opt(mut self, manifest_stats: Option<ManifestStats>) -> Self {
-        self.manifest_stats = manifest_stats;
+    pub(crate) fn manifest_info_opt(mut self, manifest_info: Option<ManifestInfo>) -> Self {
+        self.manifest_info = manifest_info;
         self
     }
 
@@ -2021,19 +2125,19 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn dv_info(mut self, dv_info: DvInfo) -> Self {
-        self.dv_info = Some(dv_info);
+    pub(crate) fn deletion_vector(mut self, deletion_vector: DeletionVectorInfo) -> Self {
+        self.deletion_vector = Some(deletion_vector);
         self
     }
 
     #[allow(dead_code)]
-    pub(crate) fn partition_spec_id(mut self, partition_spec_id: i64) -> Self {
-        self.partition_spec_id = partition_spec_id;
+    pub(crate) fn spec_id(mut self, spec_id: i32) -> Self {
+        self.spec_id = spec_id;
         self
     }
 
     #[allow(dead_code)]
-    pub(crate) fn sort_order_id(mut self, sort_order_id: i64) -> Self {
+    pub(crate) fn sort_order_id(mut self, sort_order_id: i32) -> Self {
         self.sort_order_id = Some(sort_order_id);
         self
     }
@@ -2045,14 +2149,17 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn manifest_stats(mut self, manifest_stats: ManifestStats) -> Self {
-        self.manifest_stats = Some(manifest_stats);
+    pub(crate) fn manifest_info(mut self, manifest_info: ManifestInfo) -> Self {
+        self.manifest_info = Some(manifest_info);
         self
     }
 
+    /// Set the manifest deletion vector. Stored inside `manifest_info.dv`.
+    /// Ensures `manifest_info` is initialized with defaults if not already set.
     #[allow(dead_code)]
     pub(crate) fn manifest_dv(mut self, manifest_dv: Bytes) -> Self {
-        self.manifest_dv = Some(manifest_dv);
+        let mi = self.manifest_info.get_or_insert_with(ManifestInfo::default);
+        mi.dv = Some(manifest_dv);
         self
     }
 
@@ -2063,14 +2170,13 @@ impl ContentTreeNodeEntryBuilder {
             location: self.location,
             file_format: self.file_format,
             tracking: self.tracking,
-            dv_info: self.dv_info,
-            partition_spec_id: self.partition_spec_id,
+            deletion_vector: self.deletion_vector,
+            spec_id: self.spec_id,
             sort_order_id: self.sort_order_id,
             record_count: self.record_count,
             file_size_in_bytes: self.file_size_in_bytes,
             content_stats: self.content_stats,
-            manifest_stats: self.manifest_stats,
-            manifest_dv: self.manifest_dv,
+            manifest_info: self.manifest_info,
             key_metadata: self.key_metadata,
             split_offsets: self.split_offsets,
             equality_ids: self.equality_ids,
@@ -2249,6 +2355,7 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use super::*;
@@ -2290,92 +2397,248 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_absolute_to_relative_path() {
-        // Test with memory:// URLs
-        let table_root = Url::parse("memory:///").unwrap();
-        let absolute_url = Url::parse("memory:///part-content-root.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "part-content-root.parquet");
+    // === has_uri_scheme ===
 
-        // Test with s3:// URLs
-        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
-        let absolute_url = Url::parse("s3://my-bucket/my-table/data/part-00000.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "data/part-00000.parquet");
-
-        // Test with nested paths
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let absolute_url = Url::parse("s3://bucket/table/year=2023/month=10/part.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "year=2023/month=10/part.parquet");
-
-        // Test with file:// URLs
-        let table_root = Url::parse("file:///path/to/table/").unwrap();
-        let absolute_url = Url::parse("file:///path/to/table/data/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "data/file.parquet");
+    #[rstest]
+    #[case("s3://bucket/path", true)]
+    #[case("file:///tmp/table", true)]
+    #[case("hdfs://namenode/path", true)]
+    #[case("gs+v2://bucket/path", true)]
+    #[case("/data/file.parquet", false)]
+    #[case("/metadata/root-1.parquet", false)]
+    #[case("data/file.parquet", false)]
+    #[case("", false)]
+    // RFC 3986: scheme must start with ALPHA, not a digit
+    #[case("123:foo", false)]
+    // Colon in a path segment is not a scheme
+    #[case("/data/partition=key:value/file.parquet", false)]
+    fn test_has_uri_scheme(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(has_uri_scheme(input), expected);
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_bucket() {
-        // Different S3 bucket: must return the full absolute URL, not a truncated path
-        let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
-        let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "s3://bucket-a/table-a/file.parquet");
+    // === absolute_to_relative_path ===
+
+    #[rstest]
+    // Same-bucket relative paths
+    #[case(
+        "memory:///",
+        "memory:///part-content-root.parquet",
+        "part-content-root.parquet"
+    )]
+    #[case(
+        "s3://my-bucket/my-table/",
+        "s3://my-bucket/my-table/data/part-00000.parquet",
+        "data/part-00000.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/year=2023/month=10/part.parquet",
+        "year=2023/month=10/part.parquet"
+    )]
+    #[case(
+        "file:///path/to/table/",
+        "file:///path/to/table/data/file.parquet",
+        "data/file.parquet"
+    )]
+    // Cross-bucket: returns full absolute URL
+    #[case(
+        "s3://bucket-b/table-b/",
+        "s3://bucket-a/table-a/file.parquet",
+        "s3://bucket-a/table-a/file.parquet"
+    )]
+    // Cross-scheme: returns full absolute URL
+    #[case(
+        "s3://bucket/table/",
+        "gs://bucket/table/file.parquet",
+        "gs://bucket/table/file.parquet"
+    )]
+    // Cross-port: returns full absolute URL
+    #[case(
+        "http://localhost:9000/bucket/table/",
+        "http://localhost:4566/bucket/table/file.parquet",
+        "http://localhost:4566/bucket/table/file.parquet"
+    )]
+    // Same host, path not under table root: returns full absolute URL
+    #[case(
+        "s3://bucket/table-a/",
+        "s3://bucket/table-b/file.parquet",
+        "s3://bucket/table-b/file.parquet"
+    )]
+    fn test_absolute_to_relative_path(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        assert_eq!(
+            absolute_to_relative_path(&absolute_url, &table_root),
+            expected
+        );
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_scheme() {
-        // Different scheme (s3 vs gs): must return the full absolute URL
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let absolute_url = Url::parse("gs://bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "gs://bucket/table/file.parquet");
+    // === parse_or_join_url ===
+
+    #[rstest]
+    // Leading '/' relative paths (Iceberg v4 convention)
+    #[case(
+        "s3://bucket/table/",
+        "/data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "/metadata/root-1.parquet",
+        "s3://bucket/table/metadata/root-1.parquet"
+    )]
+    // Table root without trailing slash
+    #[case(
+        "s3://bucket/table",
+        "/data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    // No leading '/' relative paths (Delta convention)
+    #[case(
+        "s3://bucket/table/",
+        "data/file.parquet",
+        "s3://bucket/table/data/file.parquet"
+    )]
+    #[case(
+        "file:///tmp/table/",
+        "data/file.parquet",
+        "file:///tmp/table/data/file.parquet"
+    )]
+    // file:// scheme with leading '/'
+    #[case(
+        "file:///tmp/table/",
+        "/data/file.parquet",
+        "file:///tmp/table/data/file.parquet"
+    )]
+    // Absolute URLs returned unchanged
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "hdfs://namenode/path/file.parquet",
+        "hdfs://namenode/path/file.parquet"
+    )]
+    // Colons in path segments (not a scheme)
+    #[case(
+        "s3://bucket/table/",
+        "/data/partition=key:value/file.parquet",
+        "s3://bucket/table/data/partition=key:value/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "/metadata/snap-123:456.avro",
+        "s3://bucket/table/metadata/snap-123:456.avro"
+    )]
+    // Percent-encoded paths
+    #[case(
+        "s3://bucket/table/",
+        "/data/year%3D2023/file.parquet",
+        "s3://bucket/table/data/year%3D2023/file.parquet"
+    )]
+    fn test_parse_or_join_url(#[case] root: &str, #[case] path: &str, #[case] expected: &str) {
+        let table_root = Url::parse(root).unwrap();
+        let resolved = parse_or_join_url(path, &table_root).unwrap();
+        assert_eq!(resolved, Url::parse(expected).unwrap());
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_cross_port() {
-        // Same host, different port: must return full absolute URL
-        let table_root = Url::parse("http://localhost:9000/bucket/table/").unwrap();
-        let absolute_url = Url::parse("http://localhost:4566/bucket/table/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "http://localhost:4566/bucket/table/file.parquet");
+    // === relativize_manifest_path ===
+
+    #[rstest]
+    // Same-bucket: produces leading '/' per Iceberg convention
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/metadata/root.parquet",
+        "/metadata/root.parquet"
+    )]
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/data/00000-0.parquet",
+        "/data/00000-0.parquet"
+    )]
+    // Cross-bucket: returns full absolute URL
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    // Prefix collision: "s3://bucket/tab/" should NOT match "s3://bucket/table/..."
+    #[case(
+        "s3://bucket/tab/",
+        "s3://bucket/table/file.parquet",
+        "s3://bucket/table/file.parquet"
+    )]
+    fn test_relativize_manifest_path(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        assert_eq!(
+            relativize_manifest_path(&absolute_url, &table_root),
+            expected
+        );
     }
 
-    #[test]
-    fn test_absolute_to_relative_path_same_host_different_path() {
-        // Same bucket but path is not under the table root
-        let table_root = Url::parse("s3://bucket/table-a/").unwrap();
-        let absolute_url = Url::parse("s3://bucket/table-b/file.parquet").unwrap();
-        let result = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(result, "s3://bucket/table-b/file.parquet");
-    }
+    // === Round-trip tests ===
 
-    #[test]
-    fn test_absolute_to_relative_path_round_trips_with_parse_or_join() {
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-
-        // Relative path round-trips through parse_or_join_url
-        let absolute_url = Url::parse("s3://bucket/table/data/file.parquet").unwrap();
+    #[rstest]
+    // absolute_to_relative_path -> parse_or_join_url round-trip (no leading '/')
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/data/file.parquet",
+        "data/file.parquet"
+    )]
+    // Cross-bucket absolute URL preserved through round-trip
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/ext/file.parquet",
+        "s3://other-bucket/ext/file.parquet"
+    )]
+    fn test_absolute_to_relative_path_round_trips(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected_relative: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
         let relative = absolute_to_relative_path(&absolute_url, &table_root);
-        assert_eq!(relative, "data/file.parquet");
+        assert_eq!(relative, expected_relative);
         let resolved = parse_or_join_url(&relative, &table_root).unwrap();
         assert_eq!(resolved, absolute_url);
+    }
 
-        // Cross-bucket absolute URL round-trips through parse_or_join_url
-        let external_url = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&external_url, &table_root);
-        assert_eq!(preserved, "s3://other-bucket/ext/file.parquet");
-        let resolved = parse_or_join_url(&preserved, &table_root).unwrap();
-        assert_eq!(resolved, external_url);
-
-        // Round-trip via Url::join (as used by content_root.path consumers)
-        let cross_bucket = Url::parse("s3://other-bucket/ext/file.parquet").unwrap();
-        let preserved = absolute_to_relative_path(&cross_bucket, &table_root);
-        let resolved = table_root.join(&preserved).unwrap();
-        assert_eq!(resolved, cross_bucket);
+    #[rstest]
+    // relativize_manifest_path -> parse_or_join_url round-trip (leading '/')
+    #[case(
+        "s3://bucket/table/",
+        "s3://bucket/table/metadata/root.parquet",
+        "/metadata/root.parquet"
+    )]
+    // Cross-bucket absolute URL preserved through round-trip
+    #[case(
+        "s3://bucket/table/",
+        "s3://other-bucket/path/file.parquet",
+        "s3://other-bucket/path/file.parquet"
+    )]
+    fn test_relativize_manifest_path_round_trips(
+        #[case] root: &str,
+        #[case] absolute: &str,
+        #[case] expected_relative: &str,
+    ) {
+        let table_root = Url::parse(root).unwrap();
+        let absolute_url = Url::parse(absolute).unwrap();
+        let relative = relativize_manifest_path(&absolute_url, &table_root);
+        assert_eq!(relative, expected_relative);
+        let resolved = parse_or_join_url(&relative, &table_root).unwrap();
+        assert_eq!(resolved, absolute_url);
     }
 
     #[test]
@@ -2385,18 +2648,15 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // Fields: contentType, location, fileFormat, tracking, dvInfo, partitionSpecId,
-        // sortOrderId, recordCount, fileSizeInBytes, manifestStats, keyMetadata,
-        // splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
-        assert_eq!(schema.fields().len(), 14);
+        // 13 top-level fields (manifestDv moved into manifest_info.dv)
+        assert_eq!(schema.fields().len(), 13);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // 28 leaf fields: 25 (our branch base) + keyMetadata(1) + splitOffsets(1) + equalityIds(1)
-        // (no referencedFile; dvInfo has 4 leaves vs old dvInfo's 2)
-        assert_eq!(leaf_names.len(), 28);
+        // 31 leaf fields (6 tracking + 4 deletion_vector + 11 manifest_info + 10 other)
+        assert_eq!(leaf_names.len(), 31);
     }
 
     #[test]
@@ -2428,8 +2688,8 @@ mod tests {
         let schema_with_stats =
             ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &delta_stats_schema)?;
 
-        // Schema should have 15 top-level fields (14 base + 1 for content_stats)
-        assert_eq!(schema_with_stats.fields().len(), 15);
+        // Schema should have 14 top-level fields (13 base + 1 for content_stats)
+        assert_eq!(schema_with_stats.fields().len(), 14);
 
         // Verify content_stats field exists
         let content_stats_field = schema_with_stats
@@ -2958,20 +3218,13 @@ mod tests {
             "tracking.first_row_id mismatch"
         );
 
-        // Compare manifest_dv and changes_dv
-        assert_eq!(
-            expected.manifest_dv, actual.manifest_dv,
-            "manifest_dv mismatch"
-        );
+        // Compare changes_dv
         assert_eq!(
             expected.tracking.changes_dv, actual.tracking.changes_dv,
             "changes_dv mismatch"
         );
 
-        assert_eq!(
-            expected.partition_spec_id, actual.partition_spec_id,
-            "partition_spec_id mismatch"
-        );
+        assert_eq!(expected.spec_id, actual.spec_id, "spec_id mismatch");
         assert_eq!(
             expected.sort_order_id, actual.sort_order_id,
             "sort_order_id mismatch"
@@ -2985,41 +3238,11 @@ mod tests {
             "file_size_in_bytes mismatch"
         );
 
-        // Compare manifest_stats
-        match (&expected.manifest_stats, &actual.manifest_stats) {
-            (Some(exp_ms), Some(act_ms)) => {
-                assert_eq!(
-                    exp_ms.added_files_count, act_ms.added_files_count,
-                    "manifest_stats.added_files_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.existing_files_count, act_ms.existing_files_count,
-                    "manifest_stats.existing_files_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.deletes_files_count, act_ms.deletes_files_count,
-                    "manifest_stats.deletes_files_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.added_rows_count, act_ms.added_rows_count,
-                    "manifest_stats.added_rows_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.existing_rows_count, act_ms.existing_rows_count,
-                    "manifest_stats.existing_rows_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.delete_rows_count, act_ms.delete_rows_count,
-                    "manifest_stats.delete_rows_count mismatch"
-                );
-                assert_eq!(
-                    exp_ms.min_sequence_number, act_ms.min_sequence_number,
-                    "manifest_stats.min_sequence_number mismatch"
-                );
-            }
-            (None, None) => {}
-            _ => panic!("manifest_stats presence mismatch"),
-        }
+        // Compare manifest_info (including dv and dv_cardinality)
+        assert_eq!(
+            expected.manifest_info, actual.manifest_info,
+            "manifest_info mismatch"
+        );
 
         assert_eq!(
             expected.key_metadata, actual.key_metadata,
@@ -3068,25 +3291,77 @@ mod tests {
         // annotations
         let tracking_schema = TrackingInfo::to_schema();
 
-        // Helper to check field_id metadata
-        fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
+        fn assert_metadata_id(
+            schema: &StructType,
+            field_name: &str,
+            key: &ColumnMetadataKey,
+            expected_id: i64,
+        ) {
             let field = schema
                 .field(field_name)
                 .unwrap_or_else(|| panic!("{} field should exist in schema", field_name));
-            let metadata = field.metadata();
-            assert!(
-                metadata.contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
-                "{} field should have PARQUET:field_id in metadata",
-                field_name
-            );
-            match metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()) {
+            match field.metadata().get(key.as_ref()) {
                 Some(MetadataValue::Number(n)) => assert_eq!(
-                    *n, expected_id,
-                    "{} field should have field_id = {}",
-                    field_name, expected_id
+                    *n,
+                    expected_id,
+                    "{}.{}: expected {}, got {}",
+                    field_name,
+                    key.as_ref(),
+                    expected_id,
+                    n
                 ),
                 other => panic!(
-                    "{} field should have Number metadata, got {:?}",
+                    "{}.{}: expected Number({}), got {:?}",
+                    field_name,
+                    key.as_ref(),
+                    expected_id,
+                    other
+                ),
+            }
+        }
+
+        fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
+            assert_metadata_id(
+                schema,
+                field_name,
+                &ColumnMetadataKey::ParquetFieldId,
+                expected_id,
+            );
+        }
+
+        fn assert_nested_field_id(
+            schema: &StructType,
+            field_name: &str,
+            nested_key: &str,
+            expected_id: i64,
+        ) {
+            let field = schema
+                .field(field_name)
+                .unwrap_or_else(|| panic!("{} field should exist in schema", field_name));
+            let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
+            let meta = field.metadata().get(meta_key);
+            match meta {
+                Some(MetadataValue::Other(serde_json::Value::Object(obj))) => {
+                    match obj.get(nested_key) {
+                        Some(serde_json::Value::Number(n)) => {
+                            assert_eq!(
+                                n.as_i64(),
+                                Some(expected_id),
+                                "{}.{}: expected {}, got {:?}",
+                                field_name,
+                                nested_key,
+                                expected_id,
+                                n
+                            );
+                        }
+                        other => panic!(
+                            "{}.{}: expected Number({}), got {:?}",
+                            field_name, nested_key, expected_id, other
+                        ),
+                    }
+                }
+                other => panic!(
+                    "{}: expected ColumnMappingNestedIds JSON object, got {:?}",
                     field_name, other
                 ),
             }
@@ -3111,22 +3386,26 @@ mod tests {
         // changesDv: #[field_id = 153]
         assert_field_id(&tracking_schema, "changesDv", 153);
 
-        // Verify ManifestStats field IDs
-        let manifest_stats_schema = ManifestStats::to_schema();
-        assert_field_id(&manifest_stats_schema, "addedFilesCount", 504);
-        assert_field_id(&manifest_stats_schema, "existingFilesCount", 505);
-        assert_field_id(&manifest_stats_schema, "deletesFilesCount", 506);
-        assert_field_id(&manifest_stats_schema, "addedRowsCount", 512);
-        assert_field_id(&manifest_stats_schema, "existingRowsCount", 513);
-        assert_field_id(&manifest_stats_schema, "deleteRowsCount", 514);
-        assert_field_id(&manifest_stats_schema, "minSequenceNumber", 516);
+        // Verify ManifestInfo field IDs
+        let manifest_info_schema = ManifestInfo::to_schema();
+        assert_field_id(&manifest_info_schema, "addedFilesCount", 504);
+        assert_field_id(&manifest_info_schema, "existingFilesCount", 505);
+        assert_field_id(&manifest_info_schema, "deletedFilesCount", 506);
+        assert_field_id(&manifest_info_schema, "replacedFilesCount", 520);
+        assert_field_id(&manifest_info_schema, "addedRowsCount", 512);
+        assert_field_id(&manifest_info_schema, "existingRowsCount", 513);
+        assert_field_id(&manifest_info_schema, "deletedRowsCount", 514);
+        assert_field_id(&manifest_info_schema, "replacedRowsCount", 521);
+        assert_field_id(&manifest_info_schema, "minSequenceNumber", 516);
+        assert_field_id(&manifest_info_schema, "dv", 522);
+        assert_field_id(&manifest_info_schema, "dvCardinality", 523);
 
-        // Verify DvInfo field IDs
-        let dv_info_schema = DvInfo::to_schema();
-        assert_field_id(&dv_info_schema, "location", 155);
-        assert_field_id(&dv_info_schema, "offset", 144);
-        assert_field_id(&dv_info_schema, "sizeInBytes", 145);
-        assert_field_id(&dv_info_schema, "cardinality", 156);
+        // Verify DeletionVectorInfo field IDs
+        let deletion_vector_schema = DeletionVectorInfo::to_schema();
+        assert_field_id(&deletion_vector_schema, "location", 155);
+        assert_field_id(&deletion_vector_schema, "offset", 144);
+        assert_field_id(&deletion_vector_schema, "sizeInBytes", 145);
+        assert_field_id(&deletion_vector_schema, "cardinality", 156);
 
         // Verify top-level ContentTreeNodeEntry field IDs
         let metadata_entry_schema = ContentTreeNodeEntry::to_schema();
@@ -3134,13 +3413,28 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "location", 100);
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
         assert_field_id(&metadata_entry_schema, "tracking", 147);
-        assert_field_id(&metadata_entry_schema, "dvInfo", 148);
-        assert_field_id(&metadata_entry_schema, "partitionSpecId", 141);
+        assert_field_id(&metadata_entry_schema, "deletionVector", 148);
+        assert_field_id(&metadata_entry_schema, "specId", 141);
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
         assert_field_id(&metadata_entry_schema, "fileSizeInBytes", 104);
-        assert_field_id(&metadata_entry_schema, "manifestStats", 150);
-        assert_field_id(&metadata_entry_schema, "manifestDv", 151);
+        assert_field_id(&metadata_entry_schema, "manifestInfo", 150);
+
+        // Verify element field IDs on list fields (splitOffsets and equalityIds)
+        assert_field_id(&metadata_entry_schema, "splitOffsets", 132);
+        assert_nested_field_id(
+            &metadata_entry_schema,
+            "splitOffsets",
+            "splitOffsets.element",
+            133,
+        );
+        assert_field_id(&metadata_entry_schema, "equalityIds", 135);
+        assert_nested_field_id(
+            &metadata_entry_schema,
+            "equalityIds",
+            "equalityIds.element",
+            136,
+        );
 
         // Verify content_stats field_id in to_schema_with_content_stats
         let table_schema =
@@ -3152,6 +3446,36 @@ mod tests {
         assert_field_id(&schema_with_stats, CONTENT_STATS_FIELD_NAME, 146);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_entry_integer_field_types_match_iceberg() {
+        use crate::schema::ToSchema;
+
+        let schema = ContentTreeNodeEntry::to_schema();
+
+        assert_eq!(
+            schema.field("specId").unwrap().data_type(),
+            &DataType::INTEGER,
+            "spec_id (141) must be INTEGER for Iceberg compatibility"
+        );
+        assert_eq!(
+            schema.field("sortOrderId").unwrap().data_type(),
+            &DataType::Primitive(crate::schema::PrimitiveType::Integer),
+            "sort_order_id (140) must be INTEGER for Iceberg compatibility"
+        );
+
+        // Verify Long fields are still Long
+        assert_eq!(
+            schema.field("recordCount").unwrap().data_type(),
+            &DataType::LONG,
+            "record_count (103) must be LONG"
+        );
+        assert_eq!(
+            schema.field("fileSizeInBytes").unwrap().data_type(),
+            &DataType::LONG,
+            "file_size_in_bytes (104) must be LONG"
+        );
     }
 
     #[test]
@@ -3246,7 +3570,7 @@ mod tests {
                 first_row_id: Some(5000),
                 changes_dv: None,
             })
-            .partition_spec_id(1)
+            .spec_id(1)
             .sort_order_id(1)
             .record_count(10)
             .file_size_in_bytes(512)
@@ -3264,7 +3588,7 @@ mod tests {
 
     #[ignore] // DataManifest is not supported
     #[test]
-    fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
+    fn test_roundtrip_metadata_entry_with_manifest_info() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -3273,25 +3597,26 @@ mod tests {
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
                 changes_dv: None,
             })
-            .partition_spec_id(2)
+            .spec_id(2)
             .sort_order_id(2)
             .record_count(100)
             .file_size_in_bytes(10240)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 10,
-                deletes_files_count: 2,
+                deleted_files_count: 2,
                 added_rows_count: 500,
                 existing_rows_count: 1000,
-                delete_rows_count: 50,
+                deleted_rows_count: 50,
                 min_sequence_number: 100,
+                ..Default::default()
             })
             .build();
         let read_metadata =
@@ -3340,11 +3665,11 @@ mod tests {
         // Verify manifest_dv specifically
         let read_entry = &entries[0];
         assert!(
-            read_entry.manifest_dv.is_some(),
+            read_entry.manifest_dv_bytes().is_some(),
             "manifest_dv should be present"
         );
-        let read_bytes = read_entry.manifest_dv.as_ref().unwrap();
-        let orig_bytes = original_entry.manifest_dv.as_ref().unwrap();
+        let read_bytes = read_entry.manifest_dv_bytes().unwrap();
+        let orig_bytes = original_entry.manifest_dv_bytes().unwrap();
         assert_eq!(
             read_bytes.len(),
             orig_bytes.len(),
@@ -3391,7 +3716,7 @@ mod tests {
                 first_row_id: Some(5000),
                 changes_dv: None,
             })
-            .partition_spec_id(1)
+            .spec_id(1)
             .sort_order_id(1)
             .record_count(10)
             .file_size_in_bytes(512)
@@ -3399,25 +3724,26 @@ mod tests {
         let entry3 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
                 changes_dv: None,
             })
-            .partition_spec_id(2)
+            .spec_id(2)
             .sort_order_id(2)
             .record_count(100)
             .file_size_in_bytes(10240)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 10,
-                deletes_files_count: 2,
+                deleted_files_count: 2,
                 added_rows_count: 500,
                 existing_rows_count: 1000,
-                delete_rows_count: 50,
+                deleted_rows_count: 50,
                 min_sequence_number: 100,
+                ..Default::default()
             })
             .build();
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
@@ -3490,8 +3816,8 @@ mod tests {
                         first_row_id: Some((i * 1000) as i64),
                         changes_dv: None,
                     })
-                    .partition_spec_id(i as i64)
-                    .sort_order_id(i as i64)
+                    .spec_id(i as i32)
+                    .sort_order_id(i as i32)
                     .record_count((i * 10) as i64)
                     .file_size_in_bytes((i * 512) as i64)
                     .build()
@@ -3518,9 +3844,10 @@ mod tests {
 
         // Create entries with all tracking statuses
         let statuses = vec![
-            TrackingStatus::Existed,
+            TrackingStatus::Existing,
             TrackingStatus::Added,
             TrackingStatus::Deleted,
+            TrackingStatus::Replaced,
         ];
 
         let entries: Vec<ContentTreeNodeEntry> = statuses
@@ -3598,8 +3925,12 @@ mod tests {
         assert!(ti.file_sequence_number.is_none());
         assert_eq!(ti.first_row_id, Some(0));
         assert!(ti.changes_dv.is_none());
-        assert!(actual.manifest_dv.is_none());
-        assert!(actual.manifest_stats.is_none());
+        assert!(actual
+            .manifest_info
+            .as_ref()
+            .and_then(|mi| mi.dv.as_ref())
+            .is_none());
+        assert!(actual.manifest_info.is_none());
 
         Ok(())
     }
@@ -3700,6 +4031,78 @@ mod tests {
         )
     }
 
+    /// Verifies that `open_stream` succeeds for manifest files at arbitrary paths, not just
+    /// Delta log paths. Iceberg AMT manifests live under `metadata/` (e.g.
+    /// `metadata/UUID-root-1.parquet`), which `ParsedLogPath` would reject.
+    #[test]
+    fn test_open_stream_accepts_non_delta_log_paths() -> DeltaResult<()> {
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Build a minimal manifest with one entry
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data/file.parquet")
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(10)
+            .build();
+
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        builder.add_entry(entry);
+        let mut allocator = crate::row_tracking::CursorRowIdAllocator::new(0);
+        let metadata = builder.build(&engine, 1, &mut allocator)?;
+
+        // Write the manifest to disk (produces a Delta-log-style path)
+        let write_result = writer::ContentTreeNodeWriter::try_new(metadata)?.write(&engine)?;
+        let original_path = write_result
+            .location
+            .to_file_path()
+            .expect("should be a file URL");
+
+        // Copy the manifest to a non-Delta-log path (Iceberg-style)
+        let iceberg_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&iceberg_dir)?;
+        let iceberg_path = iceberg_dir.join("abc-root-1.parquet");
+        std::fs::copy(&original_path, &iceberg_path)?;
+        let iceberg_url = Url::from_file_path(&iceberg_path).unwrap();
+
+        // open_stream should succeed despite the non-Delta-log filename
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &iceberg_url,
+            "metadata/abc-root-1.parquet".to_string(),
+            None,
+            None,
+        )?;
+
+        // Round-trip through from_batches_with_version and verify entries
+        let data: Vec<_> = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let node = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root.clone(),
+        )?;
+        let entries = node.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].location.as_deref(),
+            Some("memory:///data/file.parquet")
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_data_entry_without_dv_has_no_deletion_vector() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
@@ -3709,8 +4112,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, DV is inline on Data entries.
-        // A Data entry with dv_info: None produces an Add with no deletionVector.
+        // DV is inline on Data entries.
+        // A Data entry with deletion_vector: None produces an Add with no deletionVector.
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
             .tracking(TrackingInfo {
@@ -3745,7 +4148,7 @@ mod tests {
 
         assert!(
             visitor.adds[0].deletion_vector.is_none(),
-            "Data entry without dv_info should not have a deletion vector"
+            "Data entry without deletion_vector should not have a deletion vector"
         );
 
         Ok(())
@@ -3814,7 +4217,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with dv_info produces an Add with a DV.
+        // A Data entry with deletion_vector produces an Add with a DV.
         // Use a relative DV path format: deletion_vector_{uuid}.bin
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
@@ -3827,7 +4230,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .dv_info(DvInfo {
+            .deletion_vector(DeletionVectorInfo {
                 location: dv_location.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -3858,7 +4261,7 @@ mod tests {
 
         assert!(
             add.deletion_vector.is_some(),
-            "Data entry with inline dv_info should have a deletion vector"
+            "Data entry with inline deletion_vector should have a deletion vector"
         );
         assert_eq!(add.deletion_vector.as_ref().unwrap().cardinality, 10);
 
@@ -3942,7 +4345,7 @@ mod tests {
             .file_size_in_bytes(2048)
             .manifest_dv(Bytes::from(inline_data))
             .build();
-        let original_dv_bytes = inline_dv_entry.manifest_dv.as_ref().unwrap().clone();
+        let original_dv_bytes = inline_dv_entry.manifest_dv_bytes().unwrap().clone();
 
         // Convert to engine data
         let engine_data = inline_dv_entry
@@ -3977,7 +4380,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, each Data entry has its own inline DV.
+        // Each Data entry has its own inline DV.
         // Two data entries, each with a different DV, both should produce Add actions with DVs.
         let dv_loc1 = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let dv_loc2 = "deletion_vector_87654321-4321-4321-4321-cba987654321.bin";
@@ -3991,7 +4394,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .dv_info(DvInfo {
+            .deletion_vector(DeletionVectorInfo {
                 location: dv_loc1.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -4011,7 +4414,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .dv_info(DvInfo {
+            .deletion_vector(DeletionVectorInfo {
                 location: dv_loc2.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -4057,7 +4460,7 @@ mod tests {
         for add in &all_adds {
             assert!(
                 add.deletion_vector.is_some(),
-                "Each data entry with inline dv_info should have a deletion vector"
+                "Each data entry with inline deletion_vector should have a deletion vector"
             );
         }
         // Cardinalities should be 15 and 20 (in some order)
@@ -4080,8 +4483,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with Deleted tracking status
-        // should not produce any Add action (it produces a Remove action instead).
+        // A Data entry with Deleted tracking status should not produce any Add action
+        // (it produces a Remove action instead).
         let mut data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
             .tracking(TrackingInfo {
@@ -4129,39 +4532,16 @@ mod tests {
     }
 
     #[test]
-    fn test_old_data_manifest_format_returns_error() -> DeltaResult<()> {
-        // Old DataManifest/DeleteManifest format is no longer supported.
-        // manifest_references() should return an error for these entry types.
+    fn test_delete_manifest_format_returns_error() -> DeltaResult<()> {
+        // DeleteManifest format is not supported; manifest_references() should return an error.
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
-            .location("memory:///data-manifest.parquet")
-            .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            })
-            .record_count(100)
-            .file_size_in_bytes(1024)
-            .manifest_stats(ManifestStats {
-                added_files_count: 10,
-                existing_files_count: 90,
-                deletes_files_count: 0,
-                added_rows_count: 1000,
-                existing_rows_count: 9000,
-                delete_rows_count: 0,
-                min_sequence_number: 50,
-            })
-            .build();
         let delete_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DeleteManifest)
             .location("memory:///delete-manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -4170,34 +4550,29 @@ mod tests {
             })
             .record_count(10)
             .file_size_in_bytes(512)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 5,
                 existing_files_count: 5,
-                deletes_files_count: 0,
+                deleted_files_count: 0,
                 added_rows_count: 50,
                 existing_rows_count: 50,
-                delete_rows_count: 0,
+                deleted_rows_count: 0,
                 min_sequence_number: 75,
+                ..Default::default()
             })
             .build();
 
-        let metadata = build_node(
-            vec![data_manifest, delete_manifest],
-            0,
-            &table_root_url,
-            &engine,
-        )?;
+        let metadata = build_node(vec![delete_manifest], 0, &table_root_url, &engine)?;
 
-        // Old format should return an error
         let result = metadata.manifest_references(None, None, None, None, None);
         assert!(
             result.is_err(),
-            "Old DataManifest/DeleteManifest format should return an error"
+            "DeleteManifest format should return an error"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("no longer supported"),
-            "Error should mention format is no longer supported: {err_msg}"
+            err_msg.contains("DeleteManifest"),
+            "Error should mention DeleteManifest: {err_msg}"
         );
 
         Ok(())
@@ -4205,14 +4580,13 @@ mod tests {
 
     #[test]
     fn test_from_batches_with_version_rejects_unsupported_types() -> DeltaResult<()> {
-        // from_batches_with_version() should reject DataManifest, DeleteManifest,
-        // PositionDeletes, and EqualityDeletes entries at root-read time.
+        // from_batches_with_version() should reject DeleteManifest, PositionDeletes,
+        // and EqualityDeletes entries at root-read time.
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         let unsupported_cases: &[(DataContentType, &str)] = &[
-            (DataContentType::DataManifest, "DataManifest"),
             (DataContentType::DeleteManifest, "DeleteManifest"),
             (DataContentType::PositionDeletes, "PositionDeletes"),
             (DataContentType::EqualityDeletes, "EqualityDeletes"),
@@ -4222,7 +4596,7 @@ mod tests {
             let mut entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
                 .location("memory:///test.parquet")
                 .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
+                    status: TrackingStatus::Existing,
                     snapshot_id: Some(1),
                     sequence_number: Some(100),
                     file_sequence_number: Some(100),
@@ -4231,14 +4605,15 @@ mod tests {
                 })
                 .record_count(100)
                 .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
+                .manifest_info(ManifestInfo {
                     added_files_count: 10,
                     existing_files_count: 90,
-                    deletes_files_count: 0,
+                    deleted_files_count: 0,
                     added_rows_count: 1000,
                     existing_rows_count: 9000,
-                    delete_rows_count: 0,
+                    deleted_rows_count: 0,
                     min_sequence_number: 50,
+                    ..Default::default()
                 })
                 .build();
             entry.content_type = *content_type;
@@ -4263,17 +4638,17 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_references_combined_manifest() -> DeltaResult<()> {
-        // Test that CombinedManifest entries work correctly with manifest_references()
+    fn test_manifest_references_data_manifest() -> DeltaResult<()> {
+        // Test that DataManifest entries work correctly with manifest_references()
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // CombinedManifest entries contain data files + optional inline DVs
-        let combined_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-            .location("memory:///combined-manifest.parquet")
+        // DataManifest entries contain data files + optional inline DVs
+        let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("memory:///data-manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existed,
+                status: TrackingStatus::Existing,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -4284,16 +4659,16 @@ mod tests {
             .file_size_in_bytes(1024)
             .build();
 
-        let metadata = build_node(vec![combined_manifest], 0, &table_root_url, &engine)?;
+        let metadata = build_node(vec![data_manifest], 0, &table_root_url, &engine)?;
 
         let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
-        // CombinedManifest produces one manifest reference
+        // DataManifest produces one manifest reference
         assert_eq!(root_state.manifest_references.len(), 1);
         let refs = &root_state.manifest_references[0];
         assert_eq!(
             refs.data_manifest.manifest.location.as_ref().unwrap(),
-            "memory:///combined-manifest.parquet"
+            "memory:///data-manifest.parquet"
         );
 
         Ok(())
@@ -4389,54 +4764,53 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Create a root manifest that references both child manifests (as CombinedManifest, new
-        // format)
-        let data_manifest_entry_1 =
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-                .location(child_manifest_url_1.as_str())
-                .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(100),
-                    file_sequence_number: Some(100),
-                    first_row_id: Some(0),
-                    changes_dv: None,
-                })
-                .record_count(100)
-                .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
-                    added_files_count: 10,
-                    existing_files_count: 90,
-                    deletes_files_count: 0,
-                    added_rows_count: 1000,
-                    existing_rows_count: 9000,
-                    delete_rows_count: 0,
-                    min_sequence_number: 50,
-                })
-                .build();
-        let data_manifest_entry_2 =
-            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
-                .location(child_manifest_url_2.as_str())
-                .tracking(TrackingInfo {
-                    status: TrackingStatus::Existed,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(100),
-                    file_sequence_number: Some(100),
-                    first_row_id: Some(0),
-                    changes_dv: None,
-                })
-                .record_count(100)
-                .file_size_in_bytes(1024)
-                .manifest_stats(ManifestStats {
-                    added_files_count: 10,
-                    existing_files_count: 90,
-                    deletes_files_count: 0,
-                    added_rows_count: 1000,
-                    existing_rows_count: 9000,
-                    delete_rows_count: 0,
-                    min_sequence_number: 50,
-                })
-                .build();
+        // Create a root manifest that references both child manifests as DataManifest entries
+        let data_manifest_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(child_manifest_url_1.as_str())
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Existing,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .manifest_info(ManifestInfo {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deleted_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                deleted_rows_count: 0,
+                min_sequence_number: 50,
+                ..Default::default()
+            })
+            .build();
+        let data_manifest_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(child_manifest_url_2.as_str())
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Existing,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .manifest_info(ManifestInfo {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deleted_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                deleted_rows_count: 0,
+                min_sequence_number: 50,
+                ..Default::default()
+            })
+            .build();
 
         let root_metadata = build_node(
             vec![data_manifest_entry_1, data_manifest_entry_2],
@@ -4686,7 +5060,7 @@ mod tests {
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(record_batch));
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
                 leaf.add_files(engine.as_ref(), metadata_engine_data)?;
                 mc.add_leaf(leaf.finish(engine.as_ref())?)?;
@@ -4730,14 +5104,13 @@ mod tests {
                 .with_operation("UPDATE".to_string());
 
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
 
-                // TODO: Implement inline DV update for existing leaf entries in CombinedManifest
-                // model. Previously used leaf.update_deletion_vectors(dv_updates)
-                // here. In the new model DVs are inline on data entries, so
-                // updating a DV requires re-writing the data entry with updated
-                // dv_info.
+                // TODO: Implement inline DV update for existing leaf entries in DataManifest.
+                // Previously used leaf.update_deletion_vectors(dv_updates) here.
+                // DVs are inline on data entries, so updating a DV requires re-writing
+                // the data entry with updated deletion_vector.
                 let _ = (&file_locations, known_dv_size_in_bytes);
 
                 mc.add_leaf(leaf.finish(engine.as_ref())?)?;
@@ -4777,15 +5150,14 @@ mod tests {
         // Let's find all manifests and read them to find PositionDeletes
         let mut found_position_deletes_count = 0;
 
-        // In the new CombinedManifest model, DV info is inline on Data entries.
-        // Check CombinedManifest entries in root — they point to leaf manifests
-        // that contain Data entries with inline dv_info.
+        // DV info is inline on Data entries. Check DataManifest entries in root —
+        // they point to leaf manifests that contain Data entries with inline deletion_vector.
         for entry in &root_entries {
-            if matches!(entry.content_type, DataContentType::CombinedManifest) {
+            if matches!(entry.content_type, DataContentType::DataManifest) {
                 let manifest_path = entry
                     .location
                     .as_ref()
-                    .expect("CombinedManifest should have location");
+                    .expect("DataManifest should have location");
                 let manifest_url = table_url.join(manifest_path)?;
                 let (iter, version, path_in_log) = ContentTreeNode::open_stream(
                     engine.parquet_handler(),
@@ -4805,16 +5177,16 @@ mod tests {
 
                 for manifest_entry in manifest_entries {
                     if manifest_entry.content_type == DataContentType::Data {
-                        if let Some(dv_info) = &manifest_entry.dv_info {
+                        if let Some(deletion_vector) = &manifest_entry.deletion_vector {
                             // Verify the DV size includes the +8 Iceberg framing
                             let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
                             assert_eq!(
-                                dv_info.size_in_bytes,
+                                deletion_vector.size_in_bytes,
                                 expected_iceberg_size,
-                                "Persisted dv_info.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
+                                "Persisted deletion_vector.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
                                 expected_iceberg_size,
                                 known_dv_size_in_bytes,
-                                dv_info.size_in_bytes
+                                deletion_vector.size_in_bytes
                             );
                             found_position_deletes_count += 1;
                         }
@@ -4825,13 +5197,13 @@ mod tests {
 
         assert!(
             found_position_deletes_count > 0,
-            "Should have Data entries with inline dv_info in CombinedManifest leaf manifests"
+            "Should have Data entries with inline deletion_vector in DataManifest leaf manifests"
         );
 
         // The test successfully proves:
-        // 1. Persisted manifests have Data entries with inline dv_info using Iceberg sizes (Delta +
-        //    8)
-        //    - We verified dv_info.size_in_bytes = 42 + 8 = 50
+        // 1. Persisted manifests have Data entries with inline deletion_vector using Iceberg sizes
+        //    (Delta + 8)
+        //    - We verified deletion_vector.size_in_bytes = 42 + 8 = 50
         // 2. The size conversion happens at write time in:
         //    - extract_deletion_vector_content (+8): builder.rs
         // 3. On read, the size is subtracted back to Delta format in the visitor

@@ -49,7 +49,7 @@ pub struct LeafNodeWriter {
 
     /// Version of the snapshot being written
     /// TODO: This field should not be needed for leaf writer. It's currently required
-    /// as a workaround to force action tracking status to Existed (rather than Added).
+    /// as a workaround to force action tracking status to Existing (rather than Added).
     /// We need a better API - see usage at add_existing_actions() for details.
     version: Version,
 
@@ -339,8 +339,7 @@ impl LeafNodeWriter {
     /// LeafNodeWriterResult with written manifests and tracking info
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
-        // In the new CombinedManifest model, DV info is inline on data entries,
-        // so no separate DV manifest is needed.
+        // DV info is inline on data entries, so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
             Some(
                 self.data_builder
@@ -365,6 +364,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::content_tree::parse_or_join_url;
     use crate::schema::{
         ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
@@ -818,7 +818,7 @@ mod tests {
             .location
             .as_ref()
             .expect("Manifest should have location");
-        let manifest_url = table_root.join(manifest_location)?;
+        let manifest_url = parse_or_join_url(manifest_location, table_root)?;
         let manifest_path = manifest_url.to_file_path().unwrap();
         let manifest_file_size = std::fs::metadata(&manifest_path)?.len();
         let file_meta = FileMeta {
@@ -1001,7 +1001,7 @@ mod tests {
         // The ContentTreeNodeEntryVisitor doesn't read content_stats (it's table-schema-dependent),
         // so we read the parquet file directly and check the columns are present.
         let manifest_location = manifest_entry.location.as_ref().unwrap();
-        let manifest_url = table_root.join(manifest_location)?;
+        let manifest_url = parse_or_join_url(manifest_location, &table_root)?;
 
         // Use the engine's parquet handler to read the file with a schema that includes
         // content_stats
@@ -1329,7 +1329,7 @@ mod tests {
         use crate::content_tree::ContentTreeNode;
 
         // manifest_location is now a relative path, join with table_root
-        let manifest_url = table_root.join(manifest_location)?;
+        let manifest_url = parse_or_join_url(manifest_location, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &manifest_url,

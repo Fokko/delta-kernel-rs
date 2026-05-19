@@ -42,12 +42,17 @@ async fn test_manifest_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std:
         &[],
         true,
         vec!["columnMapping", "metadataTree-experimental"],
-        vec!["columnMapping", "metadataTree-experimental"],
+        vec![
+            "columnMapping",
+            "domainMetadata",
+            "metadataTree-experimental",
+            "rowTracking",
+        ],
     )
     .await?;
 
     // Write version 1 with an Add action (similar to first test)
-    let commit_json = r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":100},\"nullCount\":{\"id\":0}}"}}
+    let commit_json = r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"defaultRowCommitVersion":1,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":100},\"nullCount\":{\"id\":0}}"}}
 "#;
     let commit_path = delta_kernel::object_store::path::Path::from(format!(
         "no_op_manifest_commit/_delta_log/{:020}.json",
@@ -65,7 +70,7 @@ async fn test_manifest_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std:
     );
 
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    txn.with_manifest_commit();
+    txn.with_manifest_commit().unwrap();
     let _first_commit_result = txn.commit(engine.as_ref())?;
 
     // Verify content root was created
@@ -84,7 +89,7 @@ async fn test_manifest_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std:
     // Now call manifest commit again with no new data
     // This should be a no-op since content_root.version == snapshot.version
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    txn.with_manifest_commit();
+    txn.with_manifest_commit().unwrap();
     let result = txn.commit(engine.as_ref())?;
 
     let new_commit_version =

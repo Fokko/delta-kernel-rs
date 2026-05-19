@@ -1,6 +1,6 @@
 //! Tests verifying that `TrackingInfo` (status, snapshot_id, sequence_number,
 //! file_sequence_number) is correctly computed and preserved across multi-commit
-//! scenarios for Added, Existed, and Deleted statuses.
+//! scenarios for Added, Existing, and Deleted statuses.
 //!
 //! Each version is handled as a separate commit: the manifest is written to parquet,
 //! then read back into a fresh builder via `from_content_root`, mirroring the
@@ -144,8 +144,8 @@ fn find_entry<'a>(entries: &'a [ContentTreeNodeEntry], path: &str) -> &'a Conten
 ///   Version 1 (snapshot_id=1): Add file_a → write manifest
 ///   Version 2 (snapshot_id=2): Read V1 manifest → add file_b → read back
 ///
-/// file_a becomes Existed at V2 (was Added at V1), file_b is Added at V2.
-/// `from_content_root` flips Added→Existed for entries from prior versions.
+/// file_a becomes Existing at V2 (was Added at V1), file_b is Added at V2.
+/// `from_content_root` flips Added→Existing for entries from prior versions.
 #[test]
 fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
@@ -170,10 +170,10 @@ fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>>
     let entries = build_and_read_root(&mut builder, &engine, 2)?;
     assert_eq!(entries.len(), 2);
 
-    // file_a was Added at V1, but now at V2 it should be Existed
+    // file_a was Added at V1, but now at V2 it should be Existing
     let a = find_entry(&entries, "file_a.parquet");
     let a_tracking = &a.tracking;
-    assert_eq!(a_tracking.status, TrackingStatus::Existed);
+    assert_eq!(a_tracking.status, TrackingStatus::Existing);
     assert_eq!(a_tracking.snapshot_id, Some(1));
     assert_eq!(a_tracking.sequence_number, Some(1));
     assert_eq!(a_tracking.file_sequence_number, Some(1));
@@ -202,8 +202,8 @@ fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>>
 ///   Version 2: Read V1 → add file_b → write manifest
 ///   Version 3: Read V2 → write leaf + read back
 ///
-/// Both entries become Existed at V3 (were Added in prior versions).
-/// The write_leaf produces a CombinedManifest entry.
+/// Both entries become Existing at V3 (were Added in prior versions).
+/// The write_leaf produces a DataManifest entry.
 #[test]
 fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
@@ -235,38 +235,36 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
         3,
     )?;
 
-    // Write as a leaf manifest and verify the CombinedManifest entry
+    // Write as a leaf manifest and verify the DataManifest entry
     let manifest_entry = builder.write_leaf(&engine, 3, &mut CursorRowIdAllocator::new(0))?;
-    assert_eq!(
-        manifest_entry.content_type,
-        DataContentType::CombinedManifest
-    );
+    assert_eq!(manifest_entry.content_type, DataContentType::DataManifest);
+
     let manifest_info = &manifest_entry.tracking;
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
 
-    // Verify min_sequence_number in manifest_stats
-    let manifest_stats = manifest_entry
-        .manifest_stats
+    // Verify min_sequence_number in manifest_info
+    let manifest_info = manifest_entry
+        .manifest_info
         .as_ref()
-        .expect("manifest_stats");
-    assert_eq!(manifest_stats.min_sequence_number, 1);
+        .expect("manifest_info");
+    assert_eq!(manifest_info.min_sequence_number, 1);
 
     // Read back the leaf entries (pending_entries are preserved after write_leaf)
     let entries = build_and_read_leaf(&mut builder, &engine, 3)?;
     assert_eq!(entries.len(), 2);
 
-    // Both entries were Added in prior versions, now at V3 they should be Existed
+    // Both entries were Added in prior versions, now at V3 they should be Existing
     let a = find_entry(&entries, "file_a.parquet");
     let a_tracking = &a.tracking;
-    assert_eq!(a_tracking.status, TrackingStatus::Existed);
+    assert_eq!(a_tracking.status, TrackingStatus::Existing);
     assert_eq!(a_tracking.snapshot_id, Some(1));
     assert_eq!(a_tracking.sequence_number, Some(1));
     assert_eq!(a_tracking.file_sequence_number, Some(1));
 
     let b = find_entry(&entries, "file_b.parquet");
     let b_tracking = &b.tracking;
-    assert_eq!(b_tracking.status, TrackingStatus::Existed);
+    assert_eq!(b_tracking.status, TrackingStatus::Existing);
     assert_eq!(b_tracking.snapshot_id, Some(2));
     assert_eq!(b_tracking.sequence_number, Some(2));
     assert_eq!(b_tracking.file_sequence_number, Some(2));
@@ -289,7 +287,7 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
 ///
 /// file_a becomes Deleted (snapshot_id and sequence_number updated to V3,
 /// file_sequence_number preserved from original add at V1).
-/// file_b becomes Existed at V3 (was Added at V2).
+/// file_b becomes Existing at V3 (was Added at V2).
 #[test]
 fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Error>> {
     let engine = crate::engine::sync::SyncEngine::new();
@@ -335,10 +333,10 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
     // file_sequence_number preserved from original add
     assert_eq!(a_tracking.file_sequence_number, Some(1));
 
-    // file_b was Added at V2, but now at V3 it should be Existed
+    // file_b was Added at V2, but now at V3 it should be Existing
     let b = find_entry(&entries, "file_b.parquet");
     let b_tracking = &b.tracking;
-    assert_eq!(b_tracking.status, TrackingStatus::Existed);
+    assert_eq!(b_tracking.status, TrackingStatus::Existing);
     assert_eq!(b_tracking.snapshot_id, Some(2));
     assert_eq!(b_tracking.sequence_number, Some(2));
     assert_eq!(b_tracking.file_sequence_number, Some(2));

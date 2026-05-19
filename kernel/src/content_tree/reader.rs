@@ -4,17 +4,19 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 
 use super::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestStats, TrackingInfo,
-    TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo, ManifestInfo,
+    TrackingInfo, TrackingStatus,
 };
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{
+    FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor, TypedGetData as _,
+};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, Error};
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
-pub(super) struct ContentTreeNodeEntryVisitor {
-    pub(super) entries: Vec<ContentTreeNodeEntry>,
+pub(crate) struct ContentTreeNodeEntryVisitor {
+    pub(crate) entries: Vec<ContentTreeNodeEntry>,
 }
 
 impl RowVisitor for ContentTreeNodeEntryVisitor {
@@ -36,10 +38,25 @@ impl RowVisitor for ContentTreeNodeEntryVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // The number of getters should match the number of leaf fields in ContentTreeNodeEntry
-        // schema We'll validate this implicitly by accessing each field
-
         for i in 0..row_count {
+            let entry = visit_metadata_entry_at(i, getters)?;
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+}
+
+impl FilteredRowVisitor for ContentTreeNodeEntryVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        RowVisitor::selected_column_names_and_types(self)
+    }
+
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        for i in rows {
             let entry = visit_metadata_entry_at(i, getters)?;
             self.entries.push(entry);
         }
@@ -51,22 +68,21 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (26 total, excluding array types):
+    // The getters are in order of flattened leaf fields (29 total, excluding array types):
     // 0: content_type
     // 1: location
     // 2: file_format
     // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number,
-    // first_row_id, changes_dv) 9-12: dv_info fields (location, offset, size_in_bytes,
-    // cardinality) 13: partition_spec_id
+    // first_row_id, changes_dv) 9-12: deletion_vector fields (location, offset, size_in_bytes,
+    // cardinality) 13: spec_id
     // 14: sort_order_id
     // 15: record_count
     // 16: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 17-23: manifest_stats fields (7 fields)
-    // 24: key_metadata
+    // 17-27: manifest_info fields (11 fields, including dv and dv_cardinality)
+    // 28: key_metadata
     // (split_offsets excluded - array type not supported by GetData)
     // (equality_ids excluded - array type not supported by GetData)
-    // 25: manifest_dv
 
     // Extract content_type
     let content_type_int: i32 = getters[0].get(row_index, "content_type")?;
@@ -76,7 +92,6 @@ fn visit_metadata_entry_at<'a>(
         2 => DataContentType::EqualityDeletes,
         3 => DataContentType::DataManifest,
         4 => DataContentType::DeleteManifest,
-        5 => DataContentType::CombinedManifest,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid content_type value: {}",
@@ -95,9 +110,10 @@ fn visit_metadata_entry_at<'a>(
     // Extract tracking fields
     let tracking_status_int: i32 = getters[3].get(row_index, "tracking.status")?;
     let tracking_status = match tracking_status_int {
-        0 => TrackingStatus::Existed,
+        0 => TrackingStatus::Existing,
         1 => TrackingStatus::Added,
         2 => TrackingStatus::Deleted,
+        3 => TrackingStatus::Replaced,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid tracking status value: {}",
@@ -127,14 +143,14 @@ fn visit_metadata_entry_at<'a>(
         changes_dv: tracking_changes_dv_bytes,
     };
 
-    // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
-    let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;
-    let dv_info = dv_location
-        .map(|location| -> DeltaResult<DvInfo> {
-            let offset: i64 = getters[10].get(row_index, "dv_info.offset")?;
-            let size_in_bytes: i64 = getters[11].get(row_index, "dv_info.size_in_bytes")?;
-            let cardinality: i64 = getters[12].get(row_index, "dv_info.cardinality")?;
-            Ok(DvInfo {
+    // Extract deletion_vector fields (location, offset, size_in_bytes, cardinality)
+    let dv_location: Option<String> = getters[9].get_opt(row_index, "deletion_vector.location")?;
+    let deletion_vector = dv_location
+        .map(|location| -> DeltaResult<DeletionVectorInfo> {
+            let offset: i64 = getters[10].get(row_index, "deletion_vector.offset")?;
+            let size_in_bytes: i64 = getters[11].get(row_index, "deletion_vector.size_in_bytes")?;
+            let cardinality: i64 = getters[12].get(row_index, "deletion_vector.cardinality")?;
+            Ok(DeletionVectorInfo {
                 location,
                 offset,
                 size_in_bytes,
@@ -144,64 +160,70 @@ fn visit_metadata_entry_at<'a>(
         .transpose()?;
 
     // Extract scalar fields
-    let partition_spec_id: i64 = getters[13].get(row_index, "partition_spec_id")?;
-    let sort_order_id: Option<i64> = getters[14].get_opt(row_index, "sort_order_id")?;
+    let spec_id: i32 = getters[13].get(row_index, "spec_id")?;
+    let sort_order_id: Option<i32> = getters[14].get_opt(row_index, "sort_order_id")?;
     let record_count: i64 = getters[15].get(row_index, "record_count")?;
     let file_size_in_bytes: Option<i64> = getters[16].get_opt(row_index, "file_size_in_bytes")?;
 
     // content_stats has no fields, so no getters
 
-    // Extract manifest_stats fields
-    let ms_added_files_count: Option<i64> =
-        getters[17].get_opt(row_index, "manifest_stats.added_files_count")?;
-    let ms_existing_files_count: Option<i64> =
-        getters[18].get_opt(row_index, "manifest_stats.existing_files_count")?;
-    let ms_deletes_files_count: Option<i64> =
-        getters[19].get_opt(row_index, "manifest_stats.deletes_files_count")?;
+    // Extract manifest_info fields (11 fields: 17-27, including dv and dv_cardinality)
+    let ms_added_files_count: Option<i32> =
+        getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
+    let ms_existing_files_count: Option<i32> =
+        getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
+    let ms_deleted_files_count: Option<i32> =
+        getters[19].get_opt(row_index, "manifest_info.deleted_files_count")?;
+    let ms_replaced_files_count: Option<i32> =
+        getters[20].get_opt(row_index, "manifest_info.replaced_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_stats.added_rows_count")?;
+        getters[21].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_stats.existing_rows_count")?;
-    let ms_delete_rows_count: Option<i64> =
-        getters[22].get_opt(row_index, "manifest_stats.delete_rows_count")?;
+        getters[22].get_opt(row_index, "manifest_info.existing_rows_count")?;
+    let ms_deleted_rows_count: Option<i64> =
+        getters[23].get_opt(row_index, "manifest_info.deleted_rows_count")?;
+    let ms_replaced_rows_count: Option<i64> =
+        getters[24].get_opt(row_index, "manifest_info.replaced_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[23].get_opt(row_index, "manifest_stats.min_sequence_number")?;
+        getters[25].get_opt(row_index, "manifest_info.min_sequence_number")?;
+    let ms_dv: Option<&[u8]> = getters[26].get_opt(row_index, "manifest_info.dv")?;
+    let ms_dv_cardinality: Option<i64> =
+        getters[27].get_opt(row_index, "manifest_info.dv_cardinality")?;
 
-    let manifest_stats = ms_added_files_count.map(|added_files_count| ManifestStats {
+    let manifest_info = ms_added_files_count.map(|added_files_count| ManifestInfo {
         added_files_count,
         existing_files_count: ms_existing_files_count.unwrap_or(0),
-        deletes_files_count: ms_deletes_files_count.unwrap_or(0),
+        deleted_files_count: ms_deleted_files_count.unwrap_or(0),
+        replaced_files_count: ms_replaced_files_count.unwrap_or(0),
         added_rows_count: ms_added_rows_count.unwrap_or(0),
         existing_rows_count: ms_existing_rows_count.unwrap_or(0),
-        delete_rows_count: ms_delete_rows_count.unwrap_or(0),
+        deleted_rows_count: ms_deleted_rows_count.unwrap_or(0),
+        replaced_rows_count: ms_replaced_rows_count.unwrap_or(0),
         min_sequence_number: ms_min_sequence_number.unwrap_or(0),
+        dv: ms_dv.map(Bytes::copy_from_slice),
+        dv_cardinality: ms_dv_cardinality,
     });
 
     // Extract key_metadata
-    let key_metadata: Option<&[u8]> = getters[24].get_opt(row_index, "key_metadata")?;
+    let key_metadata: Option<&[u8]> = getters[28].get_opt(row_index, "key_metadata")?;
     let key_metadata_bytes = key_metadata.map(Bytes::copy_from_slice);
 
     // Note: split_offsets and equality_ids are array types not supported by GetData
-
-    // Extract manifest_dv
-    let manifest_dv: Option<&[u8]> = getters[25].get_opt(row_index, "manifest_dv")?;
-    let manifest_dv_bytes = manifest_dv.map(Bytes::copy_from_slice);
 
     Ok(ContentTreeNodeEntry {
         content_type,
         location,
         file_format,
         tracking,
-        dv_info,
-        partition_spec_id,
+        deletion_vector,
+        spec_id,
         sort_order_id,
         record_count,
         file_size_in_bytes,
         content_stats: None, // Requires table schema to read - not included in base schema
-        manifest_stats,
+        manifest_info,
         key_metadata: key_metadata_bytes,
         split_offsets: None, // Array type not supported by GetData
         equality_ids: None,  // Array type not supported by GetData
-        manifest_dv: manifest_dv_bytes,
     })
 }

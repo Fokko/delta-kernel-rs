@@ -669,7 +669,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
@@ -1575,12 +1575,13 @@ mod tests {
             .find(|f| f.name() == "value")
             .unwrap();
 
-        // Field ID is transformed to kernel key when reading
+        // Field ID is transformed to kernel key when reading. arrow->kernel parses the
+        // `PARQUET:field_id` string back into kernel's canonical `MetadataValue::Number(i64)`.
         assert_eq!(
             field
                 .metadata()
                 .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
-            Some(&"42".into())
+            Some(&MetadataValue::Number(42))
         );
 
         // Field ID should be accessible via documented API
@@ -1602,8 +1603,6 @@ mod tests {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
         let fields = vec![
@@ -1669,9 +1668,12 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        // Verify data was correctly matched by field ID
+        // Verify data was correctly matched by field ID and output uses kernel schema names
         assert_eq!(data.len(), 1);
         let batch = &data[0];
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "user_id");
+        assert_eq!(schema.field(1).name(), "user_name");
 
         let id_col = batch
             .column(0)

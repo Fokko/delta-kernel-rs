@@ -72,9 +72,14 @@ impl Transaction {
             read_version = read_snapshot.version(),
         );
 
+        let effective_table_config = read_snapshot.table_configuration().clone();
+
         Ok(Transaction {
             span,
-            read_snapshot,
+            read_snapshot_opt: Some(read_snapshot),
+            effective_table_config,
+            should_emit_protocol: false,
+            should_emit_metadata: false,
             committer,
             operation: None,
             engine_info: None,
@@ -129,8 +134,13 @@ impl Transaction {
                 "explicit root manifest may only be set once per transaction",
             ));
         }
+        let read_snapshot = self.read_snapshot_opt.as_ref().ok_or_else(|| {
+            Error::invalid_transaction_state(
+                "explicit root manifest requires a snapshot (not valid for CREATE TABLE)",
+            )
+        })?;
         self.explicit_root_manifest_commit =
-            Some(ExplicitRootManifestCommit::new(file, &self.read_snapshot)?);
+            Some(ExplicitRootManifestCommit::new(file, read_snapshot)?);
         Ok(())
     }
 
@@ -292,8 +302,7 @@ impl Transaction {
             ));
         }
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DeletionVectors)
         {
             return Err(Error::unsupported(
@@ -391,11 +400,8 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
-static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(scan_row_schema().as_ref())
-        .unwrap_or_else(|_| panic!("Failed to transform scan_row_schema"))
-        .into()
-});
+static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(scan_row_schema().as_ref()).into());
 
 /// Returns the nullable scan row schema.
 fn nullable_scan_rows_schema() -> &'static SchemaRef {
@@ -408,11 +414,8 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
-static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(restored_add_schema())
-        .unwrap_or_else(|_| panic!("Failed to transform restored_add_schema"))
-        .into()
-});
+static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(restored_add_schema()).into());
 
 /// Returns the nullable restored add action schema.
 fn nullable_restored_add_schema() -> &'static SchemaRef {
@@ -425,11 +428,8 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
-static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(get_log_add_schema())
-        .unwrap_or_else(|_| panic!("Failed to transform nullable_restored_add_schema"))
-        .into()
-});
+static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
 
 /// Returns the schema for nullable restored add actions with dataChange field.
 /// This schema extends the nullable restored add schema with a dataChange boolean field

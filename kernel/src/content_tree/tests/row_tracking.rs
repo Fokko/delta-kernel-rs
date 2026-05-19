@@ -190,18 +190,18 @@ fn test_first_row_id_nonzero_hwm_roundtrip() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Builds a root manifest with CombinedManifest entries, verifies first_row_id
+/// Builds a root manifest with DataManifest entries, verifies first_row_id
 /// assignment uses added_rows_count + existing_rows_count (matching Iceberg's
 /// manifest list first_row_id computation), and survives a parquet round-trip.
 #[test]
 fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
-    use crate::content_tree::ManifestStats;
+    use crate::content_tree::ManifestInfo;
 
     let (engine, mut builder) = setup_engine_and_builder();
 
     // Manifest 1: 100 added + 200 existing = 300 row ID slots
     builder.add_entry(
-        ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+        ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("manifest-a.parquet")
             .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -213,21 +213,25 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
             })
             .record_count(300)
             .file_size_in_bytes(4096)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 2,
                 existing_files_count: 3,
-                deletes_files_count: 0,
+                deleted_files_count: 0,
+                replaced_files_count: 0,
                 added_rows_count: 100,
                 existing_rows_count: 200,
-                delete_rows_count: 0,
+                deleted_rows_count: 0,
+                replaced_rows_count: 0,
                 min_sequence_number: 1,
+                dv: None,
+                dv_cardinality: None,
             })
             .build(),
     );
 
     // Manifest 2: 50 added + 50 existing = 100 row ID slots
     builder.add_entry(
-        ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+        ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("manifest-b.parquet")
             .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -239,14 +243,18 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
             })
             .record_count(100)
             .file_size_in_bytes(2048)
-            .manifest_stats(ManifestStats {
+            .manifest_info(ManifestInfo {
                 added_files_count: 1,
                 existing_files_count: 1,
-                deletes_files_count: 0,
+                deleted_files_count: 0,
+                replaced_files_count: 0,
                 added_rows_count: 50,
                 existing_rows_count: 50,
-                delete_rows_count: 0,
+                deleted_rows_count: 0,
+                replaced_rows_count: 0,
                 min_sequence_number: 1,
+                dv: None,
+                dv_cardinality: None,
             })
             .build(),
     );
@@ -291,7 +299,7 @@ fn test_first_row_id_mixed_existed_and_added_roundtrip() -> DeltaResult<()> {
     let (engine, mut builder) = setup_engine_and_builder();
 
     // Existed file with pre-assigned first_row_id from a previous commit
-    let mut existed_entry = make_data_entry("existed-file.parquet", 100, TrackingStatus::Existed);
+    let mut existed_entry = make_data_entry("existed-file.parquet", 100, TrackingStatus::Existing);
     existed_entry.tracking.first_row_id = Some(500);
     builder.add_entry(existed_entry);
 

@@ -153,7 +153,7 @@ async fn create_dv_table_with_files(
     let add_files_schema = txn.add_files_schema();
 
     // Build metadata for all files at once
-    let files: Vec<(&str, i64, i64, i64)> = file_paths
+    let files: Vec<(&str, i64, i64, Option<i64>)> = file_paths
         .iter()
         .enumerate()
         .map(|(i, &path)| {
@@ -161,7 +161,7 @@ async fn create_dv_table_with_files(
                 path,
                 1024 + i as i64 * 100, // size
                 1000000 + i as i64,    // mod_time
-                3,                     // num_records
+                Some(3),               // num_records
             )
         })
         .collect();
@@ -420,7 +420,7 @@ async fn batch_write_data_and_check_result_and_stats(
         .clone()
         .transaction(committer, engine.as_ref())?
         .with_data_change(true);
-    txn.with_manifest_commit();
+    txn.with_manifest_commit()?;
     append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
         .await
 }
@@ -2273,7 +2273,7 @@ async fn test_manifest_commit_no_add_actions() -> Result<(), Box<dyn std::error:
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("manifest commit test");
-        txn.with_manifest_commit();
+        txn.with_manifest_commit()?;
 
         // Commit without adding any add files
         // Note: manifest_commit flag is currently a placeholder for future metadata tree writing
@@ -2312,7 +2312,7 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("manifest commit test")
             .with_data_change(true);
-        txn.with_manifest_commit();
+        txn.with_manifest_commit()?;
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -3085,7 +3085,7 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
 
         // Conditionally enable manifest commit mode
         if use_manifest_commit {
-            txn.with_manifest_commit();
+            txn.with_manifest_commit()?;
         }
 
         // Create a new scan to get file metadata for removal
@@ -3212,7 +3212,7 @@ async fn remove_files_with_modified_selection_vector_impl(
 
         // Conditionally enable manifest commit mode
         if use_manifest_commit {
-            txn.with_manifest_commit();
+            txn.with_manifest_commit()?;
         }
 
         // First batch: Remove only the first file
@@ -3399,7 +3399,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
             // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
             let mt_engine = create_default_engine_mt_executor(&table_url)?;
-            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
         } else {
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
@@ -3800,7 +3800,7 @@ async fn test_manifest_commit_content_root_detected_in_scan(
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_engine_info("manifest commit test")
             .with_operation("BATCH_COMMIT".to_string());
-        manifest_txn.with_manifest_commit();
+        manifest_txn.with_manifest_commit()?;
 
         // Add data in the manifest commit
         add_files_to_transaction(&mut manifest_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
@@ -3903,7 +3903,7 @@ async fn batch_remove_all_files_impl(
             .with_engine_info("test engine")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
-        txn.with_manifest_commit();
+        txn.with_manifest_commit()?;
 
         let removed =
             remove_all_scan_files(&mut txn, snapshot.scan_builder().build()?, engine.as_ref())?;
@@ -4169,7 +4169,7 @@ async fn test_column_mapping_write(
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
-    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    snapshot_for_checkpoint.checkpoint(engine.as_ref(), None)?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
     let mut all_stats: Vec<_> = add_actions
@@ -4479,7 +4479,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    snapshot.checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -4708,7 +4708,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     )?
     .into_inner();
 
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
     // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when
@@ -5152,7 +5152,7 @@ async fn test_write_stats_for_complex_type_columns(
 
     // Optionally checkpoint to verify stats survive the checkpoint round-trip
     let scan_snapshot = if use_checkpoint {
-        snapshot2.checkpoint(engine.as_ref())?;
+        snapshot2.checkpoint(engine.as_ref(), None)?;
         Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
     } else {
         snapshot2

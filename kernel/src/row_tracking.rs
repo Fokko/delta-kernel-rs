@@ -72,7 +72,6 @@ impl RowTrackingDomainMetadata {
     ///
     /// Sets the high water mark to -1, meaning no rows have been assigned IDs yet.
     /// The first file written will receive `baseRowId = 0`.
-    #[allow(dead_code)]
     pub(crate) fn initial() -> Self {
         Self::new(Self::MISSING_ROW_ID_HIGH_WATERMARK)
     }

@@ -939,7 +939,7 @@ async fn generate_content_root(
 
     // Release root and delta actions (no predicate needed for counting approach)
     let scan = {
-        let mc = txn.with_manifest_commit();
+        let mc = txn.with_manifest_commit().unwrap();
         mc.release_root_and_delta_actions()?
     };
 
@@ -1003,7 +1003,7 @@ fn partition_actions_into_leaves(
     let mut actions_in_current_leaf: usize = 0;
     let mut leaf_count: usize = 0;
 
-    let mc = txn.with_manifest_commit();
+    let mc = txn.with_manifest_commit().unwrap();
 
     // Scan metadata and count actions
     let scan_iter = scan.scan_metadata(engine)?;

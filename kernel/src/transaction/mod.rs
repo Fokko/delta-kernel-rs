@@ -42,7 +42,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version, PRE_COMMIT_VERSION,
+    Version,
 };
 
 mod content_tree;
@@ -69,13 +69,16 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub(crate) mod alter_table;
+pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
+pub(crate) mod schema_evolution;
 mod stats_verifier;
 mod update;
 mod write_context;
 
-use stats_verifier::StatsVerifier;
+use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
@@ -139,6 +142,18 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         .build_arc_unchecked()
 });
 
+/// Cached schema for add files with the `dataChange` field inserted.
+static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
+    let len = fields.len();
+    let insert_position = fields
+        .iter()
+        .position(|f| f.name() == "modificationTime")
+        .unwrap_or(len);
+    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
+    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
+});
+
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
 
@@ -194,6 +209,22 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
+/// Marker type for alter-table (schema evolution) transactions.
+///
+/// Transactions in this state perform metadata-only commits. Data file operations are not
+/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+#[derive(Debug)]
+pub struct AlterTable;
+
+/// Marker trait for transaction states that support data file operations.
+///
+/// Only transaction types that implement this trait can access methods for adding, removing, or
+/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
+/// only perform metadata-only commits.
+pub trait SupportsDataFiles {}
+impl SupportsDataFiles for ExistingTable {}
+impl SupportsDataFiles for CreateTable {}
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -215,9 +246,17 @@ pub struct CreateTable;
 /// ```
 pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
-    // The snapshot this transaction is based on. For create-table transactions,
-    // this is a pre-commit snapshot with PRE_COMMIT_VERSION.
-    read_snapshot: SnapshotRef,
+    // The snapshot this transaction is based on. None for CREATE TABLE (no pre-existing table).
+    // Use `read_snapshot()` to access; it returns an error if None.
+    read_snapshot_opt: Option<SnapshotRef>,
+    // The table configuration that this commit will produce. For writes that don't change the
+    // config, this is cloned from the read snapshot; when the config changes (e.g. schema
+    // evolution), it is constructed separately with the new schema/protocol.
+    effective_table_config: TableConfiguration,
+    // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    should_emit_protocol: bool,
+    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
@@ -271,10 +310,9 @@ pub struct Transaction<S = ExistingTable> {
 
 impl<S> std::fmt::Debug for Transaction<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let version_info = if self.is_create_table() {
-            "create_table".to_string()
-        } else {
-            format!("{}", self.read_snapshot.version())
+        let version_info = match &self.read_snapshot_opt {
+            Some(snap) => format!("{}", snap.version()),
+            None => "create_table".to_string(),
         };
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
@@ -282,6 +320,42 @@ impl<S> std::fmt::Debug for Transaction<S> {
             self.engine_info.is_some()
         ))
     }
+}
+
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON
+/// and setting the `dataChange` field.
+fn build_add_actions<'a, I, T>(
+    engine: &dyn Engine,
+    add_files_metadata: I,
+    input_schema: SchemaRef,
+    output_schema: SchemaRef,
+    data_change: bool,
+) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+where
+    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
+    T: Deref<Target = dyn EngineData> + Send + 'a,
+{
+    let evaluation_handler = engine.evaluation_handler();
+    add_files_metadata.map(move |add_files_batch| {
+        let transform = Expression::transform(
+            Transform::new_top_level()
+                .with_inserted_field(
+                    Some("modificationTime"),
+                    Expression::literal(data_change).into(),
+                )
+                .with_replaced_field(
+                    "stats",
+                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                ),
+        );
+        let adds_expr = Expression::struct_from([transform]);
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(adds_expr),
+            as_log_add_schema(output_schema.clone()).into(),
+        )?;
+        adds_evaluator.evaluate(add_files_batch?.deref())
+    })
 }
 
 // =============================================================================
@@ -344,8 +418,7 @@ impl<S> Transaction<S> {
             && self.data_change
         {
             let cdf_enabled = self
-                .read_snapshot
-                .table_configuration()
+                .effective_table_config
                 .table_properties()
                 .enable_change_data_feed
                 .unwrap_or(false);
@@ -381,19 +454,16 @@ impl<S> Transaction<S> {
         );
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
-        // Step 3: Generate Protocol and Metadata actions for create-table (also for commit
-        // metadata)
-        let (protocol, metadata) = if self.is_create_table() {
-            let table_config = self.read_snapshot.table_configuration();
-            (
-                Some(table_config.protocol().clone()),
-                Some(table_config.metadata().clone()),
-            )
-        } else {
-            (None, None)
-        };
+        // Step 3: Extract P&M values for commit metadata; generate_log_actions handles the actions
+        let protocol = self
+            .should_emit_protocol
+            .then(|| self.effective_table_config.protocol().clone());
+        let metadata = self
+            .should_emit_metadata
+            .then(|| self.effective_table_config.metadata().clone());
 
-        // Step 3b: Get commit version for actions
+        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking
+        // high watermark)
         let commit_version = self.get_commit_version();
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
@@ -448,8 +518,9 @@ impl<S> Transaction<S> {
         {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let bin_boundaries = self
-                    .read_snapshot
-                    .get_file_stats_if_loaded()
+                    .read_snapshot_opt
+                    .as_ref()
+                    .and_then(|snap| snap.get_file_stats_if_loaded())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_delta = self.build_crc_delta(
@@ -504,10 +575,10 @@ impl<S> Transaction<S> {
                 "explicit root manifest commit cannot include deletion vector updates"
             )
         );
-        let table_root = self.read_snapshot.table_root();
+        let table_root = self.effective_table_config.table_root();
         let path =
             crate::content_tree::absolute_to_relative_path(&explicit.file.location, table_root);
-        let table_config = self.read_snapshot.table_configuration();
+        let table_config = &self.effective_table_config;
         let checkpoint_action = CheckpointAction {
             version: commit_version,
             content_root: ContentRoot {
@@ -542,9 +613,9 @@ impl<S> Transaction<S> {
         let mut actions_vec =
             vec![commit_info_action.map(FilteredEngineData::with_all_rows_selected)];
 
-        // For create-table: add Protocol and Metadata actions after commit info
-        if self.is_create_table() {
-            let table_config = self.read_snapshot.table_configuration();
+        // For create-table or alter-table: add Protocol and Metadata actions after commit info
+        if self.should_emit_protocol || self.should_emit_metadata {
+            let table_config = &self.effective_table_config;
             let protocol = table_config.protocol().clone();
             let metadata = table_config.metadata().clone();
 
@@ -568,15 +639,14 @@ impl<S> Transaction<S> {
                 metadata_data,
             )));
 
-            // Generate Iceberg metadata.json for CREATE TABLE without data (schema only).
-            // CTAS (create table with data) skips this — its metadata.json is generated
-            // in the manifest commit block with a proper snapshot.
+            // Generate Iceberg metadata.json for empty CREATE TABLE (schema only, no snapshot).
+            // Skip when manifest commit will run — it generates metadata.json with a snapshot.
             #[cfg(feature = "iceberg-nativev4")]
-            if has_iceberg_native_v4 && self.add_files_metadata.is_empty() {
+            if has_iceberg_native_v4 && self.is_create_table() && !self.is_manifest_commit() {
                 let result = crate::iceberg_metadata::generate_iceberg_metadata_for_create_table(
                     engine,
-                    self.read_snapshot.table_root(),
-                    self.read_snapshot.version().wrapping_add(1),
+                    self.effective_table_config.table_root(),
+                    commit_version,
                     &metadata_for_iceberg,
                 )?;
                 info!(
@@ -611,10 +681,7 @@ impl<S> Transaction<S> {
         } else if self.is_manifest_commit() {
             // Handle manifest commit - write to metadata tree
             // Content metadata trees require column mapping mode to be ID for stable field IDs
-            let column_mapping_mode = self
-                .read_snapshot
-                .table_configuration()
-                .column_mapping_mode();
+            let column_mapping_mode = self.effective_table_config.column_mapping_mode();
             require!(
                 column_mapping_mode == crate::table_features::ColumnMappingMode::Id,
                 Error::generic(format!(
@@ -623,7 +690,11 @@ impl<S> Transaction<S> {
             );
 
             // Get the cached checkpoint action from the snapshot (no I/O needed)
-            let latest_checkpoint_action = self.read_snapshot.checkpoint_action().cloned();
+            let latest_checkpoint_action = self
+                .read_snapshot_opt
+                .as_ref()
+                .and_then(|snap| snap.checkpoint_action())
+                .cloned();
 
             // Removes in manifest commit mode require an existing checkpoint action so that every
             // file carries a data_manifest_path and data_manifest_position (row ID).
@@ -637,87 +708,56 @@ impl<S> Transaction<S> {
                 ));
             }
 
-            let table_schema = self.read_snapshot.schema().as_ref().clone();
+            let table_schema = self
+                .effective_table_config
+                .logical_schema()
+                .as_ref()
+                .clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
             let physical_table_schema = table_schema.make_physical(column_mapping_mode)?;
-            let table_root = self.read_snapshot.table_root().clone();
-            let current_version = self.read_snapshot.version();
 
-            // Load existing metadata and determine the version from which to replay delta log
-            let (mut metadata_builder, root_manifest_path, replay_from_version) =
-                if let Some(checkpoint_action) = latest_checkpoint_action {
-                    // Load metadata from content root directly into the builder
-                    let root_path = checkpoint_action.content_root.path.clone();
-                    let builder =
-                        crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
-                            engine,
-                            &checkpoint_action.content_root,
-                            table_root.clone(),
-                            physical_table_schema.clone(),
-                            commit_version,
-                        )?;
-                    // Replay delta log from the version after the checkpoint action
-                    (builder, Some(root_path), checkpoint_action.version + 1)
-                } else {
-                    // No checkpoint action found, start with empty metadata
-                    // Use commit_version for the new metadata, not the current snapshot version
-                    let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
-                        table_root.clone(),
-                        commit_version,
-                        physical_table_schema.clone(),
-                    );
-                    // Replay all delta log commits from the beginning
-                    (builder, None, 0)
-                };
-
-            // If root was released to client control, clear all root data and DV entries
-            // The client will add them back via leaf manifests
-            if self
-                .manifest_commit_state
+            let root_manifest_path = latest_checkpoint_action
                 .as_ref()
-                .is_some_and(|b| b.root_released)
-            {
-                metadata_builder.clear_root_data_and_dv_entries();
+                .map(|ca| ca.content_root.path.clone());
 
-                // TODO: Process incremental removes from delta log and mark them as DELETED
-                // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the checkpoint action version
-                // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
-                // 3. Calling metadata_builder.delete_from_leaf() for each removed file
-                // This is deferred to future work as it requires a new delta log processor.
-            } else if replay_from_version <= current_version {
-                // Root not released: replay delta log commits to add incremental changes
-                // Create a scan of just root + delta log (skip leaves to avoid duplicates)
-                let scan = crate::scan::ScanBuilder::new(self.read_snapshot.clone())
-                    .skip_leaf_manifests(true)
-                    .build()?;
-                let scan_metadata_iter = scan.scan_metadata(engine)?;
-
-                for scan_metadata_result in scan_metadata_iter {
-                    let scan_metadata = scan_metadata_result?;
-                    let engine_data = scan_metadata.scan_files.data();
-
-                    // Add incremental actions from delta log to the metadata builder
-                    // TODO: When replaying, we should preserve original sequence_numbers from the
-                    // files' tracking instead of using current_version. This would require
-                    // extracting sequence_number from the scan data and passing it through.
-                    metadata_builder.add_from_scan_row_data(
-                        engine_data,
-                        current_version,
-                        snapshot_id,
-                    )?;
-                }
-            }
+            let temp_mcs;
+            let manifest_commit_state = if let Some(mcs) = &self.manifest_commit_state {
+                mcs
+            } else {
+                // Auto-construct ManifestCommitState when IcebergV4 forces manifest commit mode
+                // without an explicit with_manifest_commit() call. For CREATE TABLE
+                // (read_snapshot_opt is None), build a pre-commit snapshot from
+                // effective_table_config.
+                let snap = if let Some(s) = self.read_snapshot_opt.as_ref() {
+                    s.clone()
+                } else {
+                    let table_root = self.effective_table_config.table_root().clone();
+                    let log_root = table_root.join("_delta_log/").map_err(|e| {
+                        Error::generic(format!("failed to build log root URL: {e}"))
+                    })?;
+                    let log_segment = LogSegment::for_pre_commit(table_root, log_root);
+                    Arc::new(Snapshot::new_with_crc(
+                        log_segment,
+                        self.effective_table_config.clone(),
+                        Arc::new(LazyCrc::new(None)),
+                    ))
+                };
+                temp_mcs = ManifestCommitState::new(commit_version, snapshot_id, snap);
+                &temp_mcs
+            };
+            let mut metadata_builder =
+                manifest_commit_state.initialize_content_root_builder(engine)?;
 
             for add_metadata_result in self.add_files_metadata.iter() {
                 // Pre-convert stats from Delta JSON format to AMT struct format at batch level
-                let converted = crate::content_tree::stats::try_pre_convert_stats_column(
-                    engine,
-                    add_metadata_result.as_ref(),
-                    "stats",
-                    &physical_table_schema,
-                    &BASE_ADD_FILES_SCHEMA,
-                )?;
+                let converted: Option<Box<dyn EngineData>> =
+                    crate::content_tree::stats::try_pre_convert_stats_column(
+                        engine,
+                        add_metadata_result.as_ref(),
+                        "stats",
+                        &physical_table_schema,
+                        &BASE_ADD_FILES_SCHEMA,
+                    )?;
                 let data: &dyn EngineData = match &converted {
                     Some(c) => c.as_ref(),
                     None => add_metadata_result.as_ref(),
@@ -771,21 +811,15 @@ impl<S> Transaction<S> {
             } = ContentTreeNodeWriter::try_new(root_node)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
-                self.read_snapshot.table_root(),
+                self.effective_table_config.table_root(),
             );
 
             // Invariant: the checkpoint action's nested P+M must reflect the table state
             // at checkpoint.version. Currently checkpoint.version == commit_version, and
-            // manifest commits have no API to change P+M, so read_snapshot P+M (at N-1)
-            // equals commit P+M (at N). When P+M mutation is added to manifest commits,
-            // the resolved (post-mutation) P+M must be used here instead.
-            //
-            // wrapping_add handles the CREATE TABLE case where read_snapshot.version()
-            // is PRE_COMMIT_VERSION (u64::MAX), which wraps to 0 (the first commit).
-            let new_commit_version = self.read_snapshot.version().wrapping_add(1);
-            let table_config = self.read_snapshot.table_configuration();
+            // manifest commits have no API to change P+M, so effective P+M equals commit P+M.
+            let table_config = &self.effective_table_config;
             let checkpoint_action = CheckpointAction {
-                version: new_commit_version,
+                version: commit_version,
                 content_root: ContentRoot {
                     path,
                     size_in_bytes,
@@ -798,7 +832,7 @@ impl<S> Transaction<S> {
             self.maybe_generate_iceberg_metadata(
                 engine,
                 table_config,
-                new_commit_version,
+                commit_version,
                 snapshot_id,
                 &checkpoint_action,
                 &mut actions_vec,
@@ -853,8 +887,11 @@ impl<S> Transaction<S> {
             self.is_blind_append,
         );
         let previous_domain = self
-            .read_snapshot
-            .get_domain_metadata(ICEBERG_METADATA_DOMAIN, engine)?
+            .read_snapshot_opt
+            .as_ref()
+            .map(|snap| snap.get_domain_metadata(ICEBERG_METADATA_DOMAIN, engine))
+            .transpose()?
+            .flatten()
             .map(|config| serde_json::from_str::<IcebergMetadataDomain>(&config))
             .transpose()
             .map_err(|e| {
@@ -865,7 +902,7 @@ impl<S> Transaction<S> {
 
         let result = crate::iceberg_metadata::generate_iceberg_metadata(
             engine,
-            self.read_snapshot.table_root(),
+            self.effective_table_config.table_root(),
             commit_version,
             table_config.metadata(),
             &commit_info,
@@ -913,6 +950,9 @@ impl<S> Transaction<S> {
     ///
     /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
+    /// This method works for both existing-table and CREATE TABLE transactions. For CREATE TABLE,
+    /// the content tree starts empty (no prior checkpoint or log to replay).
+    ///
     /// The returned `&mut ManifestCommitState` provides tree-manipulation methods
     /// ([`ManifestCommitState::release_root_and_delta_actions`],
     /// [`ManifestCommitState::new_leaf_node_writer`], [`ManifestCommitState::add_leaf`]). Drop
@@ -929,7 +969,7 @@ impl<S> Transaction<S> {
     ///     .with_data_change(true);
     ///
     /// {
-    ///     let mc = txn.with_manifest_commit();
+    ///     let mc = txn.with_manifest_commit()?;
     ///     let scan = mc.release_root_and_delta_actions()?;
     ///     // ...process scan...
     ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
@@ -939,14 +979,29 @@ impl<S> Transaction<S> {
     ///
     /// txn.commit(engine)?;
     /// ```
-    pub fn with_manifest_commit(&mut self) -> &mut ManifestCommitState {
-        self.manifest_commit_state.get_or_insert_with(|| {
-            ManifestCommitState::new(
-                self.read_snapshot.version().wrapping_add(1),
-                self.snapshot_id,
-                self.read_snapshot.clone(),
-            )
-        })
+    pub fn with_manifest_commit(&mut self) -> DeltaResult<&mut ManifestCommitState> {
+        let commit_version = self.get_commit_version();
+        let snapshot_id = self.snapshot_id;
+        // For an existing-table transaction, use the read snapshot directly.
+        // For a CREATE TABLE transaction (read_snapshot_opt is None), build a pre-commit snapshot
+        // from effective_table_config so that ManifestCommitState can operate on an empty table.
+        let snap = if let Some(s) = self.read_snapshot_opt.clone() {
+            s
+        } else {
+            let table_root = self.effective_table_config.table_root().clone();
+            let log_root = table_root
+                .join("_delta_log/")
+                .map_err(|e| Error::generic(format!("failed to build log root URL: {e}")))?;
+            let log_segment = LogSegment::for_pre_commit(table_root, log_root);
+            Arc::new(Snapshot::new_with_crc(
+                log_segment,
+                self.effective_table_config.clone(),
+                Arc::new(LazyCrc::new(None)),
+            ))
+        };
+        Ok(self
+            .manifest_commit_state
+            .get_or_insert_with(|| ManifestCommitState::new(commit_version, snapshot_id, snap)))
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -1056,19 +1111,23 @@ impl<S> Transaction<S> {
         new_metadata: Option<Metadata>,
         domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
     ) -> DeltaResult<CommitMetadata> {
-        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let table_config = self.read_snapshot.table_configuration();
+        let log_root = LogRoot::new(self.effective_table_config.table_root().clone())?;
         let is_create = self.is_create_table();
-        let commit_type = Self::determine_commit_type(is_create, table_config);
+        let commit_type = Self::determine_commit_type(is_create, &self.effective_table_config);
         Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
-        // For create-table: read P&M is None (no previous table), new P&M is set.
-        // For existing table: read P&M is from the snapshot, new P&M is None.
-        let (read_protocol, read_metadata) = if is_create {
-            (None, None)
+        // For create-table: previous P&M is None (no prior table), new P&M is set.
+        // For existing table with metadata change: previous P&M is from snapshot, new P&M
+        // is from effective config.
+        // For existing table without metadata change: previous P&M is from snapshot, new is None.
+        let (read_protocol, read_metadata, max_published_version) = if is_create {
+            (None, None, None)
         } else {
+            let snap = self.read_snapshot()?;
+            let read_config = snap.table_configuration();
             (
-                Some(table_config.protocol().clone()),
-                Some(table_config.metadata().clone()),
+                Some(read_config.protocol().clone()),
+                Some(read_config.metadata().clone()),
+                snap.log_segment().listed.max_published_version,
             )
         };
         let protocol_metadata = CommitProtocolMetadata::try_new(
@@ -1082,10 +1141,7 @@ impl<S> Transaction<S> {
             commit_version,
             commit_type,
             in_commit_timestamp.unwrap_or(self.commit_timestamp),
-            self.read_snapshot
-                .log_segment()
-                .listed
-                .max_published_version,
+            max_published_version,
             protocol_metadata,
             domain_metadata_changes,
         ))
@@ -1127,15 +1183,21 @@ impl<S> Transaction<S> {
     }
 
     /// Returns true if this is a create-table transaction.
-    /// A create-table transaction has operation "CREATE TABLE" and a pre-commit snapshot
-    /// with PRE_COMMIT_VERSION.
+    /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
-        let is_create = self.operation.as_deref() == Some("CREATE TABLE");
         debug_assert!(
-            !is_create || self.read_snapshot.version() == PRE_COMMIT_VERSION,
-            "CREATE TABLE transaction must have PRE_COMMIT_VERSION snapshot"
+            self.operation.as_deref() != Some("CREATE TABLE") || self.read_snapshot_opt.is_none(),
+            "CREATE TABLE operation should not have a read snapshot"
         );
-        is_create
+        self.read_snapshot_opt.is_none()
+    }
+
+    // Returns the read snapshot. Returns an error if this is a create-table transaction.
+    // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
+    fn read_snapshot(&self) -> DeltaResult<&Snapshot> {
+        self.read_snapshot_opt.as_deref().ok_or_else(|| {
+            Error::internal_error("read_snapshot() called on create-table transaction")
+        })
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
@@ -1144,8 +1206,7 @@ impl<S> Transaction<S> {
     /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         let has_ict = self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_enabled(&TableFeature::InCommitTimestamp);
 
         if !has_ict {
@@ -1162,17 +1223,19 @@ impl<S> Transaction<S> {
         // - The time at which the writer attempted the commit
         // - One millisecond later than the previous commit's inCommitTimestamp
         Ok(self
-            .read_snapshot
+            .read_snapshot()?
             .get_in_commit_timestamp(engine)?
             .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
     /// For existing table transactions, this is snapshot.version() + 1.
-    /// For create-table transactions (PRE_COMMIT_VERSION + 1 wraps to 0), this is 0.
+    /// For create-table transactions, this is 0.
     fn get_commit_version(&self) -> Version {
-        // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
-        self.read_snapshot.version().wrapping_add(1)
+        match &self.read_snapshot_opt {
+            Some(snap) => snap.version() + 1,
+            None => 0,
+        }
     }
 
     /// Returns true if either manifest commit mode has been configured on this transaction.
@@ -1186,8 +1249,7 @@ impl<S> Transaction<S> {
     ///   present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
     fn is_manifest_commit(&self) -> bool {
-        let table_config = self.read_snapshot.table_configuration();
-        let protocol = table_config.protocol();
+        let protocol = self.effective_table_config.protocol();
         let explicitly_requested = self.has_manifest_commit_state()
             && protocol
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
@@ -1208,14 +1270,11 @@ impl<S> Transaction<S> {
             || !self.remove_files_metadata.is_empty()
             || !leaf_manifests_empty
             || self.explicit_root_manifest_commit.is_some()
-            || self
-                .read_snapshot
-                .checkpoint_action()
-                // PRE_COMMIT_VERSION (u64::MAX) should not count as "version > 0"
-                .map_or(
-                    !self.is_create_table() && self.read_snapshot.version() > 0,
-                    |ca| ca.version < self.read_snapshot.version(),
-                );
+            || self.read_snapshot_opt.as_ref().is_some_and(|snap| {
+                snap.checkpoint_action()
+                    // PRE_COMMIT_VERSION (u64::MAX) should not count as "version > 0"
+                    .map_or(snap.version() > 0, |ca| ca.version < snap.version())
+            });
         can_manifest_commit && has_work_to_do
     }
 
@@ -1241,9 +1300,11 @@ impl<S> Transaction<S> {
             .map(|mc| mc.row_id_cursor)
         {
             cursor
-        } else {
-            let hwm = RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+        } else if let Some(read_snapshot) = self.read_snapshot_opt.as_deref() {
+            let hwm = RowTrackingDomainMetadata::get_high_water_mark(read_snapshot, engine)?;
             hwm.unwrap_or(-1) + 1
+        } else {
+            0
         };
 
         let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
@@ -1284,7 +1345,12 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+}
 
+// =============================================================================
+// Data file methods -- only available on transaction types that support data files
+// =============================================================================
+impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -1310,9 +1376,9 @@ impl<S> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let tc = self.read_snapshot.table_configuration();
-        let stats_schemas =
-            tc.build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?;
+        let stats_schemas = self
+            .effective_table_config
+            .build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -1329,28 +1395,22 @@ impl<S> Transaction<S> {
     /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
     #[allow(unused)]
     pub fn stats_columns(&self) -> Vec<ColumnName> {
-        self.read_snapshot
-            .table_configuration()
+        self.effective_table_config
             .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
-        // Check if materializePartitionColumns feature is enabled
-        let materialize_partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+        let partition_cols = self.effective_table_config.partition_columns().to_vec();
+        // Check if partition columns should be materialized into data files.
+        let should_materialize_partition_columns = self
+            .effective_table_config
+            .should_materialize_partition_columns();
         // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+        // (unless they should be materialized).
         let mut transform = Transform::new_top_level();
-        if !materialize_partition_columns {
+        if !should_materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }
@@ -1360,16 +1420,16 @@ impl<S> Transaction<S> {
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
-        self.read_snapshot.table_configuration().partition_columns()
+        self.effective_table_config.partition_columns()
     }
 
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
-            let table_config = self.read_snapshot.table_configuration();
+            let table_config = &self.effective_table_config;
             Arc::new(SharedWriteState {
-                table_root: self.read_snapshot.table_root().clone(),
-                logical_schema: self.read_snapshot.schema(),
+                table_root: table_config.table_root().clone(),
+                logical_schema: table_config.logical_schema(),
                 physical_schema: table_config.physical_write_schema(),
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
                 column_mapping_mode: table_config.column_mapping_mode(),
@@ -1394,7 +1454,10 @@ impl<S> Transaction<S> {
     /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
     ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
     ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
-    ///   Null scalars skip the value type check (null is valid for any primitive partition column).
+    ///   Null-equivalent scalars (null scalars, empty strings, and empty binary) all of which
+    ///   collapse to JSON null in `partitionValues`) skip the value type check, but they are only
+    ///   legal when the partition column is nullable; passing any of these for a `nullable: false`
+    ///   partition column returns an error.
     ///
     /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
     ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`
@@ -1482,21 +1545,38 @@ impl<S> Transaction<S> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
+}
 
-    /// Validate that add files have required statistics for clustering columns.
+// =============================================================================
+// Internal methods available on ALL transaction types (used by commit path)
+// =============================================================================
+impl<S> Transaction<S> {
+    /// Validate that add files carry the per-file statistics required by the table's protocol.
     ///
-    /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
-    /// when the `ClusteredTable` feature is enabled. Other stat columns (e.g. the conventional
-    /// "first 32 columns") are not validated here because they are not protocol-required.
+    /// Currently checks two protocol requirements:
+    /// - `stats.numRecords` must be present when [`requires_stats_num_records`] returns true.
+    /// - Per-file min/max/nullCount must be present for clustering columns when the
+    ///   `ClusteredTable` feature is enabled.
     ///
-    /// Only add files are validated — remove files do not carry statistics.
+    /// Other stat columns (e.g. the conventional "first 32 columns") are not validated here
+    /// because they are not protocol-required.
+    ///
+    /// Only add files are validated(remove files do not carry statistics).
+    ///
+    /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
     fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
+        if self.effective_table_config.requires_stats_num_records() {
+            // TODO: Likely it's better to merge this with the clustering column validation below,
+            // benchmark it and see if it's faster. If so, refactor this to do both validations in
+            // one pass.
+            stats_verifier::verify_num_records_present(add_files)?;
+        }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
-                let physical_schema = self.read_snapshot.table_configuration().physical_schema();
+                let physical_schema = self.effective_table_config.physical_schema();
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                     .iter()
                     .map(|col| {
@@ -1512,14 +1592,14 @@ impl<S> Transaction<S> {
                         Ok((col.clone(), data_type))
                     })
                     .collect::<DeltaResult<_>>()?;
-                let verifier = StatsVerifier::new(columns_with_types);
+                let verifier = StatsColumnVerifier::new(columns_with_types);
                 verifier.verify(add_files)?;
             }
         }
         Ok(())
     }
 
-    /// Generate add actions, handling row tracking internally if needed
+    /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
@@ -1529,52 +1609,16 @@ impl<S> Transaction<S> {
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
-        fn build_add_actions<'a, I, T>(
-            engine: &dyn Engine,
-            add_files_metadata: I,
-            input_schema: SchemaRef,
-            output_schema: SchemaRef,
-            data_change: bool,
-        ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
-        where
-            I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-            T: Deref<Target = dyn EngineData> + Send + 'a,
-        {
-            let evaluation_handler = engine.evaluation_handler();
-
-            add_files_metadata.map(move |add_files_batch| {
-                // Convert stats to a JSON string and nest the add action in a top-level struct
-                let transform = Expression::transform(
-                    Transform::new_top_level()
-                        .with_inserted_field(
-                            Some("modificationTime"),
-                            Expression::literal(data_change).into(),
-                        )
-                        .with_replaced_field(
-                            "stats",
-                            Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                        ),
-                );
-                let adds_expr = Expression::struct_from([transform]);
-                let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                    input_schema.clone(),
-                    Arc::new(adds_expr),
-                    as_log_add_schema(output_schema.clone()).into(),
-                )?;
-                adds_evaluator.evaluate(add_files_batch?.deref())
-            })
-        }
-
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
+        // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
+        // for writers to assign row IDs.
+        let row_tracking_supported = self.effective_table_config.should_write_row_tracking();
 
         if self.add_files_metadata.is_empty() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
-            // have a valid starting point.
-            let row_tracking_dm = (needs_row_tracking && self.is_create_table())
+            // have a valid starting point. For all other empty commits (metadata-only, etc.),
+            // nothing row-tracking-related needs to be written.
+            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
@@ -1582,64 +1626,9 @@ impl<S> Transaction<S> {
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        if needs_row_tracking {
-            // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-            let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-
-            // Create a row tracking visitor and visit all files to collect row tracking information
-            let mut row_tracking_visitor = RowTrackingVisitor::new(
-                row_id_high_water_mark,
-                Some(self.add_files_metadata.len()),
-            );
-
-            // We visit all files with the row visitor before creating the add action iterator
-            // because we need to know the final row ID high water mark to create the domain
-            // metadata action
-            for add_files_batch in &self.add_files_metadata {
-                row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
-            }
-
-            // Deconstruct the row tracking visitor to avoid borrowing issues
-            let RowTrackingVisitor {
-                base_row_id_batches,
-                row_id_high_water_mark,
-            } = row_tracking_visitor;
-
-            // Create extended add files with row tracking columns
-            let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
-                move |(add_files_batch, base_row_ids)| {
-                    let commit_versions = vec![commit_version; base_row_ids.len()];
-                    let base_row_ids_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
-                    let commit_versions_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
-
-                    add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
-                        vec![base_row_ids_array, commit_versions_array],
-                    )
-                },
-            );
-
-            // Generate add actions including row tracking metadata
-            let add_actions = build_add_actions(
-                engine,
-                extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
-                with_row_tracking_cols(&with_stats_col(&with_data_change_col(
-                    self.add_files_schema(),
-                ))),
-                self.data_change,
-            );
-
-            // Generate a row tracking domain metadata based on the final high water mark
-            let row_tracking_domain_metadata: RowTrackingDomainMetadata =
-                RowTrackingDomainMetadata::new(row_id_high_water_mark);
-
-            Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
+        if row_tracking_supported {
+            self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
-            // Simple case without row tracking
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
@@ -1647,9 +1636,78 @@ impl<S> Transaction<S> {
                 with_stats_col(&with_data_change_col(self.add_files_schema())),
                 self.data_change,
             );
-
             Ok((Box::new(add_actions), None))
         }
+    }
+
+    /// Generates add actions with row tracking columns and the row ID high water mark
+    /// domain metadata.
+    ///
+    /// Visits all add file batches once to read `numRecords` per file, assigning a unique
+    /// non-overlapping `baseRowId` range to each file and computing the final high water mark
+    /// for the domain metadata action. The initial high water mark is read from the snapshot
+    /// for existing tables, or defaults to -1 for create-table (no prior log to read from).
+    fn generate_adds_with_row_tracking<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        commit_version: i64,
+    ) -> DeltaResult<(
+        EngineDataResultIterator<'a>,
+        Option<RowTrackingDomainMetadata>,
+    )> {
+        let row_id_high_water_mark = if self.is_create_table() {
+            None
+        } else {
+            RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
+        };
+
+        // Create a row tracking visitor and visit all files to collect row tracking information
+        let mut row_tracking_visitor =
+            RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
+
+        // We visit all files with the row visitor before creating the add action iterator because
+        // we need to know the final row ID high water mark to create the domain metadata action.
+        for add_files_batch in &self.add_files_metadata {
+            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+        }
+
+        // Destructure the visitor to move base_row_id_batches into the add-files iterator
+        // while also extracting the final high water mark for the domain metadata action.
+        let RowTrackingVisitor {
+            base_row_id_batches,
+            row_id_high_water_mark,
+        } = row_tracking_visitor;
+
+        // Create extended add files with row tracking columns
+        let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
+            move |(add_files_batch, base_row_ids)| {
+                let commit_versions = vec![commit_version; base_row_ids.len()];
+                let base_row_ids_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
+                let commit_versions_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
+
+                add_files_batch.append_columns(
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    vec![base_row_ids_array, commit_versions_array],
+                )
+            },
+        );
+
+        // Generate add actions including row tracking metadata
+        let add_actions = build_add_actions(
+            engine,
+            extended_add_files,
+            with_row_tracking_cols(self.add_files_schema()),
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            self.data_change,
+        );
+
+        // Generate a row tracking domain metadata based on the final high water mark
+        let row_tracking_domain_metadata: RowTrackingDomainMetadata =
+            RowTrackingDomainMetadata::new(row_id_high_water_mark);
+
+        Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
     }
 
     fn into_committed(
@@ -1660,51 +1718,51 @@ impl<S> Transaction<S> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
         let commit_version = parsed_commit.version;
 
-        let (post_commit_stats, post_commit_snapshot) = if self.is_create_table() {
-            // CREATE TABLE: the pre-commit log segment has end_version = PRE_COMMIT_VERSION
-            // (u64::MAX) so commits_since_checkpoint() would overflow, and new_post_commit can't
-            // chain the CRC because the pre-commit snapshot has no loaded CRC. Build a fresh
-            // snapshot and CRC at version 0 instead.
-            let log_root = self.read_snapshot.table_root().join("_delta_log/")?;
-            let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-            let crc = crc_delta.into_crc_for_version_zero().ok_or_else(|| {
-                Error::internal_error(
-                    "CREATE TABLE CRC delta is missing required protocol or metadata",
-                )
-            })?;
-            let table_config = TableConfiguration::new_post_commit(
-                self.read_snapshot.table_configuration(),
-                0,
-                Some(crc.metadata.clone()),
-                Some(crc.protocol.clone()),
-            )?;
-            let snapshot = Snapshot::new_with_crc(
-                log_segment,
-                table_config,
-                Arc::new(LazyCrc::new_precomputed(crc, 0)),
-            );
-            let stats = PostCommitStats {
-                commits_since_checkpoint: 1,
-                commits_since_log_compaction: 1,
-            };
-            (stats, Arc::new(snapshot))
-        } else {
-            let stats = PostCommitStats {
-                commits_since_checkpoint: self
-                    .read_snapshot
-                    .log_segment()
-                    .commits_since_checkpoint()
-                    + 1,
-                commits_since_log_compaction: self
-                    .read_snapshot
-                    .log_segment()
-                    .commits_since_log_compaction_or_checkpoint()
-                    + 1,
-            };
-            let snapshot = self
-                .read_snapshot
-                .new_post_commit(parsed_commit, crc_delta)?;
-            (stats, Arc::new(snapshot))
+        let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
+            Some(snap) => {
+                // Existing table path: use the read snapshot to compute post-commit state.
+                let stats = PostCommitStats {
+                    commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
+                    commits_since_log_compaction: snap
+                        .log_segment()
+                        .commits_since_log_compaction_or_checkpoint()
+                        + 1,
+                };
+                let snapshot = snap.new_post_commit(parsed_commit, crc_delta)?;
+                (stats, Arc::new(snapshot))
+            }
+            None => {
+                // CREATE TABLE path: build a fresh Snapshot at version 0.
+                let log_root = self
+                    .effective_table_config
+                    .table_root()
+                    .join("_delta_log/")?;
+                let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
+                let crc = crc_delta.into_crc_for_version_zero().ok_or_else(|| {
+                    Error::internal_error(
+                        "CREATE TABLE CRC delta is missing required protocol or metadata",
+                    )
+                })?;
+                let stats = PostCommitStats {
+                    commits_since_checkpoint: 1,
+                    commits_since_log_compaction: 1,
+                };
+                // The effective_table_config was constructed with PRE_COMMIT_VERSION; update
+                // the version to match the committed version (0 for create-table).
+                let table_config = TableConfiguration::try_new_from(
+                    &self.effective_table_config,
+                    None,
+                    None,
+                    None,
+                    commit_version,
+                )?;
+                let snapshot = Snapshot::new_with_crc(
+                    log_segment,
+                    table_config,
+                    Arc::new(LazyCrc::new_precomputed(crc, 0)),
+                );
+                (stats, Arc::new(snapshot))
+            }
         };
 
         Ok(CommittedTransaction {
@@ -1726,13 +1784,14 @@ impl<S> Transaction<S> {
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
-        let is_create = self.is_create_table();
         Ok(CrcDelta {
             file_stats,
-            protocol: is_create
-                .then(|| self.read_snapshot.table_configuration().protocol().clone()),
-            metadata: is_create
-                .then(|| self.read_snapshot.table_configuration().metadata().clone()),
+            protocol: self
+                .should_emit_protocol
+                .then(|| self.effective_table_config.protocol().clone()),
+            metadata: self
+                .should_emit_metadata
+                .then(|| self.effective_table_config.metadata().clone()),
             domain_metadata_changes: dm_changes,
             set_transaction_changes: self.set_transactions.clone(),
             in_commit_timestamp,
@@ -1791,7 +1850,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
@@ -1812,7 +1871,7 @@ impl<S> Transaction<S> {
         // Build two evaluators: one for the common case where scan files do not include a
         // stats_parsed column, and one for predicate-based scans that include stats_parsed.
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
-        // case where stats is null (e.g., when writeStatsAsJson=false was used) and then drops
+        // case where stats is null (e.g., when skip_stats=true was used) and then drops
         // the stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
@@ -1836,13 +1895,15 @@ impl<S> Transaction<S> {
 
 /// Builds the transform expression for converting scan row metadata into a Remove action.
 ///
-/// When `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
-/// `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. This handles
-/// scan files produced by scans that include a `stats_parsed` column: if `stats` is null
-/// (e.g., because a checkpoint was written with `writeStatsAsJson=false`), the stats are
-/// reconstructed from the parsed representation before writing the remove action.
+/// Handles two "parsed" columns that predicate-based scans add to scan metadata:
 ///
-/// When false, `stats` passes through unchanged and no `stats_parsed` drop is applied.
+/// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
+///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
+///   cases where `stats` is null (e.g., `skip_stats=true` or V2 checkpoints with
+///   `writeStatsAsJson=false`) by reconstructing the JSON from the parsed representation.
+/// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
+///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
+///   scans always populate from `add.partitionValues`.
 fn build_remove_transform(
     commit_timestamp: i64,
     data_change: bool,
@@ -1973,6 +2034,18 @@ impl<S: std::fmt::Debug> CommitResult<S> {
             other => panic!("Expected CommittedTransaction, got: {other:?}"),
         }
     }
+
+    /// Unwraps the post-commit snapshot of the [`CommittedTransaction`], panicking if the
+    /// commit was not successful or the post-commit snapshot is missing.
+    /// TODO(#2494): Refactor existing tests to use this.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn unwrap_post_commit_snapshot(self) -> SnapshotRef {
+        self.unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone()
+    }
 }
 
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
@@ -2064,7 +2137,7 @@ mod tests {
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::content_tree::builder::ContentTreeNodeBuilder;
     use crate::content_tree::writer::ContentTreeNodeWriter;
-    use crate::content_tree::{ContentTreeNode, DataContentType};
+    use crate::content_tree::{parse_or_join_url, ContentTreeNode, DataContentType};
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -2274,7 +2347,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
 
         // Verify manifest commit state is initialized
         assert!(txn.has_manifest_commit_state());
@@ -2297,11 +2370,11 @@ mod tests {
             .with_engine_info("test engine");
 
         // First call creates manifest commit state; mutate it to confirm state is preserved
-        txn.with_manifest_commit().root_released = true;
+        txn.with_manifest_commit().unwrap().root_released = true;
 
         // Second call must return the same ManifestCommitState without reinitializing it
         assert!(
-            txn.with_manifest_commit().root_released,
+            txn.with_manifest_commit().unwrap().root_released,
             "second call to with_manifest_commit should preserve existing state"
         );
         Ok(())
@@ -2626,7 +2699,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }
@@ -2766,7 +2839,7 @@ mod tests {
 
     // Note: Additional test coverage for partial file matching (where some files in a scan
     // have DV updates but others don't) is provided by the end-to-end integration test
-    // kernel/tests/dv.rs and kernel/tests/write.rs, which exercises
+    // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     /// Helper to create an initial Delta table with Protocol and Metadata (version 0)
@@ -2995,7 +3068,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
 
         // Remove file at row index 2 within the scan batch
         // With batched EngineData creation, all files are now in a single batch
@@ -3079,7 +3152,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
 
         let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
         if let Some(res) = scan_metadata_iter.next() {
@@ -3194,7 +3267,7 @@ mod tests {
         let data_leaf_entry =
             data_leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
 
-        // In the new CombinedManifest model, DV info is inline on Data entries.
+        // DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
@@ -3222,7 +3295,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
 
         // Remove file at row index 2 (file-2.parquet which has a DV)
         // With batched EngineData creation, all files are now in a single batch
@@ -3302,30 +3375,32 @@ mod tests {
         )?;
         let root_entries = root_metadata.entries()?;
 
-        // In the new CombinedManifest model, the data leaf (with inline DVs) is a CombinedManifest.
-        // After file removal, the CombinedManifest entry in the root should have a manifest_dv
+        // After file removal, the DataManifest entry in the root should have a manifest_dv
         // marking which data file entry indices are deleted.
         let manifest_with_dv = root_entries
             .iter()
             .find(|entry| {
-                entry.content_type == DataContentType::CombinedManifest
-                    && entry.manifest_dv.is_some()
+                entry.content_type == DataContentType::DataManifest
+                    && entry
+                        .manifest_info
+                        .as_ref()
+                        .and_then(|mi| mi.dv.as_ref())
+                        .is_some()
             })
             .ok_or_else(|| {
-                Error::generic(
-                    "No CombinedManifest with manifest_dv found in root after file removal",
-                )
+                Error::generic("No DataManifest with manifest_dv found in root after file removal")
             })?;
 
         let leaf_manifest_path = manifest_with_dv
             .location
             .clone()
-            .ok_or_else(|| Error::generic("CombinedManifest has no location"))?;
+            .ok_or_else(|| Error::generic("DataManifest has no location"))?;
 
         let manifest_dv_bytes = manifest_with_dv
-            .manifest_dv
+            .manifest_info
             .as_ref()
-            .ok_or_else(|| Error::generic("CombinedManifest has no manifest_dv"))?;
+            .and_then(|mi| mi.dv.as_ref())
+            .ok_or_else(|| Error::generic("DataManifest has no manifest_dv"))?;
 
         if manifest_dv_bytes.len() < 4 {
             return Err(Box::new(Error::generic("manifest_dv bytes too short")));
@@ -3349,9 +3424,7 @@ mod tests {
         let deleted_index = deleted_indices.iter().next().unwrap();
 
         // Read the leaf manifest and verify the entry at the deleted index
-        let leaf_manifest_url = table_root
-            .join(&leaf_manifest_path)
-            .map_err(|e| Error::generic(format!("Failed to parse leaf manifest URL: {e}")))?;
+        let leaf_manifest_url = parse_or_join_url(&leaf_manifest_path, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &leaf_manifest_url,
@@ -3415,7 +3488,7 @@ mod tests {
         let mut leaf1;
         let mut leaf2;
         {
-            let mc = txn.with_manifest_commit();
+            let mc = txn.with_manifest_commit().unwrap();
             // Step 3: Release root and delta actions
             scan = mc.release_root_and_delta_actions()?;
             // Step 4: Create leaf writers
@@ -3532,7 +3605,7 @@ mod tests {
 
         // Step 5: Finish leaf writers and add to manifest commit
         {
-            let mc = txn.with_manifest_commit();
+            let mc = txn.with_manifest_commit().unwrap();
             mc.add_leaf(leaf1.finish(&engine)?)?;
             mc.add_leaf(leaf2.finish(&engine)?)?;
         }
@@ -4117,7 +4190,8 @@ mod tests {
                 "partitionValues": {},
                 "size": 1024,
                 "modificationTime": 1677811178336u64,
-                "dataChange": true
+                "dataChange": true,
+                "defaultRowCommitVersion": version
             }
         });
 
@@ -4160,7 +4234,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot.transaction(committer, &engine)?;
-        txn.with_manifest_commit();
+        txn.with_manifest_commit().unwrap();
         match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(_) => {}
             other => panic!("Expected committed transaction, got {:?}", other),
@@ -4237,7 +4311,7 @@ mod tests {
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
-            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
         ]));
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")

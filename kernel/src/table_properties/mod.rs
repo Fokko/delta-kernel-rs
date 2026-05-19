@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::time::Duration;
 
-use strum::EnumString;
+use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
@@ -43,6 +43,7 @@ pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
 pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
+pub(crate) const ENABLE_ICEBERG_COMPAT_V3: &str = "delta.enableIcebergCompatV3";
 pub(crate) const ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL: &str =
     "delta.enableIcebergNativeV4Experimental";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
@@ -61,6 +62,7 @@ pub(crate) const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str =
     "delta.rowTracking.materializedRowCommitVersionColumnName";
 pub(crate) const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
 pub(crate) const PARQUET_FORMAT_VERSION: &str = "delta.parquet.format.version";
+pub(crate) const PARQUET_COMPRESSION_CODEC: &str = "delta.parquet.compression.codec";
 pub(crate) const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
@@ -101,6 +103,11 @@ pub struct TableProperties {
     /// Whether column mapping is enabled for Delta table columns and the corresponding
     /// Parquet columns that use different names.
     pub column_mapping_mode: Option<ColumnMappingMode>,
+
+    /// The largest column-mapping ID assigned in the table schema. ALTER TABLE operations
+    /// that add new column-mapped columns must allocate IDs strictly greater than this value
+    /// and bump the property accordingly.
+    pub column_mapping_max_column_id: Option<i64>,
 
     /// The number of columns for Delta Lake to collect statistics about for data skipping.
     /// A value of -1 means to collect statistics for all columns. Updating this property does
@@ -145,6 +152,10 @@ pub struct TableProperties {
     /// Whether Iceberg compatibility V2 is enabled for this table. When enabled, Delta Lake
     /// ensures compatibility with Apache Iceberg V2 table format.
     pub enable_iceberg_compat_v2: Option<bool>,
+
+    /// Whether Iceberg compatibility V3 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V3 table format.
+    pub enable_iceberg_compat_v3: Option<bool>,
 
     /// Whether native Iceberg v4 interop (experimental) is enabled for this table.
     pub enable_iceberg_native_v4_experimental: Option<bool>,
@@ -215,6 +226,12 @@ pub struct TableProperties {
     /// to `"1.0.0"` when absent. Connectors read this to configure their Parquet writers.
     pub parquet_format_version: Option<String>,
 
+    /// Compression codec to use when writing new Parquet data and checkpoint files. Connectors
+    /// SHOULD honor this property when configuring their Parquet writer. Use
+    /// [`TableProperties::compression_codec_or_default`] to apply the protocol-recommended
+    /// fallback ([`ParquetCompressionCodec::Zstd`]) when this field is `None`.
+    pub parquet_compression_codec: Option<ParquetCompressionCodec>,
+
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
     /// associates a monotonically increasing timestamp with each commit by storing it in the
     /// commit's metadata.
@@ -244,6 +261,17 @@ impl TableProperties {
     /// Default: `false` per the Delta protocol.
     pub fn should_write_stats_as_struct(&self) -> bool {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
+    }
+
+    /// Returns the Parquet compression codec for new data and checkpoint files, applying the
+    /// Delta protocol's recommended fallback ([`ParquetCompressionCodec::Zstd`]) when the
+    /// table property is absent.
+    ///
+    /// Use the returned value's `Display` impl (`codec.to_string()`) or `Into<&'static str>`
+    /// (`codec.into()`) to get the canonical Delta-protocol string for a Parquet writer.
+    pub fn compression_codec_or_default(&self) -> ParquetCompressionCodec {
+        self.parquet_compression_codec
+            .unwrap_or(ParquetCompressionCodec::Zstd)
     }
 }
 
@@ -317,6 +345,33 @@ pub enum CheckpointPolicy {
     V2,
 }
 
+/// Compression codec for newly written Parquet data files, controlled by the
+/// `delta.parquet.compression.codec` table property.
+///
+/// Per the Delta protocol, parsing is case-insensitive, and `none` is accepted as an alias for
+/// `uncompressed`. When the property is absent, writers SHOULD default to [`Self::Zstd`].
+///
+/// See [Table Properties] in the Delta protocol.
+///
+/// [Table Properties]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#table-properties
+#[derive(Debug, Display, EnumString, IntoStaticStr, Copy, Clone, PartialEq, Eq)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum ParquetCompressionCodec {
+    /// `zstd`. Recommended fallback per the Delta protocol when the property is absent.
+    Zstd,
+    /// `uncompressed` (alias: `none`). No compression.
+    #[strum(serialize = "uncompressed", serialize = "none")]
+    Uncompressed,
+    /// `snappy`.
+    Snappy,
+    /// `gzip`.
+    Gzip,
+    /// `lz4`. Deprecated by the Delta protocol (Hadoop framing); prefer [`Self::Lz4Raw`].
+    Lz4,
+    /// `lz4_raw`. LZ4 block format.
+    Lz4Raw,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -358,6 +413,7 @@ mod tests {
         assert_eq!(ENABLE_TYPE_WIDENING, "delta.enableTypeWidening");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
+        assert_eq!(ENABLE_ICEBERG_COMPAT_V3, "delta.enableIcebergCompatV3");
         assert_eq!(
             ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL,
             "delta.enableIcebergNativeV4Experimental"
@@ -388,6 +444,7 @@ mod tests {
         );
         assert_eq!(ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended");
         assert_eq!(PARQUET_FORMAT_VERSION, "delta.parquet.format.version");
+        assert_eq!(PARQUET_COMPRESSION_CODEC, "delta.parquet.compression.codec");
         assert_eq!(
             ENABLE_IN_COMMIT_TIMESTAMPS,
             "delta.enableInCommitTimestamps"
@@ -440,6 +497,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_iceberg_compat_v3() {
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v3, Some(true));
+
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "false".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v3, Some(false));
+    }
+
+    #[test]
     fn test_parse_iceberg_native_v4_experimental() {
         let properties = HashMap::from([(
             ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL.to_string(),
@@ -475,6 +545,34 @@ mod tests {
     }
 
     #[test]
+    fn column_mapping_max_column_id_invalid_falls_through_to_unknown() {
+        // Non-integer and negative values are invalid; following the established pattern,
+        // they fall through to `unknown_properties` rather than failing the whole parse.
+        for invalid in ["not_a_number", "-5", "1.5"] {
+            let properties = HashMap::from([(
+                COLUMN_MAPPING_MAX_COLUMN_ID.to_string(),
+                invalid.to_string(),
+            )]);
+            let parsed = TableProperties::from(properties.iter());
+            assert_eq!(
+                parsed.column_mapping_max_column_id, None,
+                "input: {invalid}"
+            );
+            assert!(parsed
+                .unknown_properties
+                .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID));
+        }
+    }
+
+    #[test]
+    fn column_mapping_max_column_id_zero_is_valid() {
+        let properties =
+            HashMap::from([(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), "0".to_string())]);
+        let parsed = TableProperties::from(properties.iter());
+        assert_eq!(parsed.column_mapping_max_column_id, Some(0));
+    }
+
+    #[test]
     fn allow_unknown_keys() {
         let properties = [("unknown_properties".to_string(), "two words".to_string())];
         let actual = TableProperties::from(properties.clone().into_iter());
@@ -503,6 +601,7 @@ mod tests {
             (CHECKPOINT_WRITE_STATS_AS_JSON, "true"),
             (CHECKPOINT_WRITE_STATS_AS_STRUCT, "true"),
             (COLUMN_MAPPING_MODE, "id"),
+            (COLUMN_MAPPING_MAX_COLUMN_ID, "42"),
             (DATA_SKIPPING_NUM_INDEXED_COLS, "-1"),
             (DATA_SKIPPING_STATS_COLUMNS, "col1,col2"),
             (DELETED_FILE_RETENTION_DURATION, "interval 1 second"),
@@ -511,6 +610,7 @@ mod tests {
             (ENABLE_TYPE_WIDENING, "true"),
             (ENABLE_ICEBERG_COMPAT_V1, "true"),
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
             (ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
@@ -532,6 +632,7 @@ mod tests {
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
             (PARQUET_FORMAT_VERSION, "2.12.0"),
+            (PARQUET_COMPRESSION_CODEC, "zstd"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -542,6 +643,7 @@ mod tests {
             checkpoint_write_stats_as_json: Some(true),
             checkpoint_write_stats_as_struct: Some(true),
             column_mapping_mode: Some(ColumnMappingMode::Id),
+            column_mapping_max_column_id: Some(42),
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
             data_skipping_stats_columns: Some(vec![column_name!("col1"), column_name!("col2")]),
             deleted_file_retention_duration: Some(Duration::new(1, 0)),
@@ -550,6 +652,7 @@ mod tests {
             enable_type_widening: Some(true),
             enable_iceberg_compat_v1: Some(true),
             enable_iceberg_compat_v2: Some(true),
+            enable_iceberg_compat_v3: Some(true),
             enable_iceberg_native_v4_experimental: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
@@ -569,6 +672,7 @@ mod tests {
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             parquet_format_version: Some("2.12.0".to_string()),
+            parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             unknown_properties: HashMap::new(),
         };

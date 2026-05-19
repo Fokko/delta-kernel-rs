@@ -5,13 +5,17 @@ use std::sync::Arc;
 use url::Url;
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
-use crate::content_tree::ContentTreeNodeEntry;
+use crate::content_tree::builder::{
+    log_replay_schema, ContentRootRebuildProcessor, ContentTreeNodeBuilder,
+};
+use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
+use crate::log_reader::commit::CommitReader;
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, FileMeta, Version};
+use crate::{DeltaResult, Engine, FileMeta, FilteredEngineData, Version};
 
 /// Commit mode that uses a caller-supplied root manifest instead of having kernel build one.
 ///
@@ -63,6 +67,62 @@ impl ExplicitRootManifestCommit {
 
         Ok(ExplicitRootManifestCommit { file })
     }
+}
+
+/// Replay delta log commit files at or after `from_version` through `processor`.
+///
+/// Returns pre-transformed [`EngineData`] batches in ContentTreeNodeEntry schema — one per
+/// non-empty surviving commit batch. The caller pushes these to a [`ContentTreeNodeBuilder`]
+/// via [`add_pre_built_log_batch`].
+///
+/// [`EngineData`]: crate::EngineData
+/// [`add_pre_built_log_batch`]: ContentTreeNodeBuilder::add_pre_built_log_batch
+fn replay_log_commits(
+    processor: &mut ContentRootRebuildProcessor,
+    engine: &dyn Engine,
+    log_segment: &crate::log_segment::LogSegment,
+    from_version: Version,
+) -> DeltaResult<Vec<Box<dyn crate::EngineData>>> {
+    let content_root_version = from_version.checked_sub(1);
+    let reader = CommitReader::try_new(
+        engine,
+        log_segment,
+        log_replay_schema(),
+        content_root_version,
+    )?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        if let Some(fed) = processor.process_log_batch(batch?)? {
+            batches.push(fed.apply_selection_vector()?);
+        }
+    }
+    Ok(batches)
+}
+
+/// Applies `processor` over the existing content root and returns the live entries.
+fn replay_content_root(
+    processor: &mut ContentRootRebuildProcessor,
+    engine: &dyn Engine,
+    root_path_str: &str,
+    table_root: &Url,
+) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+    let content_root_url = table_root
+        .join(root_path_str)
+        .map_err(|e| Error::generic(format!("Failed to parse content root URL: {e}")))?;
+    let (content_root_iter, _, _) = ContentTreeNode::open_stream(
+        engine.parquet_handler(),
+        &content_root_url,
+        root_path_str.to_owned(),
+        None,
+        None,
+    )?;
+    let mut entries = Vec::new();
+    for batch in content_root_iter {
+        entries.extend(
+            processor.process_root_batch(FilteredEngineData::with_all_rows_selected(batch?))?,
+        );
+    }
+    Ok(entries)
 }
 
 /// State for a manifest commit (content-tree update).
@@ -285,15 +345,109 @@ impl ManifestCommitState {
         Ok(cursor)
     }
 
-    /// Applies all accumulated manifest commit state to a
-    /// [`crate::content_tree::builder::ContentTreeNodeBuilder`].
+    /// Creates and populates a [`ContentTreeNodeBuilder`] from the current table state.
+    ///
+    /// This is the setup phase of a manifest commit. It determines the appropriate baseline for
+    /// the new content tree by inspecting the existing checkpoint action:
+    ///
+    /// - If [`release_root_and_delta_actions`](Self::release_root_and_delta_actions) was called,
+    ///   the root data entries are cleared so the next commit starts fresh; leaf manifest updates
+    ///   are applied separately via [`apply_to_builder`](Self::apply_to_builder).
+    /// - If delta log commits exist since the last checkpoint, replays them through a
+    ///   [`ContentRootRebuildProcessor`] to produce a correct merged view of the content root.
+    /// - If the content root is already current (no log commits since checkpoint), loads it
+    ///   directly without replay.
+    /// - If no checkpoint exists, returns an empty builder.
+    ///
+    /// The returned builder is ready to accept new file additions and leaf manifest updates via
+    /// [`apply_to_builder`](Self::apply_to_builder).
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - Engine for reading log commit files and the content root parquet file.
+    pub(super) fn initialize_content_root_builder(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<ContentTreeNodeBuilder> {
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
+        let physical_schema = self
+            .read_snapshot
+            .schema()
+            .as_ref()
+            .make_physical(column_mapping_mode)?;
+        let table_root = self.read_snapshot.table_root().clone();
+        let current_version = self.read_snapshot.version();
+
+        // If a content root exists and is current, load it directly and return — no replay needed.
+        // Otherwise fall through: either no checkpoint (replay from v0) or log commits exist
+        // after the checkpoint version (replay from checkpoint.version + 1).
+        let (log_start_version, root_path) =
+            if let Some(checkpoint_action) = self.read_snapshot.checkpoint_action() {
+                let log_start_version = checkpoint_action.version + 1;
+                if log_start_version > current_version {
+                    let mut builder = ContentTreeNodeBuilder::from_content_root(
+                        engine,
+                        &checkpoint_action.content_root,
+                        table_root,
+                        physical_schema,
+                        self.version_to_write,
+                    )?;
+                    if self.root_released {
+                        builder.clear_root_data_and_dv_entries();
+                    }
+                    return Ok(builder);
+                }
+                (
+                    log_start_version,
+                    Some(checkpoint_action.content_root.path.clone()),
+                )
+            } else {
+                (0, None)
+            };
+
+        let mut builder = ContentTreeNodeBuilder::new_for(
+            table_root.clone(),
+            self.version_to_write,
+            physical_schema.clone(),
+        );
+
+        if self.root_released {
+            builder.clear_root_data_and_dv_entries();
+            // TODO: Process incremental removes from delta log and mark them as DELETED in the
+            // appropriate leaf manifests. This can be done by calling `replay_log_commits`,
+            // discarding the returned batches, and then applying
+            // `processor.deleted_leaf_positions_by_location()` to `builder`.
+            return Ok(builder);
+        }
+
+        let mut processor =
+            ContentRootRebuildProcessor::new(engine, self.snapshot_id, physical_schema)?;
+        let log_segment = self.read_snapshot.log_segment();
+        for data in replay_log_commits(&mut processor, engine, log_segment, log_start_version)? {
+            builder.add_pre_built_log_batch(data)?;
+        }
+        if let Some(root_path) = root_path.as_deref() {
+            for entry in replay_content_root(&mut processor, engine, root_path, &table_root)? {
+                builder.add_entry(entry);
+            }
+            for (leaf_path, bitmap) in processor.deleted_leaf_positions_by_location() {
+                if builder.has_leaf_manifest(&leaf_path) {
+                    builder.delete_multiple_from_leaf(&leaf_path, &bitmap, true)?;
+                }
+            }
+        }
+
+        Ok(builder)
+    }
+
+    /// Applies all accumulated manifest commit state to a [`ContentTreeNodeBuilder`].
     ///
     /// Called during commit to incorporate leaf manifests and deletions into the content tree
-    /// before it is written out.
-    pub(super) fn apply_to_builder(
-        &self,
-        builder: &mut crate::content_tree::builder::ContentTreeNodeBuilder,
-    ) -> DeltaResult<()> {
+    /// after [`create_builder`](Self::create_builder) has populated the baseline state.
+    pub(super) fn apply_to_builder(&self, builder: &mut ContentTreeNodeBuilder) -> DeltaResult<()> {
         for entry in &self.leaf_manifests {
             builder.add_entry(entry.clone());
         }

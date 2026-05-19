@@ -43,8 +43,22 @@ fn read_and_validate_iceberg_metadata(
         latest_name
     );
 
-    let content = std::fs::read_to_string(latest.path()).unwrap();
-    serde_json::from_str(&content).unwrap()
+    let bytes = std::fs::read(latest.path()).unwrap();
+    parse_iceberg_metadata_v4(&bytes)
+}
+
+/// Parses on-disk Iceberg metadata.json (which has `format-version: 4` written by the kernel).
+/// Asserts the on-disk version is actually 4, then downgrades to 3 in-place so the iceberg
+/// crate (0.8, which only supports up to V3) can deserialize it.
+fn parse_iceberg_metadata_v4(bytes: &[u8]) -> iceberg_spec::TableMetadata {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(
+        json["format-version"], 4,
+        "Expected format-version 4 in metadata.json"
+    );
+    json["format-version"] = serde_json::Value::Number(3.into());
+    serde_json::from_value(json)
+        .unwrap_or_else(|e| panic!("Failed to parse metadata.json as V3: {e}"))
 }
 
 #[tokio::test]
@@ -95,8 +109,8 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     txn.add_files(create_add_files_metadata(
         add_files_schema,
         vec![
-            ("part-00000.parquet", 1024, 1_000_000, 10),
-            ("part-00001.parquet", 2048, 1_000_001, 20),
+            ("part-00000.parquet", 1024, 1_000_000, Some(10)),
+            ("part-00001.parquet", 2048, 1_000_001, Some(20)),
         ],
     )?);
 
@@ -122,10 +136,6 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     // Validate metadata.json content for version 1 (with snapshot)
     let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
-    assert_eq!(
-        table_metadata.format_version(),
-        iceberg_spec::FormatVersion::V2
-    );
     assert_eq!(
         table_metadata.current_schema().as_struct().fields().len(),
         2
@@ -193,7 +203,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00002.parquet", 3072, 1_000_002, 30)],
+        vec![("part-00002.parquet", 3072, 1_000_002, Some(30))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -211,7 +221,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00003.parquet", 4096, 1_000_003, 40)],
+        vec![("part-00003.parquet", 4096, 1_000_003, Some(40))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -230,7 +240,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     let latest_metadata_path = metadata_files.last().unwrap().path();
     let latest_content = std::fs::read_to_string(&latest_metadata_path)?;
-    let latest_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&latest_content)?;
+    let latest_metadata = parse_iceberg_metadata_v4(latest_content.as_bytes());
 
     println!("\n=== Latest metadata.json (version 3) ===");
     println!("{}", latest_content);
@@ -344,7 +354,7 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("part-00000.parquet", 1024, 1_000_000, 10)],
+        vec![("part-00000.parquet", 1024, 1_000_000, Some(10))],
     )?);
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -414,8 +424,8 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     txn.add_files(create_add_files_metadata(
         add_files_schema,
         vec![
-            ("ctas-part-00000.parquet", 1024, 1_000_000, 100),
-            ("ctas-part-00001.parquet", 2048, 1_000_001, 200),
+            ("ctas-part-00000.parquet", 1024, 1_000_000, Some(100)),
+            ("ctas-part-00001.parquet", 2048, 1_000_001, Some(200)),
         ],
     )?);
 
@@ -451,7 +461,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
 
     // Verify it has a snapshot (unlike pure CREATE TABLE which has 0)
     let content = std::fs::read_to_string(metadata_files[0].path())?;
-    let table_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&content)?;
+    let table_metadata = parse_iceberg_metadata_v4(content.as_bytes());
 
     println!("\n=== CTAS metadata.json ===");
     println!("{}", content);
@@ -513,7 +523,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("insert-part-00000.parquet", 3072, 1_000_002, 50)],
+        vec![("insert-part-00000.parquet", 3072, 1_000_002, Some(50))],
     )?);
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
@@ -528,7 +538,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     let add_files_schema = txn.add_files_schema();
     txn.add_files(create_add_files_metadata(
         add_files_schema,
-        vec![("insert-part-00001.parquet", 4096, 1_000_003, 60)],
+        vec![("insert-part-00001.parquet", 4096, 1_000_003, Some(60))],
     )?);
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 2);
@@ -541,7 +551,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         .collect();
     final_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
     let final_content = std::fs::read_to_string(final_files.last().unwrap().path())?;
-    let final_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&final_content)?;
+    let final_metadata = parse_iceberg_metadata_v4(final_content.as_bytes());
 
     assert_eq!(
         final_metadata.snapshots().len(),
@@ -554,11 +564,11 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         "Snapshot log should have 3 entries"
     );
 
-    // Verify parent chain: v2 -> v1 -> v0 (CTAS)
+    // Verify parent chain: current snapshot should have a parent (v1 -> v0 CTAS).
     let current = final_metadata.current_snapshot().unwrap();
     assert!(
         current.parent_snapshot_id().is_some(),
-        "v2 snapshot should have a parent"
+        "current snapshot should have a parent"
     );
 
     // Verify all files are readable
@@ -576,5 +586,103 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     assert_eq!(all_paths, expected_all, "All files should be readable");
 
     println!("\n=== SUCCESS: CTAS + 2 follow-up commits with snapshot history ===");
+    Ok(())
+}
+
+/// CREATE TABLE with data via manifest commit (content tree) should produce exactly one
+/// IcebergMetadataDomain, not two. Regression test for the duplicate domain bug where
+/// both the CREATE TABLE path and the manifest commit path generated metadata.json.
+#[tokio::test]
+async fn test_create_table_manifest_commit_single_iceberg_domain(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_utils::test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?);
+
+    let mut txn = create_table(&table_path, schema, "TestEngine/1.0")
+        .with_table_properties([
+            ("delta.columnMapping.mode", "id"),
+            ("delta.feature.metadataTree-experimental", "supported"),
+            ("delta.feature.domainMetadata", "supported"),
+            ("delta.enableRowTracking", "true"),
+            ("delta.enableIcebergNativeV4Experimental", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    let add_files_schema = txn.add_files_schema();
+
+    // Add data via manifest commit (content tree), like Reyden does
+    {
+        let mc = txn.with_manifest_commit().unwrap();
+        let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                add_files_schema,
+                vec![
+                    ("part-00000.parquet", 1024, 1_000_000, Some(10)),
+                    ("part-00001.parquet", 2048, 1_000_001, Some(20)),
+                ],
+            )?,
+        )?;
+        mc.add_leaf(leaf.finish(engine.as_ref())?)?;
+    }
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), 0);
+
+    // Verify: exactly ONE metadata.json file (not two)
+    let table_dir = std::path::Path::new(&table_path);
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
+    let metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    assert_eq!(
+        metadata_files.len(),
+        1,
+        "CREATE TABLE + manifest commit should produce exactly 1 metadata.json, got {}",
+        metadata_files.len()
+    );
+
+    // Verify: the metadata.json has a snapshot (not empty schema-only)
+    let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
+    assert_eq!(table_metadata.snapshots().len(), 1);
+    assert!(table_metadata.current_snapshot_id().is_some());
+
+    // Verify: exactly ONE iceberg domain metadata in the Delta commit
+    let commit_path = table_dir
+        .join("_delta_log")
+        .join("00000000000000000000.json");
+    let commit_content = std::fs::read_to_string(&commit_path)?;
+    let iceberg_domain_count = commit_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|action| {
+            action
+                .get("domainMetadata")
+                .and_then(|dm| dm.get("domain"))
+                .and_then(|d| d.as_str())
+                == Some("com.databricks.iceberg.metadata")
+        })
+        .count();
+    assert_eq!(
+        iceberg_domain_count, 1,
+        "Should have exactly 1 iceberg domain metadata, got {}",
+        iceberg_domain_count
+    );
+
+    // Verify: table is readable
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    let expected: HashSet<String> = ["part-00000.parquet", "part-00001.parquet"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(paths, expected);
+
     Ok(())
 }

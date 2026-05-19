@@ -15,8 +15,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot, TrackingStatus};
 use test_utils::{
     collect_file_paths, create_add_files_metadata, create_table, engine_store_setup,
     remove_scan_files_with_selection,
@@ -38,44 +37,36 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
-                        ("file1.parquet", 2048, 1000000, 100),
-                        ("file2.parquet", 1024, 1000001, 50),
+                        ("file1.parquet", 2048, 1000000, Some(100)),
+                        ("file2.parquet", 1024, 1000001, Some(50)),
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
         }
 
         // v2: Manifest commit creates root manifest
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        new_snapshot.checkpoint_action().is_some(),
-                        "Root manifest should exist"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                new_snapshot.checkpoint_action().is_some(),
+                "Root manifest should exist"
+            );
         }
 
         // Verify v2: Root manifest contains file1, file2
@@ -102,16 +93,12 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file3.parquet", 512, 1000002, 25)],
+                vec![("file3.parquet", 512, 1000002, Some(25))],
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
         }
 
         // v4: Regular commit adds file4 to log
@@ -122,16 +109,12 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file4.parquet", 768, 1000003, 30)],
+                vec![("file4.parquet", 768, 1000003, Some(30))],
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 4);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 4);
         }
 
         // Verify v4: Scan should show all 4 files (2 from root + 2 from log)
@@ -164,31 +147,28 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 as part of the new root creation
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
-                    vec![("file5.parquet", 2048, 1000004, 100)],
+                    vec![("file5.parquet", 2048, 1000004, Some(100))],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 5);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 5);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Verify v5: New root should contain all 5 files (4 rolled up + 1 new)
         // Tests: New root manifest correctly rolls up previous root + delta log changes + new files
         {
-            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let paths = collect_file_paths(snapshot, &engine)?;
+            let snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let paths = collect_file_paths(snapshot.clone(), &engine)?;
             let expected: HashSet<String> = [
                 "file1.parquet",
                 "file2.parquet",
@@ -204,6 +184,26 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                 &paths,
                 "v5: New root should contain 4 rolled-up files + 1 newly added file",
             );
+
+            // file3 and file4 were added by delta log commits at v3 and v4 respectively,
+            // and are stored as Data entries directly in the root.
+            // Sequence numbers must reflect the actual commit version, not the root version (5).
+            // Both should have Existing status since they were rolled up from prior versions.
+            let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
+            let file3 = tracking.get("file3.parquet").expect("file3 in root");
+            assert_eq!(file3.seq_num, Some(3), "file3 seq_num");
+            assert_eq!(
+                file3.status,
+                TrackingStatus::Existing as i32,
+                "file3 status"
+            );
+            let file4 = tracking.get("file4.parquet").expect("file4 in root");
+            assert_eq!(file4.seq_num, Some(4), "file4 seq_num");
+            assert_eq!(
+                file4.status,
+                TrackingStatus::Existing as i32,
+                "file4 status"
+            );
         }
     }
     Ok(())
@@ -211,7 +211,6 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
 
 /// Test Scenario: File Removal of Root Entry in Log
 #[tokio::test]
-#[ignore = "BUG: New root manifest does not roll up Remove actions from delta log in commit 3 - file2 reappears"]
 async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::error::Error>> {
     let schema = create_test_schema()?;
 
@@ -222,31 +221,27 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
                 vec![
-                    ("file1.parquet", 2048, 1000000, 100),
-                    ("file2.parquet", 1024, 1000001, 50),
-                    ("file3.parquet", 3072, 1000002, 150),
-                    ("file4.parquet", 1536, 1000003, 75),
+                    ("file1.parquet", 2048, 1000000, Some(100)),
+                    ("file2.parquet", 1024, 1000001, Some(50)),
+                    ("file3.parquet", 3072, 1000002, Some(150)),
+                    ("file4.parquet", 1536, 1000003, Some(75)),
                 ],
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                    let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        snapshot_v1.checkpoint_action().is_some(),
-                        "v1 should create root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                snapshot_v1.checkpoint_action().is_some(),
+                "v1 should create root manifest"
+            );
         }
 
         // Verify v1: Root contains all 4 files
@@ -296,12 +291,8 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
 
             assert_eq!(removed_count, 1, "Should remove exactly 1 file");
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file2 removed
@@ -323,31 +314,28 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file5.parquet", 1024, 1000004, 50)],
+                vec![("file5.parquet", 1024, 1000004, Some(50))],
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                    let new_snapshot: Arc<Snapshot> =
-                        Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let new_snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Final verification: v3 should show 4 files (3 rolled up + 1 new)
         // Tests: New root correctly rolls up Remove action from flat structure
         {
-            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let paths: HashSet<String> = collect_file_paths(snapshot, &engine)?;
+            let snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let paths: HashSet<String> = collect_file_paths(snapshot.clone(), &engine)?;
             let expected: HashSet<String> = [
                 "file1.parquet",
                 "file3.parquet",
@@ -362,6 +350,19 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                 &paths,
                 "v3: New root manifest should contain 3 files (file2 removed) + 1 newly added file",
             );
+
+            // file1/file3/file4 were rolled up from v1 (Existing); file5 was added at v3 (Added).
+            let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
+            for name in ["file1.parquet", "file3.parquet", "file4.parquet"] {
+                let e = tracking
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} in root"));
+                assert_eq!(e.seq_num, Some(1), "{name} seq_num");
+                assert_eq!(e.status, TrackingStatus::Existing as i32, "{name} status");
+            }
+            let file5 = tracking.get("file5.parquet").expect("file5 in root");
+            assert_eq!(file5.seq_num, Some(3), "file5 seq_num");
+            assert_eq!(file5.status, TrackingStatus::Added as i32, "file5 status");
         }
     }
     Ok(())
@@ -369,7 +370,6 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
 
 /// Test File Removal of Leaf Entry in Log rolls up in subsequent manifest commit
 #[tokio::test]
-#[ignore = "BUG: New root manifest does not roll up Remove actions from delta log in commit 3 - file2 reappears"]
 async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::error::Error>> {
     let schema = create_test_schema()?;
 
@@ -382,32 +382,28 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
             {
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
                     vec![
-                        ("file1.parquet", 2048, 1000000, 100),
-                        ("file2.parquet", 1024, 1000001, 50),
-                        ("file3.parquet", 3072, 1000002, 150),
-                        ("file4.parquet", 1536, 1000003, 75),
+                        ("file1.parquet", 2048, 1000000, Some(100)),
+                        ("file2.parquet", 1024, 1000001, Some(50)),
+                        ("file3.parquet", 3072, 1000002, Some(150)),
+                        ("file4.parquet", 1536, 1000003, Some(75)),
                     ],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                    let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        snapshot_v1.checkpoint_action().is_some(),
-                        "v1 should create root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                snapshot_v1.checkpoint_action().is_some(),
+                "v1 should create root manifest"
+            );
         }
 
         // Verify v1: Root contains all 4 files
@@ -458,12 +454,8 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
 
             assert_eq!(removed_count, 1, "Should remove exactly 1 file");
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file2 removed
@@ -489,25 +481,21 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             let add_files_schema = txn.add_files_schema();
             {
                 // Add file5 via leaf writer as part of new root creation
-                let mc = txn.with_manifest_commit();
+                let mc = txn.with_manifest_commit().unwrap();
                 let mut leaf = mc.new_leaf_node_writer(&engine)?;
                 let metadata = create_add_files_metadata(
                     add_files_schema,
-                    vec![("file5.parquet", 1024, 1000004, 50)],
+                    vec![("file5.parquet", 1024, 1000004, Some(50))],
                 )?;
                 leaf.add_files(&engine, metadata)?;
                 mc.add_leaf(leaf.finish(&engine)?)?;
             }
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                    let new_snapshot: Arc<Snapshot> =
-                        Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.checkpoint_action().is_some());
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let new_snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(new_snapshot.checkpoint_action().is_some());
         }
 
         // Final verification: v3 should show 4 files (3 rolled up + 1 new)
@@ -547,7 +535,6 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
 /// Actual: v4 has file with NO DV - BUG: manifest commit does not roll up DV replacements from
 /// delta log
 #[tokio::test]
-#[ignore = "BUG: Manifest commit at v4 does not roll up DV replacement from delta log - file has no DV"]
 async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
     let schema = create_test_schema()?;
 
@@ -558,21 +545,17 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 add_files_schema,
-                vec![("file1.parquet", 2048, 1000000, 100)],
+                vec![("file1.parquet", 2048, 1000000, Some(100))],
             )?;
             txn.add_files(metadata);
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 1);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
         }
 
         // Verify v1: file1 present in root, no DV
@@ -590,7 +573,7 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             let mut txn = snapshot
                 .clone()
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
             // Scan to get file1
             let scan = snapshot.clone().scan_builder().build()?;
@@ -616,12 +599,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             // Add DV to file1
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 2);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 2);
         }
 
         // Verify v2: file1 present with DV from v2
@@ -678,12 +657,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             // Replace DV via delta log
             txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 3);
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
         }
 
         // Verify v3: file1 present with REPLACED DV from v3 (not v2!)
@@ -713,26 +688,23 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-            txn.with_manifest_commit();
+            txn.with_manifest_commit().unwrap();
 
-            match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => {
-                    assert_eq!(c.commit_version(), 4);
-                    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(
-                        new_snapshot.checkpoint_action().is_some(),
-                        "v4 should create new root manifest"
-                    );
-                }
-                other => panic!("Expected success, got {:?}", other),
-            };
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 4);
+            let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(
+                new_snapshot.checkpoint_action().is_some(),
+                "v4 should create new root manifest"
+            );
         }
 
         // Verify v4: file1 present with DV from v3 (NOT v2) rolled up into new root
         // manifest commit should roll up the REPLACED DV from delta log
         {
-            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let files_with_dvs = collect_files_with_dvs(snapshot, &engine)?;
+            let snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files_with_dvs = collect_files_with_dvs(snapshot.clone(), &engine)?;
 
             assert_eq!(files_with_dvs.len(), 1, "v4: Should have exactly 1 file");
             let file1_dv = files_with_dvs
@@ -751,9 +723,235 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
                 "v4: DV cardinality should be 8 (from v3)"
             );
             assert_eq!(
-                file1_dv.storage_type, "p",
-                "v4: DV storage type should be 'p' (PersistedRelative)"
+                file1_dv.storage_type, "u",
+                "v4: DV storage type should be 'u' (PersistedRelative)"
             );
+
+            let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
+            let file1_tracking = tracking.get("file1.parquet").expect("file1 in root");
+            assert_eq!(file1_tracking.seq_num, Some(1), "file1 seq_num");
+            assert_eq!(
+                file1_tracking.status,
+                TrackingStatus::Existing as i32,
+                "file1 status must be Existing (rolled up from v3 into v4 root)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Test Scenario: DV Addition and Replacement for a File in a Leaf Manifest
+///
+/// Setup:
+/// - v1: Batch commit adds file to a leaf manifest (no DV)
+/// - v2: Regular commit adds DV to that file via delta log
+/// - v3: Batch commit creates new root (first rollup)
+/// - v4: Regular commit replaces DV via delta log
+/// - v5: Batch commit creates new root (second rollup)
+///
+/// Expected:
+/// - v3 root should have file with DV from v2
+/// - v5 root should have file with DV from v4 (replacement)
+#[tokio::test]
+async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = create_test_schema()?;
+
+    for (table_url, engine, _store) in
+        setup_amt_test_tables(schema.clone(), "dv_leaf_rollup").await?
+    {
+        // v1: Batch commit adds file1 to a leaf manifest (no DV)
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let add_files_schema = txn.add_files_schema();
+            {
+                let batch = txn.with_manifest_commit().unwrap();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![("file1.parquet", 2048, 1000000, Some(100))],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
+
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 1);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v1 should have root");
+        }
+
+        // Verify v1: file1 present, no DV
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files = collect_files_with_dvs(snapshot, &engine)?;
+            assert_eq!(files.len(), 1, "v1: should have 1 file");
+            assert!(
+                files["file1.parquet"].is_none(),
+                "v1: file1 should have no DV"
+            );
+        }
+
+        // v2: Regular commit adds DV to file1 via delta log
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let mut txn = snapshot
+                .clone()
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let scan = snapshot.clone().scan_builder().build()?;
+            let scan_files: Vec<_> = scan
+                .scan_metadata(&engine)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|sm| sm.scan_files)
+                .collect();
+            let mut dv_map = std::collections::HashMap::new();
+            dv_map.insert(
+                "file1.parquet".to_string(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                    offset: Some(0),
+                    size_in_bytes: 10,
+                    cardinality: 5,
+                },
+            );
+            txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+            assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 2);
+        }
+
+        // Verify v2: file1 has DV from v2
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files = collect_files_with_dvs(snapshot, &engine)?;
+            assert_eq!(files.len(), 1, "v2: should have 1 file");
+            let dv = files["file1.parquet"]
+                .as_ref()
+                .expect("v2: file1 should have DV");
+            assert_eq!(dv.path_or_inline_dv, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+            assert_eq!(dv.cardinality, 5);
+        }
+
+        // v3: Batch commit creates new root, rolling up v2 DV
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_manifest_commit().unwrap();
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 3);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v3 should have root");
+        }
+
+        // Verify v3: file1 appears exactly once with DV from v2; rolled up as Existing
+        {
+            let snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files = collect_files_with_dvs(snapshot.clone(), &engine)?;
+            assert_eq!(
+                files.len(),
+                1,
+                "v3: should have exactly 1 file (not a duplicate from leaf + data entry)"
+            );
+            let dv = files["file1.parquet"]
+                .as_ref()
+                .expect("v3: file1 should have DV from v2");
+            assert_eq!(
+                dv.path_or_inline_dv, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "v3: DV should be from v2"
+            );
+            assert_eq!(dv.cardinality, 5);
+
+            let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
+            let file1 = tracking.get("file1.parquet").expect("file1 in root at v3");
+            assert_eq!(
+                file1.status,
+                TrackingStatus::Existing as i32,
+                "v3: file1 rolled up from v2 log commit must be Existing"
+            );
+            assert_eq!(file1.seq_num, Some(1), "v3: file1 seq_num");
+        }
+
+        // v4: Regular commit replaces DV via delta log
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let mut txn = snapshot
+                .clone()
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let scan = snapshot.clone().scan_builder().build()?;
+            let scan_files: Vec<_> = scan
+                .scan_metadata(&engine)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|sm| sm.scan_files)
+                .collect();
+            let mut dv_map = std::collections::HashMap::new();
+            dv_map.insert(
+                "file1.parquet".to_string(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                    offset: Some(0),
+                    size_in_bytes: 15,
+                    cardinality: 8,
+                },
+            );
+            txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+            assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 4);
+        }
+
+        // Verify v4: file1 has DV from v4
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files = collect_files_with_dvs(snapshot, &engine)?;
+            assert_eq!(files.len(), 1, "v4: should have 1 file");
+            let dv = files["file1.parquet"]
+                .as_ref()
+                .expect("v4: file1 should have DV");
+            assert_eq!(dv.path_or_inline_dv, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+            assert_eq!(dv.cardinality, 8);
+        }
+
+        // v5: Batch commit creates second new root, rolling up v4 DV replacement
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_manifest_commit().unwrap();
+            let c = txn.commit(&engine)?.unwrap_committed();
+            assert_eq!(c.commit_version(), 5);
+            let s = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            assert!(s.checkpoint_action().is_some(), "v5 should have root");
+        }
+
+        // Verify v5: file1 appears exactly once with DV from v4 (replacement); rolled up as
+        // Existing
+        {
+            let snapshot: Arc<Snapshot> =
+                Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let files = collect_files_with_dvs(snapshot.clone(), &engine)?;
+            assert_eq!(
+                files.len(),
+                1,
+                "v5: should have exactly 1 file (not a duplicate from leaf + data entry)"
+            );
+            let dv = files["file1.parquet"]
+                .as_ref()
+                .expect("v5: file1 should have DV from v4");
+            assert_eq!(
+                dv.path_or_inline_dv, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "v5: DV should be from v4 (replacement), not v2"
+            );
+            assert_eq!(dv.cardinality, 8);
+
+            let tracking = collect_root_manifest_tracking_info(snapshot, &engine)?;
+            let file1 = tracking.get("file1.parquet").expect("file1 in root at v5");
+            assert_eq!(
+                file1.status,
+                TrackingStatus::Existing as i32,
+                "v5: file1 rolled up from v4 log commit must be Existing"
+            );
+            assert_eq!(file1.seq_num, Some(1), "v5: file1 seq_num");
         }
     }
     Ok(())
@@ -857,6 +1055,110 @@ fn collect_files_with_dvs(
     Ok(all_files)
 }
 
+/// Per-entry data collected from the root manifest parquet in a single read.
+struct TrackingEntry {
+    /// Raw tracking status: `TrackingStatus::Existing as i32 == 0`, `Added == 1`, `Deleted == 2`.
+    status: i32,
+    seq_num: Option<i64>,
+}
+
+/// Reads the root manifest parquet for `snapshot` and returns a map from file path to
+/// [`TrackingEntry`]. Entries without a location are skipped. Returns an empty map when the
+/// snapshot has no root manifest.
+fn collect_root_manifest_tracking_info(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> DeltaResult<HashMap<String, TrackingEntry>> {
+    use std::sync::LazyLock;
+
+    use delta_kernel::engine_data::{GetData, RowVisitor};
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::FileMeta;
+
+    let Some(checkpoint_action) = snapshot.checkpoint_action() else {
+        return Ok(HashMap::new());
+    };
+
+    let root_url = snapshot
+        .table_root()
+        .join(checkpoint_action.path())
+        .map_err(|e| delta_kernel::Error::generic(format!("bad content root URL: {e}")))?;
+
+    let schema = Arc::new(
+        StructType::try_new([
+            StructField::nullable("location", DataType::STRING),
+            StructField::nullable(
+                "tracking",
+                DataType::Struct(Box::new(
+                    StructType::try_new([
+                        StructField::nullable("status", DataType::INTEGER),
+                        StructField::nullable("sequenceNumber", DataType::LONG),
+                    ])
+                    .unwrap(),
+                )),
+            ),
+        ])
+        .unwrap(),
+    );
+
+    let file_meta = FileMeta {
+        location: root_url,
+        last_modified: 0,
+        size: 0,
+    };
+    let batches: Vec<_> = engine
+        .parquet_handler()
+        .read_parquet_files(&[file_meta], schema, None)?
+        .collect::<DeltaResult<Vec<_>>>()?;
+
+    struct TrackingCollector {
+        entries: HashMap<String, TrackingEntry>,
+    }
+
+    impl RowVisitor for TrackingCollector {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| {
+                    (
+                        vec![
+                            ColumnName::new(["location"]),
+                            ColumnName::new(["tracking", "status"]),
+                            ColumnName::new(["tracking", "sequenceNumber"]),
+                        ],
+                        vec![DataType::STRING, DataType::INTEGER, DataType::LONG],
+                    )
+                });
+            (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+        }
+
+        fn visit<'b>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'b dyn GetData<'b>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                if let Some(path) = getters[0].get_opt(i, "location")? {
+                    let status: i32 = getters[1]
+                        .get_opt(i, "tracking.status")?
+                        .unwrap_or(TrackingStatus::Existing as i32);
+                    let seq_num: Option<i64> = getters[2].get_opt(i, "tracking.sequenceNumber")?;
+                    self.entries.insert(path, TrackingEntry { status, seq_num });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut collector = TrackingCollector {
+        entries: HashMap::new(),
+    };
+    for batch in &batches {
+        collector.visit_rows_of(batch.as_ref())?;
+    }
+    Ok(collector.entries)
+}
+
 async fn setup_amt_test_tables(
     schema: SchemaRef,
     table_base_name: &str,
@@ -887,6 +1189,8 @@ async fn setup_amt_test_tables(
                 "columnMapping",
                 "metadataTree-experimental",
                 "deletionVectors",
+                "domainMetadata",
+                "rowTracking",
             ],
         )
         .await?,
