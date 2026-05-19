@@ -13,7 +13,7 @@ use super::TableChanges;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
-use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::scan::{PhysicalPredicate, ScanFilePathResolver, StatsOutputMode};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
@@ -258,7 +258,7 @@ fn read_scan_file(
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
-    let location = table_root.join(&scan_file.path)?;
+    let location = ScanFilePathResolver::new(table_root.clone()).resolve(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
         size: match scan_file.size {

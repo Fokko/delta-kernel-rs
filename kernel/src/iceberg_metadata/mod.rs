@@ -61,8 +61,8 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // TODO: parameterize format version once iceberg crate supports V4
-        iceberg_spec::FormatVersion::V2,
+        // Built with V3 internally; serialize_metadata_json overrides to V4 for AMT
+        iceberg_spec::FormatVersion::V3,
         properties,
     )
     .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?
@@ -71,8 +71,7 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
     .map_err(|e| Error::generic(format!("Failed to build TableMetadata: {}", e)))?;
 
     let metadata_location = generate_metadata_path(table_root, version)?;
-    let metadata_bytes = serde_json::to_vec(&table_metadata.metadata)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
+    let metadata_bytes = serialize_metadata_json(&table_metadata.metadata)?;
 
     engine
         .storage_handler()
@@ -153,8 +152,7 @@ pub(crate) fn generate_iceberg_metadata(
 
     // Step 4: Serialize and write to storage
     let metadata_location = generate_metadata_path(table_root, version)?;
-    let metadata_bytes = serde_json::to_vec(&table_metadata)
-        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
+    let metadata_bytes = serialize_metadata_json(&table_metadata)?;
 
     engine
         .storage_handler()
@@ -179,6 +177,41 @@ pub(crate) fn generate_iceberg_metadata(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// The Iceberg format version written to metadata.json.
+const ICEBERG_FORMAT_VERSION: u8 = 4;
+
+/// Serializes TableMetadata to JSON bytes, overriding format-version to [`ICEBERG_FORMAT_VERSION`].
+///
+/// The iceberg crate (0.8) only supports up to format-version 3, so we build with V3 internally
+/// (with row tracking fields stubbed via `with_row_range(0, 0)`) and post-process the serialized
+/// JSON to set the correct version for AMT compatibility.
+// TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
+fn serialize_metadata_json(metadata: &iceberg_spec::TableMetadata) -> DeltaResult<Vec<u8>> {
+    let mut json: serde_json::Value = serde_json::to_value(metadata)
+        .map_err(|e| Error::generic(format!("Failed to convert metadata to JSON value: {e}")))?;
+    json["format-version"] = serde_json::Value::Number(ICEBERG_FORMAT_VERSION.into());
+    serde_json::to_vec(&json).map_err(|e| {
+        Error::generic(format!(
+            "Failed to serialize metadata JSON value to bytes: {e}"
+        ))
+    })
+}
+
+/// Deserializes TableMetadata from JSON bytes, downgrading format-version from V4 to V3 so
+/// the iceberg crate can parse it.
+// TODO: remove this workaround once iceberg-rust supports format-version 4 natively.
+fn deserialize_metadata_json(bytes: &[u8]) -> DeltaResult<iceberg_spec::TableMetadata> {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        Error::generic(format!("Failed to parse bytes as metadata JSON value: {e}"))
+    })?;
+    json["format-version"] = serde_json::Value::Number(3.into());
+    serde_json::from_value(json).map_err(|e| {
+        Error::generic(format!(
+            "Failed to convert metadata JSON value to TableMetadata: {e}"
+        ))
+    })
+}
 
 /// Finds the maximum field ID in an Iceberg schema (for `last_column_id`).
 fn find_max_field_id(schema: &iceberg_spec::Schema) -> i32 {
@@ -278,6 +311,9 @@ fn build_snapshot(
             operation: iceberg_spec::Operation::Append,
             additional_properties: HashMap::new(),
         })
+        // V3 requires row lineage: first_row_id + added_rows_count.
+        // TODO: compute actual row counts from Delta add file stats.
+        .with_row_range(0, 0)
         .with_schema_id(0)
         .build())
 }
@@ -295,8 +331,8 @@ fn build_table_metadata_fresh(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
-        // TODO: parameterize format version once iceberg crate supports V4
-        iceberg_spec::FormatVersion::V2,
+        // Built with V3 internally; serialize_metadata_json overrides to V4 for AMT
+        iceberg_spec::FormatVersion::V3,
         properties,
     )
     .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?;
@@ -331,8 +367,7 @@ fn build_table_metadata_incremental(
         .into_iter()
         .next()
         .ok_or_else(|| Error::generic("No data returned for previous metadata.json"))??;
-    let prev_metadata: iceberg_spec::TableMetadata = serde_json::from_slice(&prev_bytes)
-        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {}", e)))?;
+    let prev_metadata = deserialize_metadata_json(&prev_bytes)?;
 
     // Build on top of previous metadata, preserving snapshot history.
     // Update properties (delta-version, delta-timestamp, etc.) to reflect the current commit.
@@ -472,10 +507,12 @@ mod tests {
         )
         .unwrap();
 
-        // Verify it serializes to valid JSON
-        let json = serde_json::to_value(&metadata).unwrap();
+        // Verify it serializes to valid JSON via serialize_metadata_json (overrides format-version
+        // to 4)
+        let json_bytes = serialize_metadata_json(&metadata).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
 
-        assert_eq!(json["format-version"], 2);
+        assert_eq!(json["format-version"], 4);
         assert_eq!(json["table-uuid"], "d20125c8-7284-442c-9aea-15fee620737e");
         // Iceberg may strip trailing slash from location
         let location = json["location"].as_str().unwrap();
@@ -605,14 +642,18 @@ mod tests {
         )
         .unwrap();
 
-        // Step 4: Serialize to JSON (what we'd write to disk)
-        let json_bytes = serde_json::to_vec(&table_metadata).unwrap();
+        // Step 4: Serialize to JSON (what we'd write to disk) — produces format-version 4
+        let json_bytes = serialize_metadata_json(&table_metadata).unwrap();
 
-        // Step 5: Deserialize back as Iceberg TableMetadata — proves valid format
-        let parsed: iceberg_spec::TableMetadata = serde_json::from_slice(&json_bytes).unwrap();
+        // Verify the on-disk JSON has format-version 4
+        let raw_json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(raw_json["format-version"], 4);
 
-        // Verify format version
-        assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V2);
+        // Step 5: Deserialize back via deserialize_metadata_json — downgrades V4 -> V3 for parsing
+        let parsed = deserialize_metadata_json(&json_bytes).unwrap();
+
+        // Verify format version (parsed value is V3 because we downgraded for iceberg-rust parsing)
+        assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V3);
 
         // Verify table UUID
         assert_eq!(parsed.uuid(), table_uuid);

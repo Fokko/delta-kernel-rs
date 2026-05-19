@@ -5,7 +5,7 @@
 //! - Calls read_parquet_files() ONCE for all manifests (maximum parallelism)
 //! - Uses _file metadata column to group batches by manifest
 //! - Processes manifests lazily one at a time as needed
-//! - Extracts inline DV columns from dvInfo.* fields per batch
+//! - Extracts inline DV columns from deletionVector.* fields per batch
 
 use std::sync::Arc;
 

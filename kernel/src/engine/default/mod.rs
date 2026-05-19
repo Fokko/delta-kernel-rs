@@ -367,10 +367,6 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
-
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        self.metrics_reporter.clone()
-    }
 }
 
 trait UrlExt {

@@ -67,7 +67,7 @@ async fn table_v2_with_checkpoint(
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("manifest commit")
         .with_operation("BATCH_COMMIT".to_string());
-    txn.with_manifest_commit();
+    txn.with_manifest_commit().unwrap();
     add_files_to_transaction(&mut txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
     match txn.commit(engine.as_ref())? {
         CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 2),
@@ -171,7 +171,7 @@ async fn test_explicit_root_manifest_errors_after_leaf_based_commit(
         .build(engine.as_ref())?
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test");
-    txn.with_manifest_commit();
+    txn.with_manifest_commit().unwrap();
     assert_result_error_with_message(
         txn.with_explicit_root_manifest(meta),
         "explicit root manifest and manifest commit are mutually exclusive",
@@ -192,7 +192,7 @@ async fn test_leaf_based_commit_errors_at_commit_after_explicit_root_set(
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test");
     txn.with_explicit_root_manifest(meta)?;
-    txn.with_manifest_commit();
+    txn.with_manifest_commit().unwrap();
     assert_result_error_with_message(
         txn.commit(engine.as_ref()),
         "manifest commit and explicit root manifest are mutually exclusive",
