@@ -1,5 +1,5 @@
 //! Shared helpers for manifest-commit integration tests (metadata tree).
-
+// Each test binary includes this file via `#[path]` but only uses a subset of helpers.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -15,8 +15,9 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
-use delta_kernel::transaction::{CommitResult, Transaction};
-use delta_kernel::{Snapshot, Version};
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::{CommitResult, CreateTable, Transaction};
+use delta_kernel::{DeltaResult, Snapshot, Version};
 use test_utils::{create_table, engine_store_setup};
 use url::Url;
 
@@ -137,4 +138,27 @@ pub async fn generate_and_add_data_file(
         .await?;
     txn.add_files(file_meta);
     Ok(())
+}
+
+/// Creates an uncommitted create-table transaction with metadataTree-experimental enabled.
+///
+/// Row tracking is implicitly enabled (required for content trees). Returns the transaction
+/// before commit so callers can add leaves via `with_manifest_commit()` and `write_leaf()`.
+pub fn create_manifest_commit_table(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<Transaction<CreateTable>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?);
+
+    let txn = kernel_create_table(table_path, schema, "TestEngine/1.0")
+        .with_table_properties([
+            ("delta.columnMapping.mode", "id"),
+            ("delta.feature.metadataTree-experimental", "supported"),
+        ])
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
+
+    Ok(txn)
 }

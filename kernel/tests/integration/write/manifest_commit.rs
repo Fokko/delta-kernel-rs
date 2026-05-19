@@ -19,13 +19,10 @@ use itertools::Itertools;
 use serde_json::Deserializer;
 use url::Url;
 
-#[path = "../../support/manifest_commit_setup.rs"]
-mod manifest_commit_setup;
-use manifest_commit_setup::{
+use crate::common::manifest_commit_setup::{
     add_files_to_transaction, create_column_mapping_schema, setup_manifest_commit_test_tables,
     write_data_to_table,
 };
-
 use crate::common::write_utils::{
     batch_write_data_and_check_result_and_stats, remove_all_scan_files,
     write_data_and_check_result_and_stats,
@@ -45,7 +42,7 @@ async fn test_manifest_commit_no_add_actions() -> Result<(), Box<dyn std::error:
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("manifest commit test");
-        let _ = txn.with_manifest_commit();
+        let _ = txn.with_manifest_commit()?;
 
         assert!(txn.commit(&engine)?.is_committed());
 
@@ -80,7 +77,7 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("manifest commit test")
             .with_data_change(true);
-        let _ = txn.with_manifest_commit();
+        let _ = txn.with_manifest_commit()?;
 
         // Create two batches to append.
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -171,7 +168,7 @@ async fn test_manifest_commit_content_root_detected_in_scan(
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_engine_info("manifest commit test")
             .with_operation("BATCH_COMMIT".to_string());
-        let _ = manifest_txn.with_manifest_commit();
+        let _ = manifest_txn.with_manifest_commit()?;
 
         add_files_to_transaction(&mut manifest_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
 
@@ -261,7 +258,7 @@ async fn batch_remove_all_files_impl(
             .with_engine_info("test engine")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
-        let _ = txn.with_manifest_commit();
+        let _ = txn.with_manifest_commit()?;
 
         let removed =
             remove_all_scan_files(&mut txn, snapshot.scan_builder().build()?, engine.as_ref())?;

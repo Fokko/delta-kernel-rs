@@ -12,10 +12,45 @@ use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
+/// Cursor-based allocator for assigning contiguous row ID ranges during content tree building.
+///
+/// Tracks a monotonically advancing cursor that represents the next unassigned row ID.
+/// Used by [`ContentTreeNodeBuilder`] to assign `first_row_id` values to entries without
+/// threading row ID state through parameters and return values.
+///
+/// [`ContentTreeNodeBuilder`]: crate::content_tree::builder::ContentTreeNodeBuilder
+pub(crate) struct CursorRowIdAllocator {
+    cursor: i64,
+}
+
+impl CursorRowIdAllocator {
+    /// Creates a new allocator starting at the given row ID.
+    pub(crate) fn new(starting_row_id: i64) -> Self {
+        Self {
+            cursor: starting_row_id,
+        }
+    }
+
+    /// Reserves `count` contiguous row IDs and returns the starting ID of the reserved range.
+    ///
+    /// The reserved range is `[returned_value, returned_value + count)`. The internal cursor
+    /// advances by `count`.
+    pub(crate) fn reserve_row_ids(&mut self, count: i64) -> i64 {
+        let start = self.cursor;
+        self.cursor += count;
+        start
+    }
+
+    /// Returns the current cursor position (the next unassigned row ID).
+    pub(crate) fn current(&self) -> i64 {
+        self.cursor
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowTrackingDomainMetadata {
-    // NB: The Delta spec does not rule out negative high water marks
+    // NB: The Delta spec does not rule out negative high watermarks
     row_id_high_water_mark: i64,
 }
 
