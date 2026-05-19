@@ -487,7 +487,7 @@ pub async fn batch_write_data_and_check_result_and_stats(
         .clone()
         .transaction(committer, engine.as_ref())?
         .with_data_change(true);
-    let _ = txn.with_manifest_commit();
+    let _ = txn.with_manifest_commit()?;
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {

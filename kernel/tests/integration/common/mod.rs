@@ -1,3 +1,5 @@
+#[path = "../../support/manifest_commit_setup.rs"]
+pub mod manifest_commit_setup;
 pub mod write_utils;
 
 #[macro_export]

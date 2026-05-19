@@ -10,7 +10,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
@@ -18,9 +18,12 @@ use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use test_utils::{
-    create_default_engine_mt_executor, create_table, engine_store_setup, read_scan, test_read,
+    collect_file_paths, create_add_files_metadata, create_default_engine_mt_executor, create_table,
+    engine_store_setup, read_scan, test_read, test_table_setup,
 };
 use url::Url;
+
+use crate::common::manifest_commit_setup::create_manifest_commit_table;
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -722,10 +725,9 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
-    // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+    let schema: SchemaRef = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
     )])?);
@@ -810,6 +812,153 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     assert!(
         row_tracking_domain_metadata.is_empty(),
         "Should not have any row tracking domain metadata when row tracking is disabled"
+    );
+
+    Ok(())
+}
+
+// --- Batch commit (content tree / V4 metadata tree) row tracking tests ---
+
+/// Write files into a single leaf manifest and add it to the transaction.
+fn write_leaf<S>(
+    txn: &mut delta_kernel::transaction::Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let files = files
+        .into_iter()
+        .map(|(path, size, mod_time, count)| (path, size, mod_time, Some(count)))
+        .collect();
+    let mc = txn.with_manifest_commit()?;
+    let mut leaf = mc.new_leaf_node_writer(engine)?;
+    leaf.add_files(engine, create_add_files_metadata(schema, files)?)?;
+    mc.add_leaf(leaf.finish(engine)?)?;
+    Ok(())
+}
+
+/// Commit a transaction and assert it succeeds at the expected version.
+fn commit_at<S: std::fmt::Debug>(
+    txn: delta_kernel::transaction::Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    expected_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let committed = txn.commit(engine)?.unwrap_committed();
+    assert_eq!(committed.commit_version(), expected_version);
+    Ok(())
+}
+
+/// Collect `(path, baseRowId)` pairs from scan metadata, sorted by baseRowId.
+///
+/// Works for both regular commits (baseRowId in JSON add actions) and batch commits
+/// (first_row_id in the content tree, surfaced as baseRowId in scan metadata).
+fn collect_base_row_ids(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<Vec<(String, i64)>> {
+    use std::sync::LazyLock;
+
+    use delta_kernel::engine_data::{GetData, TypedGetData as _};
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::RowVisitor;
+
+    struct BaseRowIdCollector<'a> {
+        entries: Vec<(String, i64)>,
+        selection_vector: &'a [bool],
+    }
+
+    impl<'a> RowVisitor for BaseRowIdCollector<'a> {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| {
+                    (
+                        vec![
+                            ColumnName::new(["path"]),
+                            ColumnName::new(["fileConstantValues", "baseRowId"]),
+                        ],
+                        vec![DataType::STRING, DataType::LONG],
+                    )
+                });
+            (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+        }
+
+        fn visit<'b>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'b dyn GetData<'b>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                if i < self.selection_vector.len() && !self.selection_vector[i] {
+                    continue;
+                }
+                let path: String = getters[0].get(i, "path")?;
+                let base_row_id: i64 = getters[1].get(i, "fileConstantValues.baseRowId")?;
+                self.entries.push((path, base_row_id));
+            }
+            Ok(())
+        }
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut all_entries = Vec::new();
+
+    for scan_metadata_result in scan.scan_metadata(engine)? {
+        let scan_metadata = scan_metadata_result?;
+        let mut collector = BaseRowIdCollector {
+            entries: Vec::new(),
+            selection_vector: scan_metadata.scan_files.selection_vector(),
+        };
+        collector.visit_rows_of(scan_metadata.scan_files.data())?;
+        all_entries.extend(collector.entries);
+    }
+
+    all_entries.sort_by_key(|(_, row_id)| *row_id);
+    Ok(all_entries)
+}
+
+/// Verify the row ID high water mark in a batch commit's domain metadata.
+///
+/// Batch commits store file-level row IDs in the content tree manifest (as first_row_id),
+/// not as baseRowId in JSON add actions. The JSON log only contains the domain metadata
+/// with the row ID high water mark.
+async fn verify_batch_commit_hwm(
+    table_url: &Url,
+    commit_version: u64,
+    expected_hwm: i64,
+) -> DeltaResult<()> {
+    let store = delta_kernel::object_store::local::LocalFileSystem::new();
+    let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+    let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<Value>()
+        .try_collect()?;
+
+    let row_tracking_configs: Vec<_> = parsed_actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .get("domainMetadata")
+                .and_then(|meta| match meta.get("domain")?.as_str()? {
+                    "delta.rowTracking" => Some(meta.get("configuration")?.as_str()?),
+                    _ => None,
+                })
+        })
+        .collect();
+
+    assert_eq!(
+        row_tracking_configs.len(),
+        1,
+        "Expected exactly one row tracking domain metadata action"
+    );
+
+    let hwm = serde_json::from_str::<Value>(row_tracking_configs[0])?
+        .get("rowIdHighWaterMark")
+        .expect("rowIdHighWaterMark should be present")
+        .as_i64()
+        .expect("rowIdHighWaterMark should be an i64");
+    assert_eq!(
+        hwm, expected_hwm,
+        "rowIdHighWaterMark should match expected value"
     );
 
     Ok(())
@@ -947,6 +1096,355 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
         vec![0, 1, 2, 3, 4],
         "Row IDs must be globally unique and monotonically increasing across commits"
     );
+
+    Ok(())
+}
+
+/// A batch commit with leaf writers assigns sequential first_row_id values (surfaced as
+/// baseRowId in Delta) and writes the correct row ID high water mark domain metadata.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_single_commit() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("leaf1-part1.parquet", 1024, 1_000_000, 10),
+            ("leaf1-part2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf2-part1.parquet", 3072, 1_000_002, 30)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    // HWM = total_records - 1 = 10 + 20 + 30 - 1 = 59
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 59).await?;
+
+    // Verify all files are visible and have correct baseRowId assignments.
+    // Leaf 1: file1 (10 records) -> baseRowId=0, file2 (20 records) -> baseRowId=10
+    // Leaf 2: file3 (30 records) -> baseRowId=30
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let base_row_ids = collect_base_row_ids(snapshot, engine.as_ref())?;
+    assert_eq!(base_row_ids.len(), 3, "Should have 3 data files");
+    let row_ids: Vec<i64> = base_row_ids.iter().map(|(_, id)| *id).collect();
+    assert_eq!(row_ids, vec![0, 10, 30]);
+
+    Ok(())
+}
+
+/// Two consecutive batch commits correctly advance the row ID high water mark across commits.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_consecutive_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // First commit: create table with 2 files (10 + 20 = 30 records)
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 29).await?;
+
+    // Second commit: add 1 more file with 15 records (row IDs start from 30 = HWM 29 + 1)
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let schema = txn2.add_files_schema();
+    txn2.with_manifest_commit()?;
+    write_leaf(
+        &mut txn2,
+        engine.as_ref(),
+        schema,
+        vec![("file3.parquet", 4096, 1_000_002, 15)],
+    )?;
+    commit_at(txn2, engine.as_ref(), 1)?;
+
+    // Verify second commit HWM = 44 (29 + 15 = 44)
+    verify_batch_commit_hwm(&table_url, 1, 44).await?;
+
+    // Verify all 3 files visible
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    assert_eq!(paths.len(), 3, "Should have 3 data files total");
+
+    Ok(())
+}
+
+/// Multiple leaves in a single batch commit get sequentially assigned first_row_ids,
+/// with each leaf picking up where the previous one left off.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_multiple_leaves() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf1.parquet", 512, 1_000_000, 5)],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf2.parquet", 768, 1_000_001, 7)],
+    )?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("leaf3.parquet", 256, 1_000_002, 3)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    // Verify HWM = 14 (5 + 7 + 3 - 1)
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 14).await?;
+
+    Ok(())
+}
+
+/// A batch commit with multiple files per leaf assigns first_row_ids correctly within each leaf.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_multiple_files_per_leaf(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+            ("file3.parquet", 3072, 1_000_002, 30),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    // Verify HWM = 59 (10 + 20 + 30 - 1)
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 59).await?;
+
+    Ok(())
+}
+
+/// When a batch commit has no actual work (no leaves, no add/remove files), it falls back
+/// to the normal commit path which does not write row tracking domain metadata.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_no_op_skips_batch_path(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // First commit: create the table with some data
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("file1.parquet", 1024, 1_000_000, 10)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    verify_batch_commit_hwm(
+        &Url::from_directory_path(&table_path).unwrap(),
+        0,
+        9, // HWM = 10 - 1
+    )
+    .await?;
+
+    // Second commit: empty batch commit (no leaves added).
+    // Because there is no actual work, the batch commit path is skipped.
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    {
+        txn2.with_manifest_commit()?;
+        // Don't add any leaves
+    }
+    let result = txn2.commit(engine.as_ref())?;
+    assert!(matches!(result, CommitResult::CommittedTransaction(_)));
+
+    // The no-op commit should only contain a commitInfo action (same as the non-batch path)
+    let store = delta_kernel::object_store::local::LocalFileSystem::new();
+    let commit_url = table_url.join("_delta_log/00000000000000000001.json")?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+    let parsed_actions: Vec<Value> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<Value>()
+        .try_collect()?;
+
+    assert_eq!(parsed_actions.len(), 1, "Expected only commitInfo action");
+    assert!(parsed_actions[0].get("commitInfo").is_some());
+
+    // Verify files remain visible from the first commit
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    assert_eq!(paths.len(), 1, "Should still have 1 data file");
+
+    Ok(())
+}
+
+/// Verifies the Iceberg row lineage equivalence: Delta's rowIdHighWaterMark + 1
+/// equals Iceberg's next-row-id, and consecutive commits produce contiguous
+/// ID spaces with no gaps or overlaps.
+#[tokio::test]
+async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    // Commit 0: 10 + 20 = 30 records -> HWM = 29, Iceberg next-row-id = 30
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+    verify_batch_commit_hwm(&table_url, 0, 29).await?;
+
+    // Commit 1: 15 records (row IDs start at 30 = previous HWM + 1)
+    // Contiguity: commit 0 used [0, 30), commit 1 uses [30, 45) -> HWM = 44
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn2 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let schema = txn2.add_files_schema();
+    txn2.with_manifest_commit()?;
+    write_leaf(
+        &mut txn2,
+        engine.as_ref(),
+        schema,
+        vec![("file3.parquet", 3072, 1_000_002, 15)],
+    )?;
+    commit_at(txn2, engine.as_ref(), 1)?;
+    verify_batch_commit_hwm(&table_url, 1, 44).await?;
+
+    // Commit 2: 5 + 10 = 15 records across 2 leaves
+    // Contiguity: commit 2 uses [45, 60) -> HWM = 59
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn3 = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let schema = txn3.add_files_schema();
+    txn3.with_manifest_commit()?;
+    write_leaf(
+        &mut txn3,
+        engine.as_ref(),
+        schema,
+        vec![("file4.parquet", 512, 1_000_003, 5)],
+    )?;
+    write_leaf(
+        &mut txn3,
+        engine.as_ref(),
+        schema,
+        vec![("file5.parquet", 768, 1_000_004, 10)],
+    )?;
+    commit_at(txn3, engine.as_ref(), 2)?;
+    verify_batch_commit_hwm(&table_url, 2, 59).await?;
+
+    // Verify all 5 files have contiguous, non-overlapping baseRowId assignments:
+    // file1(10)=0, file2(20)=10, file3(15)=30, file4(5)=45, file5(10)=50
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let base_row_ids = collect_base_row_ids(snapshot, engine.as_ref())?;
+    assert_eq!(base_row_ids.len(), 5, "Should have 5 data files total");
+    let row_ids: Vec<i64> = base_row_ids.iter().map(|(_, id)| *id).collect();
+    assert_eq!(row_ids, vec![0, 10, 30, 45, 50]);
+
+    Ok(())
+}
+
+/// Multiple leaf writers created and finished independently within a single transaction
+/// get non-overlapping, sequential row ID ranges. This simulates a scenario where
+/// different processes each build a leaf manifest and then add them to the transaction.
+#[tokio::test]
+async fn test_batch_commit_row_tracking_parallel_leaf_writers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+
+    // Simulate parallel leaf creation: each writer is created, populated, and finished
+    // independently. The transaction-level cursor ensures non-overlapping row ID ranges.
+    {
+        let mc = txn.with_manifest_commit()?;
+
+        // Leaf A: 100 records -> row IDs [0, 100)
+        let mut leaf_a = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_a.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![("leaf-a.parquet", 4096, 1_000_000, Some(100))],
+            )?,
+        )?;
+        let result_a = leaf_a.finish(engine.as_ref())?;
+        mc.add_leaf(result_a)?;
+
+        // Leaf B: 50 records -> row IDs [100, 150)
+        let mut leaf_b = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_b.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(schema, vec![("leaf-b.parquet", 2048, 1_000_001, Some(50))])?,
+        )?;
+        let result_b = leaf_b.finish(engine.as_ref())?;
+        mc.add_leaf(result_b)?;
+
+        // Leaf C: 200 records -> row IDs [150, 350)
+        let mut leaf_c = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf_c.add_files(
+            engine.as_ref(),
+            create_add_files_metadata(
+                schema,
+                vec![("leaf-c.parquet", 8192, 1_000_002, Some(200))],
+            )?,
+        )?;
+        let result_c = leaf_c.finish(engine.as_ref())?;
+        mc.add_leaf(result_c)?;
+    }
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), 0);
+
+    // HWM = 100 + 50 + 200 - 1 = 349
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    verify_batch_commit_hwm(&table_url, 0, 349).await?;
+
+    // Verify all 3 files are visible
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot, engine.as_ref())?;
+    assert_eq!(paths.len(), 3, "Should have 3 data files");
 
     Ok(())
 }

@@ -733,7 +733,13 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         };
         builder.add(add, 3, 1)?;
 
-        let metadata = builder.build(engine.as_ref(), 1).unwrap();
+        let metadata = builder
+            .build(
+                engine.as_ref(),
+                1,
+                &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+            )
+            .unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().location
     };
@@ -1054,7 +1060,13 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         };
         builder.add(add, 10, 1)?;
 
-        let metadata = builder.build(engine.as_ref(), 1).unwrap();
+        let metadata = builder
+            .build(
+                engine.as_ref(),
+                1,
+                &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+            )
+            .unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().location
     };
