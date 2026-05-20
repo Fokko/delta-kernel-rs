@@ -118,10 +118,9 @@ fn build_and_read_leaf(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let leaf_metadata =
-        builder.build_leaf(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
+    let leaf_metadata = builder.build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
     let table_root = leaf_metadata.table_root.clone();
-    let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?
+    let leaf_url = ContentTreeNodeWriter::try_new_leaf(leaf_metadata)?
         .write(engine)?
         .location;
     let leaf_path = absolute_to_relative_path(&leaf_url, &table_root);

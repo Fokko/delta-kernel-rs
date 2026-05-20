@@ -105,7 +105,6 @@ static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// - A collection of `ContentTreeNodeEntry` records (one per file)
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
-/// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
 pub(super) struct ContentTreeNode {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
@@ -114,10 +113,6 @@ pub(super) struct ContentTreeNode {
     /// location field). This is NOT normalized or converted - it flows through exactly as
     /// stored in the log. Empty string for newly built metadata that hasn't been written yet.
     path_in_log: String,
-    /// Optional UUID that identifies this metadata as a leaf manifest.
-    /// When writing a root manifest, this is `None`.
-    /// When writing a leaf manifest, this must be set to a unique UUID.
-    leaf: Option<uuid::Uuid>,
 }
 
 /// A manifest entry wrapper.
@@ -220,7 +215,6 @@ impl ContentTreeNode {
             version,
             table_root,
             path_in_log,
-            leaf: None,
         };
         node.validate_root_manifest_entries()?;
         Ok(node)
@@ -297,11 +291,6 @@ impl ContentTreeNode {
             visitor.visit_rows_of(batch.as_ref())?;
         }
         Ok(())
-    }
-
-    /// Returns the leaf UUID if this is a leaf manifest, or `None` if it's a root manifest.
-    pub(crate) fn leaf(&self) -> Option<uuid::Uuid> {
-        self.leaf
     }
 
     pub(crate) fn entries(&self) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
@@ -3090,7 +3079,6 @@ mod tests {
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: String::new(),
-            leaf: None,
         };
 
         // Write metadata using the writer

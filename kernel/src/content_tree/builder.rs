@@ -1002,10 +1002,11 @@ impl ContentTreeNodeBuilder {
     ) -> DeltaResult<ContentTreeNodeEntry> {
         // Capture the starting row ID before build_leaf advances the allocator
         let starting_first_row_id = allocator.current();
-        // Build the leaf metadata with a UUID
-        let leaf_metadata = self.build_leaf(engine, snapshot_id, allocator)?;
+        // Build the manifest payload, then write it as a leaf (the writer generates the UUID
+        // that disambiguate this manifest's filename from other leaves at the same version).
+        let leaf_metadata = self.build(engine, snapshot_id, allocator)?;
 
-        let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let write_result = ContentTreeNodeWriter::try_new_leaf(leaf_metadata)?.write(engine)?;
         let manifest_path =
             super::relativize_manifest_path(&write_result.location, &self.table_root);
         // Use the actual manifest Parquet file size so bulk_processor can pass it to
@@ -1114,7 +1115,9 @@ impl ContentTreeNodeBuilder {
         )
     }
 
-    /// Builds a root ContentTreeNode instance (leaf is `None`).
+    /// Builds a ContentTreeNode from the builder's accumulated state. The caller decides
+    /// whether the resulting metadata is written as a root or leaf manifest by selecting
+    /// the appropriate [`ContentTreeNodeWriter`] constructor.
     ///
     /// Assigns sequential `first_row_id` values to entries that don't already have one,
     /// using the given `allocator`. The allocator is advanced past all assigned row IDs.
@@ -1144,7 +1147,6 @@ impl ContentTreeNodeBuilder {
                 data: vec![],
                 version: self.version,
                 path_in_log: String::new(),
-                leaf: None,
             });
         }
 
@@ -1172,69 +1174,6 @@ impl ContentTreeNodeBuilder {
             data,
             version: self.version,
             path_in_log: String::new(), // Will be set when written
-            leaf: None,
-        })
-    }
-
-    /// Builds a leaf ContentTreeNode instance with a generated UUID.
-    ///
-    /// Assigns sequential `first_row_id` values to data entries using the given `allocator`.
-    /// The allocator is advanced past all assigned row IDs.
-    pub(crate) fn build_leaf(
-        &mut self,
-        engine: &dyn crate::Engine,
-        snapshot_id: i64,
-        allocator: &mut CursorRowIdAllocator,
-    ) -> DeltaResult<ContentTreeNode> {
-        use crate::content_tree::metadata_entry_to_scalars;
-        use crate::expressions::Scalar;
-
-        // Serialize all in-memory DVs back to entries
-        self.serialize_dvs_to_entries(snapshot_id)?;
-
-        // Assign first_row_id values
-        self.assign_first_row_ids_to_pending(allocator);
-        self.assign_first_row_ids_pre_built(engine, allocator)?;
-
-        // Use cached schema with content_stats based on table schema
-        let schema = self.get_schema()?;
-
-        // Handle empty case early
-        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(ContentTreeNode {
-                table_root: self.table_root.clone(),
-                data: vec![],
-                version: self.version,
-                path_in_log: String::new(),
-                leaf: Some(uuid::Uuid::new_v4()),
-            });
-        }
-
-        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
-
-        // Add scalar-built batch from pending_entries (existing path)
-        if !self.pending_entries.is_empty() {
-            let fields_per_row = schema.fields().len();
-            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-            for entry in &self.pending_entries {
-                let scalars = metadata_entry_to_scalars(entry, &schema)?;
-                all_scalars.extend(scalars);
-            }
-            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-            let evaluation_handler = engine.evaluation_handler();
-            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-            data.push(engine_data);
-        }
-
-        // Add pre-transformed columnar batches
-        data.append(&mut self.pre_built_data);
-
-        Ok(ContentTreeNode {
-            table_root: self.table_root.clone(),
-            data,
-            version: self.version,
-            path_in_log: String::new(), // Will be set when written
-            leaf: Some(uuid::Uuid::new_v4()),
         })
     }
 
