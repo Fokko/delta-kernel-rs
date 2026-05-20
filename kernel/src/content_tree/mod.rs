@@ -10,6 +10,10 @@ pub(crate) mod writer;
 #[path = "tests/snaps_and_seqs.rs"]
 mod snaps_and_seqs_tests;
 
+#[cfg(test)]
+#[path = "tests/row_tracking.rs"]
+mod row_tracking_tests;
+
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use std::str::FromStr;
@@ -3891,18 +3895,23 @@ mod tests {
 
         let read_metadata = build_and_roundtrip(vec![entry.clone()], 6, &table_root_url, &engine)?;
 
+        // build_and_roundtrip runs assign_first_row_ids_to_pending which assigns
+        // first_row_id=Some(0) to Added entries that have first_row_id=None
+        let mut expected_entry = entry;
+        expected_entry.tracking.first_row_id = Some(0);
+
         // Verify
         let entries = read_metadata.entries()?;
         assert_eq!(entries.len(), 1);
-        assert_metadata_entry_eq(&entry, &entries[0]);
+        assert_metadata_entry_eq(&expected_entry, &entries[0]);
 
-        // Specifically verify the None values
+        // Specifically verify the None values (except first_row_id which gets assigned)
         let actual = &entries[0];
         let ti = &actual.tracking;
         assert!(ti.snapshot_id.is_none());
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
-        assert!(ti.first_row_id.is_none());
+        assert_eq!(ti.first_row_id, Some(0));
         assert!(ti.changes_dv.is_none());
         assert!(actual
             .manifest_info
@@ -3962,7 +3971,11 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        builder.build(engine, 1)
+        builder.build(
+            engine,
+            1,
+            &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+        )
     }
 
     /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
@@ -3980,7 +3993,11 @@ mod tests {
         for entry in entries {
             builder.add_entry(entry);
         }
-        let metadata = builder.build(engine, 1)?;
+        let metadata = builder.build(
+            engine,
+            1,
+            &mut crate::row_tracking::CursorRowIdAllocator::new(0),
+        )?;
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
             .write(engine)?
@@ -4030,7 +4047,8 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_entry(entry);
-        let metadata = builder.build(&engine, 1)?;
+        let mut allocator = crate::row_tracking::CursorRowIdAllocator::new(0);
+        let metadata = builder.build(&engine, 1, &mut allocator)?;
 
         // Write the manifest to disk (produces a Delta-log-style path)
         let write_result = writer::ContentTreeNodeWriter::try_new(metadata)?.write(&engine)?;

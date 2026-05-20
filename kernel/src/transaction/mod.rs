@@ -7,12 +7,11 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
-#[cfg(feature = "iceberg-nativev4")]
-use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema, get_log_remove_schema,
-    get_log_txn_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
-    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
+    CommitInfo, ContentRoot, DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME,
+    PROTOCOL_NAME,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -29,7 +28,7 @@ use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
-use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::row_tracking::{CursorRowIdAllocator, RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
@@ -52,7 +51,7 @@ pub mod manifest_commit_state;
 
 use content_tree::ScanMetadataRemoveVisitor;
 // Re-export types needed for public API
-pub use leaf_writer::LeafNodeWriterResult;
+pub use leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 pub use manifest_commit_state::{ExplicitRootManifestCommit, ManifestCommitState};
 
 #[cfg(feature = "internal-api")]
@@ -469,7 +468,9 @@ impl<S> Transaction<S> {
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
 
-        // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
+        let manifest_commit = self.is_manifest_commit();
+
+        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
         // than written to the delta log (same issue as removes). This requires:
         // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions to
@@ -480,17 +481,16 @@ impl<S> Transaction<S> {
         //    check.
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 5: Generate remove actions for the delta log (skipped in manifest commit mode, where
+        // Step 6: Generate remove actions for the delta log (skipped in manifest commit mode, where
         // removes are recorded in the content tree instead).
-        let manifest_commit = self.is_manifest_commit();
         let remove_actions = if manifest_commit {
             None
         } else {
             Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
         };
 
-        // Step 6: Generate all log actions (commit info, protocol, metadata for create-table or
-        // alter-table, set transactions, domain metadata, add actions)
+        // Step 7: Generate all log actions (commit info, protocol, metadata for create-table,
+        // set transactions, domain metadata, add actions).
         let (actions, dm_changes) = self.generate_log_actions(
             engine,
             commit_version,
@@ -606,7 +606,7 @@ impl<S> Transaction<S> {
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
-        let (domain_metadata_actions, dm_changes) =
+        let (domain_metadata_actions, mut dm_changes) =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Start with commit info action
@@ -797,11 +797,18 @@ impl<S> Transaction<S> {
                 }
             }
 
-            let new_metadata = metadata_builder.build(engine, snapshot_id)?;
+            let (root_node, dm_action, dm_data) = self.build_manifest_root_with_row_tracking(
+                engine,
+                &mut metadata_builder,
+                snapshot_id,
+            )?;
+            actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(dm_data)));
+            dm_changes.push(dm_action);
+
             let ContentTreeWriteResult {
                 location: content_metadata_path,
                 size_in_bytes,
-            } = ContentTreeNodeWriter::try_new(new_metadata)?.write(engine)?;
+            } = ContentTreeNodeWriter::try_new(root_node)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.effective_table_config.table_root(),
@@ -1269,6 +1276,50 @@ impl<S> Transaction<S> {
                     .map_or(snap.version() > 0, |ca| ca.version < snap.version())
             });
         can_manifest_commit && has_work_to_do
+    }
+
+    /// Builds the manifest root node with row tracking, returning the root node and the
+    /// row tracking high water mark domain metadata action.
+    ///
+    /// Computes the starting row ID from either the manifest commit state's cached cursor
+    /// (if a leaf writer already advanced it) or the snapshot's high water mark + 1.
+    /// After building, the allocator's final cursor becomes the new high water mark.
+    fn build_manifest_root_with_row_tracking(
+        &self,
+        engine: &dyn Engine,
+        metadata_builder: &mut crate::content_tree::builder::ContentTreeNodeBuilder,
+        snapshot_id: i64,
+    ) -> DeltaResult<(
+        crate::content_tree::ContentTreeNode,
+        DomainMetadata,
+        Box<dyn EngineData>,
+    )> {
+        let starting_first_row_id = if let Some(Some(cursor)) = self
+            .manifest_commit_state
+            .as_ref()
+            .map(|mc| mc.row_id_cursor)
+        {
+            cursor
+        } else if let Some(read_snapshot) = self.read_snapshot_opt.as_deref() {
+            let hwm = RowTrackingDomainMetadata::get_high_water_mark(read_snapshot, engine)?;
+            hwm.unwrap_or(-1) + 1
+        } else {
+            0
+        };
+
+        let mut allocator = CursorRowIdAllocator::new(starting_first_row_id);
+        let root_node = metadata_builder.build(engine, snapshot_id, &mut allocator)?;
+
+        // The allocator's cursor is the first *unassigned* row ID, but the high water
+        // mark records the last *assigned* one (i.e. the inclusive upper bound), so we
+        // subtract 1.
+        let new_hwm = allocator.current() - 1;
+        let rt_dm = RowTrackingDomainMetadata::new(new_hwm);
+        let dm_action: DomainMetadata = rt_dm.try_into()?;
+        let schema = get_log_domain_metadata_schema().clone();
+        let dm_data = dm_action.clone().into_engine_data(schema, engine)?;
+
+        Ok((root_node, dm_action, dm_data))
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
@@ -2989,11 +3040,12 @@ mod tests {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -3081,11 +3133,12 @@ mod tests {
         for path in &data_files {
             leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -3211,14 +3264,15 @@ mod tests {
         // File without DV
         data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1)?;
+        let data_leaf_entry =
+            data_leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
 
         // DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_metadata = root_builder.build(&engine, 1)?;
+        let root_metadata = root_builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
@@ -4167,7 +4221,7 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         builder.add(make_add_action("data/file-0.parquet".into()), 1, 1)?;
-        let root_metadata = builder.build(&engine, 1)?;
+        let root_metadata = builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;

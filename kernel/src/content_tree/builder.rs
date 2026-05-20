@@ -22,8 +22,9 @@ use crate::content_tree::{
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
 use crate::log_replay::{ActionsBatch, FileActionKey};
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{
     column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
     StructField, StructType,
@@ -987,14 +988,23 @@ impl ContentTreeNodeBuilder {
     /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
     #[instrument(name = "content_tree.write_leaf", skip_all, err)]
+    /// Builds and writes a leaf manifest, returning the DataManifest entry for the root.
+    ///
+    /// Assigns sequential `first_row_id` values to data entries in the leaf using the given
+    /// `allocator`. The returned DataManifest entry will have its `first_row_id` set to
+    /// the allocator's cursor position at the time of this call. The allocator is advanced past
+    /// all assigned row IDs.
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: i64,
+        allocator: &mut CursorRowIdAllocator,
     ) -> DeltaResult<ContentTreeNodeEntry> {
+        // Capture the starting row ID before build_leaf advances the allocator
+        let starting_first_row_id = allocator.current();
         // Build the manifest payload, then write it as a leaf (the writer generates the UUID
-        // that disambiguates this manifest's filename from other leaves at the same version).
-        let leaf_metadata = self.build(engine, snapshot_id)?;
+        // that disambiguate this manifest's filename from other leaves at the same version).
+        let leaf_metadata = self.build(engine, snapshot_id, allocator)?;
 
         let write_result = ContentTreeNodeWriter::try_new_leaf(leaf_metadata)?.write(engine)?;
         let manifest_path =
@@ -1093,7 +1103,8 @@ impl ContentTreeNodeBuilder {
                     // entries can inherit them when null.
                     sequence_number: None,
                     file_sequence_number: None,
-                    first_row_id: None,
+                    // Set to the starting row ID used for data entries in this leaf
+                    first_row_id: Some(starting_first_row_id),
                     changes_dv: None,
                 })
                 .record_count(record_count)
@@ -1107,16 +1118,24 @@ impl ContentTreeNodeBuilder {
     /// Builds a ContentTreeNode from the builder's accumulated state. The caller decides
     /// whether the resulting metadata is written as a root or leaf manifest by selecting
     /// the appropriate [`ContentTreeNodeWriter`] constructor.
+    ///
+    /// Assigns sequential `first_row_id` values to entries that don't already have one,
+    /// using the given `allocator`. The allocator is advanced past all assigned row IDs.
     pub(crate) fn build(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: i64,
+        allocator: &mut CursorRowIdAllocator,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
+
+        // Assign first_row_id values
+        self.assign_first_row_ids_to_pending(allocator);
+        self.assign_first_row_ids_pre_built(engine, allocator)?;
 
         // Use cached schema with content_stats based on table schema
         let schema = self.get_schema()?;
@@ -1284,6 +1303,123 @@ impl ContentTreeNodeBuilder {
         Ok((transformed, aggregates))
     }
 
+    /// Assigns `first_row_id` to entries that need it, following the spec rules:
+    /// - Preserve existing `first_row_id` for entries that already have one
+    /// - Assign sequential IDs for Data and DataManifest entries without `first_row_id`
+    ///
+    /// Uses the given `allocator` to reserve row ID ranges. For entries with existing IDs,
+    /// the allocator cursor is advanced past their range without allocating new IDs.
+    fn assign_first_row_ids_to_pending(&mut self, allocator: &mut CursorRowIdAllocator) {
+        for entry in &mut self.pending_entries {
+            let ti = &mut entry.tracking;
+
+            // Deleted entries preserve their existing first_row_id but don't consume row IDs
+            if ti.status == TrackingStatus::Deleted {
+                continue;
+            }
+
+            match entry.content_type {
+                DataContentType::Data if ti.first_row_id.is_none() => {
+                    ti.first_row_id = Some(allocator.reserve_row_ids(entry.record_count));
+                }
+                DataContentType::DataManifest if ti.first_row_id.is_none() => {
+                    let row_increment = entry
+                        .manifest_info
+                        .as_ref()
+                        .map(|mi| mi.added_rows_count + mi.existing_rows_count)
+                        .unwrap_or(0);
+                    ti.first_row_id = Some(allocator.reserve_row_ids(row_increment));
+                }
+                // PositionDeletes, EqualityDeletes, or already assigned: no-op
+                _ => {}
+            }
+        }
+    }
+
+    /// Assigns `first_row_id` to pre-built EngineData batches that contain opaque columnar data.
+    ///
+    /// Uses a visitor to read `recordCount` per row, computes sequential `first_row_id` values
+    /// via the given `allocator`, then uses `append_columns` + expression evaluator to replace
+    /// `tracking.firstRowId`.
+    fn assign_first_row_ids_pre_built(
+        &mut self,
+        engine: &dyn crate::Engine,
+        allocator: &mut CursorRowIdAllocator,
+    ) -> DeltaResult<()> {
+        if self.pre_built_data.is_empty() {
+            return Ok(());
+        }
+
+        let output_schema = self.get_schema()?;
+        let mut new_pre_built = Vec::with_capacity(self.pre_built_data.len());
+
+        for batch in self.pre_built_data.drain(..) {
+            // Step 1: Visit to get record counts per row
+            let mut record_counts_visitor = RecordCountVisitor::with_capacity(batch.len());
+            record_counts_visitor.visit_rows_of(batch.as_ref())?;
+
+            // Step 2: Compute first_row_id for each row, preserving existing non-null values.
+            // This mirrors `assign_first_row_ids_to_pending` which checks `is_none()` before
+            // allocating.
+            let mut first_row_ids = Vec::with_capacity(record_counts_visitor.record_counts.len());
+            for (rc, existing_id) in record_counts_visitor
+                .record_counts
+                .iter()
+                .zip(record_counts_visitor.first_row_ids.iter())
+            {
+                if let Some(id) = existing_id {
+                    first_row_ids.push(*id);
+                } else {
+                    first_row_ids.push(allocator.reserve_row_ids(*rc));
+                }
+            }
+
+            // Step 3: Append _first_row_id column to the batch
+            let append_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+                "_first_row_id",
+                DataType::LONG,
+            )]));
+            let first_row_id_array =
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
+            let augmented = batch.append_columns(append_schema, vec![first_row_id_array])?;
+
+            // Step 4: Use a Transform to replace tracking.firstRowId with _first_row_id,
+            // preserving existing non-null values via coalesce, then drop the helper column.
+            // Input schema = output_schema + _first_row_id
+            let mut input_fields: Vec<StructField> =
+                output_schema.fields().cloned().collect::<Vec<_>>();
+            input_fields.push(StructField::nullable("_first_row_id", DataType::LONG));
+            let input_schema = Arc::new(StructType::new_unchecked(input_fields));
+
+            let transform_expr = Expression::transform(
+                Transform::new_top_level()
+                    .with_replaced_field(
+                        "tracking",
+                        Arc::new(Expression::transform(
+                            Transform::new_nested(["tracking"]).with_replaced_field(
+                                "firstRowId",
+                                Arc::new(Expression::coalesce([
+                                    Expression::column(["tracking", "firstRowId"]),
+                                    Expression::column(["_first_row_id"]),
+                                ])),
+                            ),
+                        )),
+                    )
+                    .with_dropped_field("_first_row_id"),
+            );
+            let evaluator = engine.evaluation_handler().new_expression_evaluator(
+                input_schema,
+                Arc::new(transform_expr),
+                DataType::Struct(Box::new(output_schema.as_ref().clone())),
+            )?;
+            let result = evaluator.evaluate(augmented.as_ref())?;
+            new_pre_built.push(result);
+        }
+
+        self.pre_built_data = new_pre_built;
+        Ok(())
+    }
+
     /// Adds file metadata from existing scan rows to the leaf manifest.
     ///
     /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
@@ -1304,9 +1440,6 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
-        use crate::expressions::{ArrayData, Expression};
-        use crate::schema::{ArrayType, StructField, StructType};
-
         if engine_data.is_empty() {
             return Ok(());
         }
@@ -1455,6 +1588,48 @@ impl RowVisitor for TransformedAggregateVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.total_record_count += record_count;
+        }
+        Ok(())
+    }
+}
+
+/// Visitor that reads per-row record counts and existing `firstRowId` values from pre-built
+/// EngineData batches. Used by `assign_first_row_ids_pre_built` to compute sequential
+/// first_row_id values while preserving any already-assigned IDs.
+struct RecordCountVisitor {
+    record_counts: Vec<i64>,
+    first_row_ids: Vec<Option<i64>>,
+}
+
+impl RecordCountVisitor {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            record_counts: Vec::with_capacity(cap),
+            first_row_ids: Vec::with_capacity(cap),
+        }
+    }
+}
+
+impl RowVisitor for RecordCountVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::column_name;
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("recordCount"),
+                column_name!("tracking.firstRowId"),
+            ];
+            let types = vec![DataType::LONG, DataType::LONG];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            let record_count: i64 = getters[0].get(i, "recordCount")?;
+            self.record_counts.push(record_count);
+            let first_row_id: Option<i64> = getters[1].get_opt(i, "tracking.firstRowId")?;
+            self.first_row_ids.push(first_row_id);
         }
         Ok(())
     }
@@ -2225,7 +2400,8 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot_id: i64,
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let root_metadata = builder.build(engine, snapshot_id)?;
+        let root_metadata =
+            builder.build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
         let table_root = root_metadata.table_root.clone();
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(engine)?
@@ -2424,7 +2600,7 @@ mod tests {
 
         // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, 1)?;
+        let metadata = builder.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].record_count, 100);
@@ -2854,7 +3030,8 @@ mod tests {
         builder.add_entry(entry2);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
 
         // Verify content_stats is populated on the leaf manifest entry
         assert!(
@@ -2952,7 +3129,8 @@ mod tests {
         builder.add_entry(entry);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
 
         // When all entries have None content_stats, the aggregate should also be None
         assert!(
@@ -3153,7 +3331,8 @@ mod tests {
         }
 
         // Write the leaf
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
@@ -3240,7 +3419,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
@@ -3312,7 +3492,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
@@ -3365,7 +3546,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
@@ -3433,7 +3615,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
         // leaf_path is now already relative
         let relative_path = &leaf_path;
@@ -3574,7 +3757,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
@@ -3797,7 +3981,8 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
@@ -4080,4 +4265,339 @@ mod tests {
     // - Full table scans with the backfill tool
 
     // Disabled complex unit test - see note above
+
+    // --- Tests for assign_first_row_ids_to_pending ---
+
+    fn make_data_entry(
+        record_count: i64,
+        status: TrackingStatus,
+        first_row_id: Option<i64>,
+    ) -> ContentTreeNodeEntry {
+        ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(format!("file-{}.parquet", record_count))
+            .tracking(TrackingInfo {
+                status,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id,
+                changes_dv: None,
+            })
+            .record_count(record_count)
+            .file_size_in_bytes(1024)
+            .build()
+    }
+
+    fn make_manifest_entry(
+        added_rows: i64,
+        existing_rows: i64,
+        status: TrackingStatus,
+        first_row_id: Option<i64>,
+    ) -> ContentTreeNodeEntry {
+        ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(format!("manifest-{}-{}.parquet", added_rows, existing_rows))
+            .tracking(TrackingInfo {
+                status,
+                snapshot_id: Some(1),
+                sequence_number: None,
+                file_sequence_number: None,
+                first_row_id,
+                changes_dv: None,
+            })
+            .record_count(added_rows + existing_rows)
+            .file_size_in_bytes(2048)
+            .manifest_info_opt(Some(ManifestInfo {
+                added_files_count: 1,
+                existing_files_count: 1,
+                deleted_files_count: 0,
+                replaced_files_count: 0,
+                added_rows_count: added_rows,
+                existing_rows_count: existing_rows,
+                deleted_rows_count: 0,
+                replaced_rows_count: 0,
+                min_sequence_number: 1,
+                dv: None,
+                dv_cardinality: None,
+            }))
+            .build()
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_data_entries_only() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_data_entry(200, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_data_entry(50, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(allocator.current(), 350);
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(300));
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_combined_manifest_entries() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder
+            .pending_entries
+            .push(make_manifest_entry(100, 200, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(allocator.current(), 400);
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(300));
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_preserves_existing() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder.pending_entries.push(make_manifest_entry(
+            100,
+            200,
+            TrackingStatus::Existing,
+            Some(0),
+        ));
+        builder
+            .pending_entries
+            .push(make_manifest_entry(50, 50, TrackingStatus::Added, None));
+
+        // Allocator starts at HWM+1 = 300 (existed entry covers [0, 300))
+        let mut allocator = CursorRowIdAllocator::new(300);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(300));
+        assert_eq!(allocator.current(), 400);
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_deleted_entries_skipped() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_data_entry(200, TrackingStatus::Deleted, Some(999)));
+        builder
+            .pending_entries
+            .push(make_data_entry(50, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(999));
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(100));
+        assert_eq!(allocator.current(), 150);
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_mixed_data_and_manifests() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_manifest_entry(50, 150, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_data_entry(75, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
+        assert_eq!(builder.pending_entries[2].tracking.first_row_id, Some(300));
+        assert_eq!(allocator.current(), 375);
+    }
+
+    #[test]
+    fn test_assign_first_row_ids_nonzero_starting_value() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+        builder
+            .pending_entries
+            .push(make_data_entry(200, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(501);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(501));
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(601));
+        assert_eq!(allocator.current(), 801);
+    }
+
+    // --- Tests for Iceberg row lineage compatibility ---
+
+    /// Verifies that the eager first_row_id assignment for data files within a leaf
+    /// produces values equivalent to Iceberg's lazy inheritance model: each data file's
+    /// first_row_id == manifest's first_row_id + sum of preceding files' record_counts.
+    #[test]
+    fn test_assign_first_row_ids_iceberg_inheritance_equivalence() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Simulate a leaf manifest containing 3 data files: 100, 50, 200 records
+        let record_counts = [100i64, 50, 200];
+        for &rc in &record_counts {
+            builder
+                .pending_entries
+                .push(make_data_entry(rc, TrackingStatus::Added, None));
+        }
+
+        let manifest_first_row_id = 42i64;
+        let mut allocator = CursorRowIdAllocator::new(manifest_first_row_id);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        // Verify Iceberg inheritance equivalence:
+        // file[i].first_row_id == manifest_first_row_id + sum(record_counts[0..i])
+        let mut cumulative = 0i64;
+        for (i, &rc) in record_counts.iter().enumerate() {
+            let expected = manifest_first_row_id + cumulative;
+            assert_eq!(
+                builder.pending_entries[i]
+                    .tracking
+                    .first_row_id,
+                Some(expected),
+                "file {i}: expected first_row_id={expected} (manifest={manifest_first_row_id} + cumulative={cumulative})"
+            );
+            cumulative += rc;
+        }
+
+        // allocator cursor == manifest_first_row_id + total_records
+        assert_eq!(allocator.current(), manifest_first_row_id + cumulative);
+    }
+
+    /// Existed data entries with null first_row_id (from scan-row rebuild) get
+    /// correctly assigned new IDs, matching Iceberg's rule that all unassigned
+    /// first_row_id values require inheritance assignment.
+    #[test]
+    fn test_assign_first_row_ids_existed_null_get_assigned() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Existed entry with null first_row_id (e.g., from table upgrade or scan rebuild)
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Existing, None));
+        // Added entry after it
+        builder
+            .pending_entries
+            .push(make_data_entry(50, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        // The Existed entry should be assigned first_row_id=0
+        assert_eq!(
+            builder.pending_entries[0].tracking.first_row_id,
+            Some(0),
+            "Existed entry with null first_row_id should be assigned"
+        );
+        // The Added entry should follow sequentially
+        assert_eq!(builder.pending_entries[1].tracking.first_row_id, Some(100));
+        assert_eq!(allocator.current(), 150);
+    }
+
+    /// PositionDeletes and EqualityDeletes content types never get first_row_id
+    /// assigned, matching Iceberg's rule that delete files always have null first_row_id.
+    #[test]
+    fn test_assign_first_row_ids_delete_content_types_always_null() {
+        let table_root = Url::parse("memory:///test/").unwrap();
+        let mut builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
+
+        // Data entry first
+        builder
+            .pending_entries
+            .push(make_data_entry(100, TrackingStatus::Added, None));
+
+        // PositionDeletes entry
+        builder.pending_entries.push(
+            ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
+                .location("pos-deletes.parquet")
+                .tracking(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                })
+                .record_count(50)
+                .file_size_in_bytes(512)
+                .build(),
+        );
+
+        // EqualityDeletes entry
+        builder.pending_entries.push(
+            ContentTreeNodeEntryBuilder::new(DataContentType::EqualityDeletes)
+                .location("eq-deletes.parquet")
+                .tracking(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                })
+                .record_count(25)
+                .file_size_in_bytes(256)
+                .build(),
+        );
+
+        // Another data entry after the deletes
+        builder
+            .pending_entries
+            .push(make_data_entry(75, TrackingStatus::Added, None));
+
+        let mut allocator = CursorRowIdAllocator::new(0);
+        builder.assign_first_row_ids_to_pending(&mut allocator);
+
+        // Data entry gets assigned
+        assert_eq!(builder.pending_entries[0].tracking.first_row_id, Some(0));
+        // PositionDeletes: no first_row_id assignment
+        assert_eq!(
+            builder.pending_entries[1].tracking.first_row_id, None,
+            "PositionDeletes should not get first_row_id"
+        );
+        // EqualityDeletes: no first_row_id assignment
+        assert_eq!(
+            builder.pending_entries[2].tracking.first_row_id, None,
+            "EqualityDeletes should not get first_row_id"
+        );
+        // Next data entry picks up where the first left off (deletes don't consume IDs)
+        assert_eq!(builder.pending_entries[3].tracking.first_row_id, Some(100));
+        assert_eq!(allocator.current(), 175);
+    }
 }

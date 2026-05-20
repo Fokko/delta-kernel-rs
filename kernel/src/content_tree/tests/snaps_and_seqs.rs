@@ -15,6 +15,7 @@ use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
     TrackingStatus,
 };
+use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
 use crate::{DeltaResult, Version};
 
@@ -85,7 +86,7 @@ fn write_root_manifest(
     table_root: &Url,
     snapshot_id: i64,
 ) -> DeltaResult<String> {
-    let root = builder.build(engine, snapshot_id)?;
+    let root = builder.build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
     let root_url = ContentTreeNodeWriter::try_new(root)?
         .write(engine)?
         .location;
@@ -98,7 +99,7 @@ fn build_and_read_root(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let root_metadata = builder.build(engine, snapshot_id)?;
+    let root_metadata = builder.build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
     let table_root = root_metadata.table_root.clone();
     let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
         .write(engine)?
@@ -117,7 +118,8 @@ fn build_and_read_leaf(
     engine: &dyn crate::Engine,
     snapshot_id: i64,
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-    let leaf_metadata = builder.build(engine, snapshot_id)?;
+    let leaf_metadata =
+        builder.build(engine, snapshot_id, &mut CursorRowIdAllocator::new(0))?;
     let table_root = leaf_metadata.table_root.clone();
     let leaf_url = ContentTreeNodeWriter::try_new_leaf(leaf_metadata)?
         .write(engine)?
@@ -234,8 +236,9 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     )?;
 
     // Write as a leaf manifest and verify the DataManifest entry
-    let manifest_entry = builder.write_leaf(&engine, 3)?;
+    let manifest_entry = builder.write_leaf(&engine, 3, &mut CursorRowIdAllocator::new(0))?;
     assert_eq!(manifest_entry.content_type, DataContentType::DataManifest);
+
     let manifest_info = &manifest_entry.tracking;
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
