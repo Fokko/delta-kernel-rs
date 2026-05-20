@@ -170,6 +170,7 @@ impl CreateTableTransaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            dv_updates_by_path: std::collections::HashMap::new(),
             snapshot_id: crate::actions::generate_snapshot_id(),
             manifest_commit_state: None,
             explicit_root_manifest_commit: None,

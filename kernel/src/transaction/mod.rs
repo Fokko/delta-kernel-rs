@@ -289,6 +289,13 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // New DV descriptor per file path, captured at update_deletion_vectors() time. Used only by
+    // the manifest-commit DV-update path to look up a file's new DV and mutate the existing
+    // ContentTreeNodeEntry.deletion_vector in place (preserving sequence_number). Stored as the
+    // raw descriptor so the conversion to DeletionVectorInfo (which may fail for short relative
+    // paths used in tests) is deferred to commit time and skipped entirely on the regular
+    // commit path.
+    dv_updates_by_path: HashMap<String, crate::actions::deletion_vector::DeletionVectorDescriptor>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
     // Leaf-based manifest commit state. `Some` when the caller has opted in via
@@ -797,35 +804,73 @@ impl<S> Transaction<S> {
                 }
             }
 
-            // In manifest commit mode, process DV updates by:
-            // 1. Marking old entries as deleted (reuses ScanMetadataRemoveVisitor)
-            // 2. Re-adding entries with the new DV via add_from_existing_scan_rows
+            // In manifest commit mode, process DV updates by classifying each matched file:
+            //   - Root-resident: the file's entry is already in `pending_entries`. Mutate its
+            //     `deletion_vector` in place. This preserves `tracking.sequence_number`, since a DV
+            //     update is metadata-only and must not reset the file's data sequence number to
+            //     `commit_version`.
+            //   - Leaf-resident: the file lives in a leaf manifest. Clear it from the leaf's
+            //     manifest_dv bitmap and re-add it to the root via add_from_existing_scan_rows.
+            //
+            // TODO: leaf-resident DV updates still inherit `commit_version` as their new
+            // `sequence_number` because the leaf manifest is not loaded into `pending_entries`
+            // during a manifest commit. Preserving the original leaf seq_num would require
+            // reading it from the leaf manifest itself. Not exercised by a failing test today.
             //
             // The substitute_new_dv transform replaces deletionVector with newDeletionVector
             // and drops the temp column. A null stats_parsed column is appended so
             // add_from_existing_scan_rows can use its coalesce(stats_parsed, parse_json(stats))
             // fallback to recover stats from the raw JSON string.
             if !self.dv_matched_files.is_empty() {
-                // Phase 1: Mark old entries as deleted.
-                let leaf_deletions = {
-                    let mut visitor = ScanMetadataRemoveVisitor::new(
+                let mut combined_leaf_deletions: HashMap<String, roaring::RoaringTreemap> =
+                    HashMap::new();
+                let mut leaf_selections: Vec<Vec<bool>> =
+                    Vec::with_capacity(self.dv_matched_files.len());
+
+                for batch in self.dv_matched_files.iter() {
+                    let decisions = content_tree::collect_dv_update_decisions(
+                        batch.data(),
+                        batch.selection_vector(),
                         root_manifest_path.as_deref(),
-                        |path, dv_path| {
-                            metadata_builder.mark_deleted(Some(path), dv_path, snapshot_id)
-                        },
-                    );
-                    for batch in self.dv_matched_files.iter() {
-                        visitor.selection_vector = batch.selection_vector();
-                        visitor.visit_rows_of(batch.data())?;
+                    )?;
+
+                    // Root-resident: mutate the existing entry's DV in place.
+                    for path in &decisions.root_paths {
+                        let new_dv = match self.dv_updates_by_path.get(path) {
+                            Some(descriptor) => Some(
+                                crate::content_tree::builder::extract_deletion_vector_content(
+                                    descriptor,
+                                )?,
+                            ),
+                            None => None,
+                        };
+                        if !metadata_builder.update_dv(path, new_dv) {
+                            // Defensive: scan classified this as root-resident but the entry
+                            // isn't in pending_entries. Should not happen for well-formed
+                            // transactions; fall back to mark_deleted.
+                            metadata_builder.mark_deleted(Some(path), None, snapshot_id)?;
+                        }
                     }
-                    visitor.leaf_deletions
-                };
-                for (manifest_path, indices) in &leaf_deletions {
+
+                    for (mp, indices) in decisions.leaf_deletions {
+                        combined_leaf_deletions
+                            .entry(mp)
+                            .or_default()
+                            .extend(indices);
+                    }
+                    leaf_selections.push(decisions.leaf_only_selection);
+                }
+
+                for (manifest_path, indices) in &combined_leaf_deletions {
                     metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
                 }
 
-                // Phase 2: Re-add entries with updated DV.
-                for batch in self.dv_matched_files.iter() {
+                // Re-add leaf-resident rows to the root with the new DV. Root rows were
+                // already handled in place above, so they are cleared from `leaf_selection`.
+                for (batch, leaf_selection) in self.dv_matched_files.iter().zip(leaf_selections) {
+                    if !leaf_selection.iter().any(|&b| b) {
+                        continue;
+                    }
                     let transformed = update::substitute_new_dv_for_content_tree(
                         engine,
                         batch,
@@ -834,7 +879,7 @@ impl<S> Transaction<S> {
                     metadata_builder.add_from_existing_scan_rows(
                         engine,
                         transformed.data(),
-                        transformed.selection_vector(),
+                        &leaf_selection,
                         commit_version,
                         snapshot_id,
                     )?;

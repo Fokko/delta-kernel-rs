@@ -94,6 +94,7 @@ impl Transaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            dv_updates_by_path: HashMap::new(),
             snapshot_id: generate_snapshot_id(),
             manifest_commit_state: None,
             explicit_root_manifest_commit: None,
@@ -360,6 +361,12 @@ impl Transaction {
                 new_dv_descriptors.len()
             )));
         }
+
+        // Stash the descriptors by path for the manifest-commit DV-update path. Conversion to
+        // DeletionVectorInfo (which may fail on relative DVs with short paths) is deferred to
+        // commit time inside the manifest-commit branch so the regular commit path is
+        // unaffected.
+        self.dv_updates_by_path.extend(new_dv_descriptors);
 
         Ok(())
     }
