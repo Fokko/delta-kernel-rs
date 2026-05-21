@@ -546,14 +546,13 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
-    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
-            Some(&arrow_schema),
+            Some(&table_schema),
         )
         .map(Into::into)
     });
@@ -629,7 +628,6 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -637,7 +635,7 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
-                    Some(&arrow_schema),
+                    Some(&table_schema),
                 )
                 .map(Into::into)
             });
@@ -1668,9 +1666,12 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        // Verify data was correctly matched by field ID and output uses kernel schema names
+        // Verify data was correctly matched by field ID
         assert_eq!(data.len(), 1);
         let batch = &data[0];
+
+        // Verify columns were renamed to match the kernel schema (the names from the parquet
+        // file's schema are discarded; the matching agreed on field IDs only).
         let schema = batch.schema();
         assert_eq!(schema.field(0).name(), "user_id");
         assert_eq!(schema.field(1).name(), "user_name");

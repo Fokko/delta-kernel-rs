@@ -4,7 +4,7 @@ use std::sync::Arc;
 use url::Url;
 
 use super::read_files;
-use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
+use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -29,7 +29,6 @@ fn try_create_from_parquet(
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
     let reader_options = reader_options();
     let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
@@ -56,7 +55,7 @@ fn try_create_from_parquet(
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
-            Some(&arrow_schema),
+            Some(&schema),
         )
     }))
 }
