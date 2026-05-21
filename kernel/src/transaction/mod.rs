@@ -289,6 +289,13 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // New DV descriptor per file path, captured at update_deletion_vectors() time. Used only by
+    // the manifest-commit DV-update path to look up a file's new DV and mutate the existing
+    // ContentTreeNodeEntry.deletion_vector in place (preserving sequence_number). Stored as the
+    // raw descriptor so the conversion to DeletionVectorInfo (which may fail for short relative
+    // paths used in tests) is deferred to commit time and skipped entirely on the regular
+    // commit path.
+    dv_updates_by_path: HashMap<String, crate::actions::deletion_vector::DeletionVectorDescriptor>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
     // Leaf-based manifest commit state. `Some` when the caller has opted in via
@@ -468,28 +475,23 @@ impl<S> Transaction<S> {
         // Use transaction's snapshot_id directly (already i64)
         let snapshot_id = self.snapshot_id;
 
+        // Step 4: Determine if manifest commit is active (needed before generating DV/remove
+        // actions, since those are suppressed from the log in manifest commit mode).
         let manifest_commit = self.is_manifest_commit();
 
-        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
-        // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
-        // than written to the delta log (same issue as removes). This requires:
-        // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions to
-        //    update the content tree with new DV descriptors.
-        // 2. Suppressing dv_update_actions from the log (similar to how remove_actions are
-        //    suppressed when manifest_commit is active).
-        // 3. Including !self.dv_matched_files.is_empty() in is_manifest_commit()'s has_work_to_do
-        //    check.
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
-
-        // Step 6: Generate remove actions for the delta log (skipped in manifest commit mode, where
-        // removes are recorded in the content tree instead).
-        let remove_actions = if manifest_commit {
-            None
+        // Step 5: Generate remove and DV update actions for the delta log. Both are skipped in
+        // manifest commit mode, where they are recorded in the content tree instead (see
+        // generate_log_actions).
+        let (remove_actions, dv_update_actions) = if manifest_commit {
+            (None, None)
         } else {
-            Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
+            let removes =
+                self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+            let dv_updates = self.generate_dv_update_actions(engine)?;
+            (Some(removes), Some(dv_updates))
         };
 
-        // Step 7: Generate all log actions (commit info, protocol, metadata for create-table,
+        // Step 6: Generate all log actions (commit info, protocol, metadata for create-table,
         // set transactions, domain metadata, add actions).
         let (actions, dm_changes) = self.generate_log_actions(
             engine,
@@ -502,7 +504,7 @@ impl<S> Transaction<S> {
         let filtered_actions = actions
             .into_iter()
             .chain(remove_actions.into_iter().flatten())
-            .chain(dv_update_actions);
+            .chain(dv_update_actions.into_iter().flatten());
 
         // Step 7: Commit via the committer
         let commit_metadata = self.create_commit_metadata(
@@ -707,6 +709,11 @@ impl<S> Transaction<S> {
                     "remove_files is not supported in manifest commit mode without an existing checkpoint action",
                 ));
             }
+            if latest_checkpoint_action.is_none() && !self.dv_matched_files.is_empty() {
+                return Err(Error::invalid_transaction_state(
+                    "DV updates are not supported in manifest commit mode without an existing checkpoint action",
+                ));
+            }
 
             let table_schema = self
                 .effective_table_config
@@ -794,6 +801,88 @@ impl<S> Transaction<S> {
                 };
                 for (manifest_path, indices) in &leaf_deletions {
                     metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                }
+            }
+
+            // In manifest commit mode, process DV updates by classifying each matched file:
+            //   - Root-resident: the file's entry is already in `pending_entries`. Mutate its
+            //     `deletion_vector` in place. This preserves `tracking.sequence_number`, since a DV
+            //     update is metadata-only and must not reset the file's data sequence number to
+            //     `commit_version`.
+            //   - Leaf-resident: the file lives in a leaf manifest. Clear it from the leaf's
+            //     manifest_dv bitmap and re-add it to the root via add_from_existing_scan_rows.
+            //
+            // TODO: leaf-resident DV updates still inherit `commit_version` as their new
+            // `sequence_number` because the leaf manifest is not loaded into `pending_entries`
+            // during a manifest commit. Preserving the original leaf seq_num would require
+            // reading it from the leaf manifest itself. Not exercised by a failing test today.
+            //
+            // The substitute_new_dv transform replaces deletionVector with newDeletionVector
+            // and drops the temp column. A null stats_parsed column is appended so
+            // add_from_existing_scan_rows can use its coalesce(stats_parsed, parse_json(stats))
+            // fallback to recover stats from the raw JSON string.
+            if !self.dv_matched_files.is_empty() {
+                let mut combined_leaf_deletions: HashMap<String, roaring::RoaringTreemap> =
+                    HashMap::new();
+                let mut leaf_selections: Vec<Vec<bool>> =
+                    Vec::with_capacity(self.dv_matched_files.len());
+
+                for batch in self.dv_matched_files.iter() {
+                    let decisions = content_tree::collect_dv_update_decisions(
+                        batch.data(),
+                        batch.selection_vector(),
+                        root_manifest_path.as_deref(),
+                    )?;
+
+                    // Root-resident: mutate the existing entry's DV in place.
+                    for path in &decisions.root_paths {
+                        let new_dv = match self.dv_updates_by_path.get(path) {
+                            Some(descriptor) => Some(
+                                crate::content_tree::builder::extract_deletion_vector_content(
+                                    descriptor,
+                                )?,
+                            ),
+                            None => None,
+                        };
+                        if !metadata_builder.update_dv(path, new_dv) {
+                            // Defensive: scan classified this as root-resident but the entry
+                            // isn't in pending_entries. Should not happen for well-formed
+                            // transactions; fall back to mark_deleted.
+                            metadata_builder.mark_deleted(Some(path), None, snapshot_id)?;
+                        }
+                    }
+
+                    for (mp, indices) in decisions.leaf_deletions {
+                        combined_leaf_deletions
+                            .entry(mp)
+                            .or_default()
+                            .extend(indices);
+                    }
+                    leaf_selections.push(decisions.leaf_only_selection);
+                }
+
+                for (manifest_path, indices) in &combined_leaf_deletions {
+                    metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                }
+
+                // Re-add leaf-resident rows to the root with the new DV. Root rows were
+                // already handled in place above, so they are cleared from `leaf_selection`.
+                for (batch, leaf_selection) in self.dv_matched_files.iter().zip(leaf_selections) {
+                    if !leaf_selection.iter().any(|&b| b) {
+                        continue;
+                    }
+                    let transformed = update::substitute_new_dv_for_content_tree(
+                        engine,
+                        batch,
+                        &physical_table_schema,
+                    )?;
+                    metadata_builder.add_from_existing_scan_rows(
+                        engine,
+                        transformed.data(),
+                        &leaf_selection,
+                        commit_version,
+                        snapshot_id,
+                    )?;
                 }
             }
 
@@ -1268,6 +1357,7 @@ impl<S> Transaction<S> {
             .is_none_or(|b| b.leaf_manifests.is_empty());
         let has_work_to_do = !self.add_files_metadata.is_empty()
             || !self.remove_files_metadata.is_empty()
+            || !self.dv_matched_files.is_empty()
             || !leaf_manifests_empty
             || self.explicit_root_manifest_commit.is_some()
             || self.read_snapshot_opt.as_ref().is_some_and(|snap| {
@@ -4177,6 +4267,92 @@ mod tests {
         assert!(
             txn.is_manifest_commit(),
             "icebergNativeV4 should force manifest commit even without with_manifest_commit()"
+        );
+
+        Ok(())
+    }
+
+    /// Test that DV-only updates trigger manifest commit when manifest commit is active.
+    #[test]
+    fn test_dv_only_update_triggers_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Create table with metadataTree-experimental feature
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {
+                    "PARQUET:field_id": 1,
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "id"
+                }
+            }]
+        });
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"]
+            }
+        });
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableDeletionVectors": "true",
+                    "delta.columnMapping.mode": "id"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        create_dir_all(&delta_log_path)?;
+        write(delta_log_path.join("00000000000000000000.json"), data)?;
+
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("test".to_string());
+
+        // Opt into manifest commit
+        let _ = txn.with_manifest_commit();
+
+        // Without any work, is_manifest_commit should be false
+        assert!(
+            !txn.is_manifest_commit(),
+            "manifest commit should not be active without work to do"
+        );
+
+        // Add a DV-matched file to simulate a DV update
+        let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+            StringArray::from(vec!["dv"]),
+        ));
+        txn.dv_matched_files.push(dv_data);
+
+        // Now is_manifest_commit should be true (DV update counts as work to do)
+        assert!(
+            txn.is_manifest_commit(),
+            "manifest commit should be active when dv_matched_files is populated"
         );
 
         Ok(())

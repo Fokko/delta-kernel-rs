@@ -859,6 +859,35 @@ impl ContentTreeNodeBuilder {
         self.pre_built_aggregates.clear();
     }
 
+    /// Mutates the `deletion_vector` field of a non-deleted Data entry in `pending_entries`
+    /// whose `location` matches `file_path`. All other fields -- including `tracking.status`,
+    /// `tracking.sequence_number`, and `tracking.snapshot_id` -- are left untouched.
+    ///
+    /// Used by the DV-update flow during manifest commits. A DV update is metadata-only, so
+    /// the original `sequence_number` is preserved rather than reset to the current
+    /// `commit_version` that a delete + re-add would imply.
+    ///
+    /// # Returns
+    /// * `true` if a matching entry was found and updated in place.
+    /// * `false` if no matching entry exists (caller should fall back to the delete + re-add flow,
+    ///   e.g. for leaf-resident files whose entries aren't in `pending_entries`).
+    pub(crate) fn update_dv(
+        &mut self,
+        file_path: &str,
+        new_dv: Option<DeletionVectorInfo>,
+    ) -> bool {
+        for entry in &mut self.pending_entries {
+            if entry.location.as_deref() == Some(file_path)
+                && entry.content_type == DataContentType::Data
+                && entry.tracking.status != TrackingStatus::Deleted
+            {
+                entry.deletion_vector = new_dv;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Marks existing entries as DELETED based on a matching file path or deletion vector.
     ///
     /// This method searches through pending entries and updates their tracking status to DELETED

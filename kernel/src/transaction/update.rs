@@ -94,6 +94,7 @@ impl Transaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            dv_updates_by_path: HashMap::new(),
             snapshot_id: generate_snapshot_id(),
             manifest_commit_state: None,
             explicit_root_manifest_commit: None,
@@ -361,6 +362,12 @@ impl Transaction {
             )));
         }
 
+        // Stash the descriptors by path for the manifest-commit DV-update path. Conversion to
+        // DeletionVectorInfo (which may fail on relative DVs with short paths) is deferred to
+        // commit time inside the manifest-commit branch so the regular commit path is
+        // unaffected.
+        self.dv_updates_by_path.extend(new_dv_descriptors);
+
         Ok(())
     }
 }
@@ -556,6 +563,61 @@ impl<S> Transaction<S> {
             },
         ))
     }
+}
+
+// =============================================================================
+// Helper: prepare DV-updated scan data for add_from_existing_scan_rows
+// =============================================================================
+
+/// Prepares DV-updated scan data for re-addition to the content tree.
+///
+/// Applies two transforms to `dv_matched_files` data:
+/// 1. Replaces `deletionVector` with `newDeletionVector` and drops the temp column
+/// 2. Appends a null `stats_parsed` column so `add_from_existing_scan_rows` can use its
+///    `coalesce(stats_parsed, parse_json(stats, schema))` fallback
+///
+/// The `physical_table_schema` is used to determine the stats_parsed column schema.
+pub(super) fn substitute_new_dv_for_content_tree(
+    engine: &dyn Engine,
+    batch: &FilteredEngineData,
+    physical_table_schema: &StructType,
+) -> DeltaResult<FilteredEngineData> {
+    use crate::content_tree::builder::build_delta_stats_schema;
+    use crate::scan::log_replay::STATS_PARSED_NAME;
+
+    // Step 1: Replace deletionVector with newDeletionVector, drop the temp column.
+    let with_new_dv_transform = Expression::transform(
+        Transform::new_top_level()
+            .with_replaced_field(
+                "deletionVector",
+                Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
+            )
+            .with_dropped_field(NEW_DELETION_VECTOR_NAME),
+    );
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        intermediate_dv_schema().clone(),
+        Arc::new(with_new_dv_transform),
+        nullable_scan_rows_schema().clone().into(),
+    )?;
+    let transformed = evaluator.evaluate(batch.data())?;
+
+    // Step 2: Append a null stats_parsed column. add_from_existing_scan_rows expects this
+    // column so its coalesce can fall back to parsing the `stats` JSON string.
+    let delta_stats_schema = build_delta_stats_schema(physical_table_schema);
+    let stats_parsed_field = StructField::nullable(STATS_PARSED_NAME, delta_stats_schema.clone());
+    let null_stats_schema = Arc::new(StructType::new_unchecked(vec![stats_parsed_field]));
+    let num_rows = transformed.len();
+    let null_column = vec![ArrayData::try_new(
+        ArrayType::new(DataType::Struct(Box::new(delta_stats_schema)), true),
+        vec![
+            Scalar::Null(DataType::Struct(Box::new(build_delta_stats_schema(
+                physical_table_schema
+            ),)));
+            num_rows
+        ],
+    )?];
+    let with_stats = transformed.append_columns(null_stats_schema, null_column)?;
+    FilteredEngineData::try_new(with_stats, batch.selection_vector().to_vec())
 }
 
 // =============================================================================

@@ -70,6 +70,7 @@ impl AlterTableTransaction {
             // now: safe, but misses the true-case optimization delta-spark applies.
             is_blind_append: false,
             dv_matched_files: vec![],
+            dv_updates_by_path: std::collections::HashMap::new(),
             physical_clustering_columns: None,
             snapshot_id: 0,
             manifest_commit_state: None,
