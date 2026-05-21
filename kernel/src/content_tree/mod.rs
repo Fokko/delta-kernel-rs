@@ -35,9 +35,21 @@ use crate::{
     SchemaRef, Version,
 };
 
-/// Field name for the content_stats column in ContentTreeNodeEntry schema.
-/// This field contains per-column statistics in AMT format.
+/// Field names in the [`ContentTreeNodeEntry`] schema.
+pub(crate) const CONTENT_TYPE: &str = "contentType";
+pub(crate) const LOCATION: &str = "location";
+pub(crate) const FILE_FORMAT: &str = "fileFormat";
+pub(crate) const TRACKING: &str = "tracking";
+pub(crate) const DV_INFO: &str = "deletionVector";
+pub(crate) const PARTITION_SPEC_ID: &str = "specId";
+pub(crate) const SORT_ORDER_ID: &str = "sortOrderId";
+pub(crate) const RECORD_COUNT: &str = "recordCount";
+pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
+pub(crate) const KEY_METADATA: &str = "keyMetadata";
+pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
+pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 
 /// Field names for the different fields within content_stats.
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
@@ -1552,10 +1564,10 @@ pub(crate) fn metadata_entry_to_scalars(
 
     for field in schema.fields() {
         let scalar = match field.name().as_str() {
-            "contentType" => Scalar::from(entry.content_type),
-            "location" => Scalar::from(entry.location.clone()),
-            "fileFormat" => Scalar::from(entry.file_format),
-            "tracking" => {
+            CONTENT_TYPE => Scalar::from(entry.content_type),
+            LOCATION => Scalar::from(entry.location.clone()),
+            FILE_FORMAT => Scalar::from(entry.file_format),
+            TRACKING => {
                 let ti = &entry.tracking;
                 // Get struct fields from schema
                 let struct_fields = if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1573,7 +1585,7 @@ pub(crate) fn metadata_entry_to_scalars(
                 ];
                 Scalar::Struct(StructData::new_unchecked(struct_fields, values))
             }
-            "deletionVector" => match &entry.deletion_vector {
+            DV_INFO => match &entry.deletion_vector {
                 Some(dv) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1593,15 +1605,15 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "specId" => Scalar::from(entry.spec_id),
-            "sortOrderId" => Scalar::from(entry.sort_order_id),
-            "recordCount" => Scalar::from(entry.record_count),
-            "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
+            PARTITION_SPEC_ID => Scalar::from(entry.spec_id),
+            SORT_ORDER_ID => Scalar::from(entry.sort_order_id),
+            RECORD_COUNT => Scalar::from(entry.record_count),
+            FILE_SIZE_IN_BYTES => Scalar::from(entry.file_size_in_bytes),
             CONTENT_STATS_FIELD_NAME => match &entry.content_stats {
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "manifestInfo" => match &entry.manifest_info {
+            MANIFEST_INFO => match &entry.manifest_info {
                 Some(ms) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -1628,9 +1640,9 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "keyMetadata" => Scalar::from(entry.key_metadata.clone()),
-            "splitOffsets" => entry.split_offsets.clone().try_into()?,
-            "equalityIds" => entry.equality_ids.clone().try_into()?,
+            KEY_METADATA => Scalar::from(entry.key_metadata.clone()),
+            SPLIT_OFFSETS => entry.split_offsets.clone().try_into()?,
+            EQUALITY_IDS => entry.equality_ids.clone().try_into()?,
             _ => Scalar::Null(field.data_type().clone()),
         };
 
@@ -2320,7 +2332,7 @@ impl ContentTreeNodeEntry {
         let mut fields = Vec::new();
         for field in base.fields() {
             fields.push(field.clone());
-            if field.name() == "fileSizeInBytes" {
+            if field.name() == FILE_SIZE_IN_BYTES {
                 fields.push(content_stats_field.clone());
             }
         }
