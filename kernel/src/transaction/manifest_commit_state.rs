@@ -11,6 +11,7 @@ use crate::content_tree::builder::{
 use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
 use crate::log_reader::commit::CommitReader;
+use crate::log_replay::{HasSelectionVector, LogReplayProcessor};
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
