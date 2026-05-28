@@ -10,9 +10,9 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::content_tree::{
-    AVG_VALUE_SIZE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
-    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, EXACT_BOUNDS, LOWER_BOUND, MAX_VALUE_SIZE,
-    NAN_VALUE_COUNT, NULL_VALUE_COUNT, UPPER_BOUND, VALUE_COUNT,
+    AVG_VALUE_SIZE_IN_BYTES, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES,
+    DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, LOWER_BOUND,
+    NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::{
     Expression, ExpressionRef, MapData, Predicate, Scalar, StructData, Transform,
@@ -155,14 +155,13 @@ pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
 }
 
 /// Field ID offsets for stats fields within a column's stats struct.
-const STATS_OFFSET_VALUE_COUNT: i32 = 1;
-const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 2;
-const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 3;
-const STATS_OFFSET_AVG_VALUE_SIZE: i32 = 4;
-const STATS_OFFSET_MAX_VALUE_SIZE: i32 = 5;
-const STATS_OFFSET_LOWER_BOUND: i32 = 6;
-const STATS_OFFSET_UPPER_BOUND: i32 = 7;
-const STATS_OFFSET_EXACT_BOUNDS: i32 = 8;
+const STATS_OFFSET_LOWER_BOUND: i32 = 1;
+const STATS_OFFSET_UPPER_BOUND: i32 = 2;
+const STATS_OFFSET_TIGHT_BOUNDS: i32 = 3;
+const STATS_OFFSET_VALUE_COUNT: i32 = 4;
+const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 5;
+const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 6;
+const STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES: i32 = 7;
 
 /// Creates a [`StructField`] with the given name, data type, nullability, and field ID.
 /// Also includes column mapping annotations (`delta.columnMapping.id` and
@@ -272,7 +271,7 @@ impl SchemaVisitor for StatsSchemaVisitor {
                         vf.name(),
                         DataType::Struct(Box::new(build_primitive_stats_struct(
                             base_stats_id,
-                            vf.data_type.clone(),
+                            field.data_type.clone(),
                             vf.nullable,
                         ))),
                         true,
@@ -337,38 +336,76 @@ impl SchemaVisitor for StatsSchemaVisitor {
     }
 }
 
-/// Builds the stats struct for a primitive field.
+/// Builds the stats struct for a primitive or variant field.
 ///
 /// The stats struct contains the following fields (with field IDs as offsets from the base):
-/// - offset 1: `value_count` (long)
-/// - offset 2: `null_value_count` (long) - only if the field is nullable
-/// - offset 3: `nan_value_count` (long) - only for float/double types
-/// - offset 4: `avg_value_size` (int) - only for variable-length types (e.g. string/binary)
-/// - offset 5: `max_value_size` (int) - only for variable-length types (e.g. string/binary)
-/// - offset 6: `lower_bound` (same type as the field)
-/// - offset 7: `upper_bound` (same type as the field)
-/// - offset 8: `exact_bounds` (boolean)
+/// - offset 1: `lower_bound` (same type as the field)
+/// - offset 2: `upper_bound` (same type as the field)
+/// - offset 3: `tight_bounds` (boolean) - excluded for variant types
+/// - offset 4: `value_count` (long)
+/// - offset 5: `null_value_count` (long) - only if the field is nullable
+/// - offset 6: `nan_value_count` (long) - only for float/double types
+/// - offset 7: `avg_value_size_in_bytes` (int) - only for string/binary/variant types
+///
+/// `data_type` is the **column-level** type (may be `Variant`). For variant columns,
+/// `tight_bounds` is excluded and `avg_value_size_in_bytes` is always included. The
+/// bound types are derived from the primitive type for primitives, or from the inner
+/// value field for variants.
 fn build_primitive_stats_struct(
     base_field_id: i32,
     data_type: DataType,
     nullable: bool,
 ) -> StructType {
-    // Base fields: value_count, lower_bound, upper_bound, exact_bounds.
-    // Optional fields:
-    // - null_value_count (if nullable)
-    // - nan_value_count (if float/double)
-    // - avg_value_size/max_value_size (if variable-length: string/binary)
-    let (has_nan_count, has_size_stats) = match &data_type {
+    let is_variant = matches!(&data_type, DataType::Variant(_));
+    let bounds_type = match &data_type {
+        DataType::Variant(inner) => inner
+            .field(VARIANT_VALUE_FIELD_NAME)
+            .map(|f| f.data_type().clone())
+            .unwrap_or(data_type.clone()),
+        _ => data_type.clone(),
+    };
+    let (has_nan_count, has_size_stats) = match &bounds_type {
         DataType::Primitive(ptype) => (
             matches!(ptype, &PrimitiveType::Float | &PrimitiveType::Double),
             matches!(ptype, &PrimitiveType::String | &PrimitiveType::Binary),
         ),
         _ => (false, false),
     };
+    let has_size_stats = has_size_stats || is_variant;
+    let has_tight_bounds = !is_variant;
 
-    let capacity =
-        4 + usize::from(nullable) + usize::from(has_nan_count) + if has_size_stats { 2 } else { 0 };
+    let capacity = 3
+        + usize::from(has_tight_bounds)
+        + usize::from(nullable)
+        + usize::from(has_nan_count)
+        + usize::from(has_size_stats);
     let mut fields = Vec::with_capacity(capacity);
+
+    // lower_bound: same type as the field (inner value type for variants)
+    fields.push(field_with_id(
+        LOWER_BOUND,
+        bounds_type.clone(),
+        true,
+        base_field_id + STATS_OFFSET_LOWER_BOUND,
+    ));
+
+    // upper_bound: same type as the field (inner value type for variants)
+    fields.push(field_with_id(
+        UPPER_BOUND,
+        bounds_type,
+        true,
+        base_field_id + STATS_OFFSET_UPPER_BOUND,
+    ));
+
+    // tight_bounds: excluded for variant (and geometry/geography, not handled here)
+    if has_tight_bounds {
+        fields.push(field_with_id(
+            TIGHT_BOUNDS,
+            DataType::BOOLEAN,
+            true,
+            base_field_id + STATS_OFFSET_TIGHT_BOUNDS,
+        ));
+    }
 
     // value_count: always present
     fields.push(field_with_id(
@@ -398,46 +435,15 @@ fn build_primitive_stats_struct(
         ));
     }
 
-    // avg_value_size/max_value_size: only for variable-length types (e.g. string/binary)
+    // avg_value_size_in_bytes: for string, binary, and variant types
     if has_size_stats {
         fields.push(field_with_id(
-            AVG_VALUE_SIZE,
+            AVG_VALUE_SIZE_IN_BYTES,
             DataType::INTEGER,
             true,
-            base_field_id + STATS_OFFSET_AVG_VALUE_SIZE,
-        ));
-
-        fields.push(field_with_id(
-            MAX_VALUE_SIZE,
-            DataType::INTEGER,
-            true,
-            base_field_id + STATS_OFFSET_MAX_VALUE_SIZE,
+            base_field_id + STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
         ));
     }
-
-    // lower_bound: same type as the field
-    fields.push(field_with_id(
-        LOWER_BOUND,
-        data_type.clone(),
-        true,
-        base_field_id + STATS_OFFSET_LOWER_BOUND,
-    ));
-
-    // upper_bound: same type as the field
-    fields.push(field_with_id(
-        UPPER_BOUND,
-        data_type.clone(),
-        true,
-        base_field_id + STATS_OFFSET_UPPER_BOUND,
-    ));
-
-    // exact_bounds: always present
-    fields.push(field_with_id(
-        EXACT_BOUNDS,
-        DataType::BOOLEAN,
-        true,
-        base_field_id + STATS_OFFSET_EXACT_BOUNDS,
-    ));
 
     StructType::new_unchecked(fields)
 }
@@ -450,14 +456,13 @@ fn build_primitive_stats_struct(
 /// ## Stats Schema Structure
 ///
 /// Each primitive field's stats struct contains:
+/// - `lower_bound` (same type as field): minimum value
+/// - `upper_bound` (same type as field): maximum value
+/// - `tight_bounds` (boolean): whether bounds are exact (excluded for variant types)
 /// - `value_count` (long): count of values
 /// - `null_value_count` (long): count of null values (only if field is nullable)
 /// - `nan_value_count` (long): count of NaN values (only for float/double types)
-/// - `avg_value_size` (int): average size of values (only for variable-length types)
-/// - `max_value_size` (int): maximum size of values (only for variable-length types)
-/// - `lower_bound` (same type as field): minimum value
-/// - `upper_bound` (same type as field): maximum value
-/// - `exact_bounds` (boolean): whether bounds are exact
+/// - `avg_value_size_in_bytes` (int): avg size in bytes (only for string/binary/variant)
 ///
 /// ## Field IDs
 ///
@@ -629,8 +634,8 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
 
 /// Builds a content_stats StructData for a single column from Delta JSON stats.
 ///
-/// Creates a struct with the stats schema fields (value_count, null_count,
-/// lower_bound, upper_bound, exact_bounds) populated from the Delta JSON stats.
+/// Creates a struct with the stats schema fields (lower_bound, upper_bound,
+/// tight_bounds, value_count, null_value_count, etc.) populated from the Delta JSON stats.
 ///
 /// # Arguments
 /// * `field` - The table schema field for this column
@@ -655,20 +660,18 @@ fn build_column_stats(
 
     for stats_field in &fields {
         let scalar = match stats_field.name().as_str() {
+            LOWER_BOUND => min_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            UPPER_BOUND => max_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            TIGHT_BOUNDS => {
+                // tight_bounds reflects Delta's tightBounds field:
+                // - true: bounds are exact (all rows in file satisfy min <= value <= max)
+                // - false: bounds may be wider (e.g., deletion vectors have removed some rows)
+                Some(Scalar::Boolean(tight_bounds))
+            }
             VALUE_COUNT => num_records.map(Scalar::Long),
             field if field == NULL_VALUE_COUNT => null_count.map(Scalar::Long),
             NAN_VALUE_COUNT => None, // Not available in Delta JSON stats
-            AVG_VALUE_SIZE => None,  // Not available in Delta JSON stats
-            MAX_VALUE_SIZE => None,  // Not available in Delta JSON stats
-            LOWER_BOUND => min_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
-            UPPER_BOUND => max_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
-            EXACT_BOUNDS => {
-                // exact_bounds reflects Delta's tightBounds field:
-                // - true: bounds are exact (all rows in file satisfy min <= value <= max)
-                // - false: bounds may be wider (e.g., deletion vectors have removed some rows)
-                // Always report this field - defaults to true in Delta JSON when absent
-                Some(Scalar::Boolean(tight_bounds))
-            }
+            AVG_VALUE_SIZE_IN_BYTES => None, // Not available in Delta JSON stats
             _ => None,
         };
 
@@ -765,14 +768,13 @@ fn build_struct_stats(
 /// - `tightBounds`: AND of all tightBounds (false if any is false)
 ///
 /// For AMT-style format (per-column stats with lower_bound, upper_bound, etc.):
+/// - `lower_bound`: min of all lower_bounds
+/// - `upper_bound`: max of all upper_bounds
+/// - `tight_bounds`: AND of all tight_bounds (false if any is false)
 /// - `value_count`: sum of all value_counts
 /// - `null_value_count`: sum of all null_value_counts
 /// - `nan_value_count`: sum of all nan_value_counts
-/// - `avg_value_size`: set to null (would require weighted average calculation)
-/// - `max_value_size`: max of all max_value_sizes
-/// - `lower_bound`: min of all lower_bounds
-/// - `upper_bound`: max of all upper_bounds
-/// - `exact_bounds`: AND of all exact_bounds (false if any is false)
+/// - `avg_value_size_in_bytes`: set to null (would require weighted average calculation)
 ///
 /// # Arguments
 ///
@@ -1006,19 +1008,17 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
             .collect();
 
         let aggregated = match field_name {
-            // Sum fields
-            VALUE_COUNT | NAN_VALUE_COUNT => sum_long_scalars(&field_scalars),
-            field if field == NULL_VALUE_COUNT => sum_long_scalars(&field_scalars),
-            // Max fields
-            MAX_VALUE_SIZE => max_scalar(&field_scalars, &DataType::INTEGER),
             // Min bound
             LOWER_BOUND => min_scalar(&field_scalars, field.data_type()),
             // Max bound
             UPPER_BOUND => max_scalar(&field_scalars, field.data_type()),
-            // AND of all exact_bounds
-            EXACT_BOUNDS => and_boolean_scalars(&field_scalars),
-            // Skip avg_value_size (would need weighted average, not straightforward)
-            AVG_VALUE_SIZE => Scalar::Null(field.data_type().clone()),
+            // AND of all tight_bounds
+            TIGHT_BOUNDS => and_boolean_scalars(&field_scalars),
+            // Sum fields
+            VALUE_COUNT | NAN_VALUE_COUNT => sum_long_scalars(&field_scalars),
+            field if field == NULL_VALUE_COUNT => sum_long_scalars(&field_scalars),
+            // Skip avg_value_size_in_bytes (would need weighted average, not straightforward)
+            AVG_VALUE_SIZE_IN_BYTES => Scalar::Null(DataType::INTEGER),
             // Unknown field - preserve as null
             _ => Scalar::Null(field.data_type().clone()),
         };
@@ -1171,7 +1171,7 @@ pub(crate) fn delta_json_stats_to_content_stats(
 /// - `value_count` = num_records
 /// - `null_value_count` = num_records if partition value is null, else 0
 /// - `lower_bound` / `upper_bound` = the parsed partition value (both equal)
-/// - `exact_bounds` = true (partition values are always exact)
+/// - `tight_bounds` = true (partition values are always exact)
 #[cfg(test)]
 fn build_partition_column_stats(
     stats_struct: &StructType,
@@ -1185,6 +1185,14 @@ fn build_partition_column_stats(
 
     for stats_field in &fields {
         let scalar = match stats_field.name().as_str() {
+            LOWER_BOUND | UPPER_BOUND => {
+                if is_null {
+                    None
+                } else {
+                    partition_value.cloned()
+                }
+            }
+            TIGHT_BOUNDS => Some(Scalar::Boolean(true)),
             VALUE_COUNT => num_records.map(Scalar::Long),
             field if field == NULL_VALUE_COUNT => {
                 if is_null {
@@ -1193,14 +1201,6 @@ fn build_partition_column_stats(
                     Some(Scalar::Long(0))
                 }
             }
-            LOWER_BOUND | UPPER_BOUND => {
-                if is_null {
-                    None
-                } else {
-                    partition_value.cloned()
-                }
-            }
-            EXACT_BOUNDS => Some(Scalar::Boolean(true)),
             _ => None,
         };
 
@@ -1219,10 +1219,10 @@ fn build_partition_column_stats(
 /// the full table schema (including partition columns) is represented.
 ///
 /// For each partition column, the statistics are derived from the constant partition value:
+/// - `lower_bound` = `upper_bound` = the typed partition value
+/// - `tight_bounds` = true
 /// - `value_count` = `num_records`
 /// - `null_value_count` = `num_records` when the partition value is null, else 0
-/// - `lower_bound` = `upper_bound` = the typed partition value
-/// - `exact_bounds` = true
 ///
 /// Partition values are keyed by **physical** column name (matching `add.partitionValues` in
 /// the Delta log). The `table_schema` must also use physical names so that field lookups and
@@ -1585,8 +1585,8 @@ fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
 /// Builds per-column stats struct expression for a leaf (primitive) column.
 ///
 /// The field ordering matches the AMT stats schema from [`stats_schema`]:
-/// value_count, null_value_count, nan_value_count, avg_value_size,
-/// max_value_size, lower_bound, upper_bound, exact_bounds.
+/// lower_bound, upper_bound, tight_bounds, value_count, null_value_count,
+/// nan_value_count, avg_value_size_in_bytes.
 ///
 /// When `known_stats_schema` is `Some`, column references are only created for fields
 /// that exist in the known schema. When `None`, all Delta JSON fields are assumed to exist.
@@ -1613,16 +1613,6 @@ fn build_amt_leaf_expr(
         .fields()
         .map(|field| {
             let expr = match field.name().as_str() {
-                VALUE_COUNT if field_exists(DELTA_STATS_NUM_RECORDS, &[]) => {
-                    Expression::column([stats_col, DELTA_STATS_NUM_RECORDS])
-                }
-                name if name == NULL_VALUE_COUNT
-                    && field_exists(DELTA_STATS_NULL_COUNT, col_path) =>
-                {
-                    let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_NULL_COUNT];
-                    path.extend_from_slice(col_path);
-                    Expression::column(path)
-                }
                 LOWER_BOUND if field_exists(DELTA_STATS_MIN_VALUES, col_path) => {
                     let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_MIN_VALUES];
                     path.extend_from_slice(col_path);
@@ -1633,11 +1623,21 @@ fn build_amt_leaf_expr(
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                EXACT_BOUNDS if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
+                TIGHT_BOUNDS if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
                     Expression::column([stats_col, DELTA_STATS_TIGHT_BOUNDS])
                 }
+                VALUE_COUNT if field_exists(DELTA_STATS_NUM_RECORDS, &[]) => {
+                    Expression::column([stats_col, DELTA_STATS_NUM_RECORDS])
+                }
+                name if name == NULL_VALUE_COUNT
+                    && field_exists(DELTA_STATS_NULL_COUNT, col_path) =>
+                {
+                    let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_NULL_COUNT];
+                    path.extend_from_slice(col_path);
+                    Expression::column(path)
+                }
                 // Field not in Delta JSON stats or not present in known schema -> null literal.
-                // This includes AMT-only fields like avg_value_size and max_value_size.
+                // This includes AMT-only fields like avg_value_size_in_bytes.
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             Arc::new(expr)
@@ -1777,20 +1777,24 @@ fn build_primitive_amt_struct_for_stats(
 ///
 /// Returns `None` when the variant has no `value` field (degenerate schema).
 fn build_variant_value_stats(
-    inner: &StructType,
+    variant_type: &DataType,
     base_stats_id: i32,
     col_name: &str,
     null_count_cols: Option<&StructType>,
     min_vals_cols: Option<&StructType>,
     max_vals_cols: Option<&StructType>,
 ) -> Option<StructType> {
+    let inner = match variant_type {
+        DataType::Variant(inner) => inner.as_ref(),
+        _ => return None,
+    };
     let vf = inner.field(VARIANT_VALUE_FIELD_NAME)?;
     let needs_min = variant_value_in_sub_schema(min_vals_cols, col_name);
     let needs_max = variant_value_in_sub_schema(max_vals_cols, col_name);
     let nullable = variant_value_in_sub_schema(null_count_cols, col_name);
     let value_stats = build_primitive_amt_struct_for_stats(
         base_stats_id,
-        &vf.data_type,
+        variant_type,
         nullable,
         needs_min,
         needs_max,
@@ -1868,9 +1872,9 @@ fn filtered_stats_schema_fields(
                     max_nested,
                 )?)
             }
-            DataType::Variant(inner) => {
+            DataType::Variant(_) => {
                 match build_variant_value_stats(
-                    inner,
+                    table_field.data_type(),
                     base_stats_id,
                     col_name,
                     null_count_cols,
@@ -1951,7 +1955,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     let mut null_count_exprs = Vec::new();
     let mut min_values_exprs = Vec::new();
     let mut max_values_exprs = Vec::new();
-    let mut exact_bounds_exprs = Vec::new();
+    let mut tight_bounds_exprs = Vec::new();
 
     collect_stats_expressions_filtered(
         table_schema,
@@ -1963,7 +1967,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         &mut null_count_exprs,
         &mut min_values_exprs,
         &mut max_values_exprs,
-        &mut exact_bounds_exprs,
+        &mut tight_bounds_exprs,
     )?;
 
     // Build nested struct expressions
@@ -1995,12 +1999,12 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     // This expression will be evaluated against the manifest batch data which includes recordCount
     let num_records_expr = Expression::column(["recordCount"]);
 
-    // tightBounds: AND of all columns' exact_bounds from content_stats
+    // tightBounds: AND of all columns' tight_bounds from content_stats
     // bounds are tight only if tight for every column (to match Delta semantics).
-    let tight_bounds_expr = if exact_bounds_exprs.is_empty() {
+    let tight_bounds_expr = if tight_bounds_exprs.is_empty() {
         Expression::literal(Scalar::Boolean(true))
     } else {
-        let preds: Vec<Predicate> = exact_bounds_exprs
+        let preds: Vec<Predicate> = tight_bounds_exprs
             .into_iter()
             .map(|e| Predicate::BooleanExpression((*e).clone()))
             .collect();
@@ -2070,7 +2074,7 @@ fn collect_stats_expressions_filtered(
     null_count_exprs: &mut Vec<ExpressionRef>,
     min_values_exprs: &mut Vec<ExpressionRef>,
     max_values_exprs: &mut Vec<ExpressionRef>,
-    exact_bounds_exprs: &mut Vec<ExpressionRef>,
+    tight_bounds_exprs: &mut Vec<ExpressionRef>,
 ) -> DeltaResult<()> {
     // Collect unique column names across all three stat categories
     let mut col_names: Vec<&str> = Vec::new();
@@ -2114,7 +2118,7 @@ fn collect_stats_expressions_filtered(
                 let mut nested_null_count_exprs = Vec::new();
                 let mut nested_min_values_exprs = Vec::new();
                 let mut nested_max_values_exprs = Vec::new();
-                let mut nested_exact_bounds_exprs = Vec::new();
+                let mut nested_tight_bounds_exprs = Vec::new();
 
                 collect_stats_expressions_filtered(
                     table_nested,
@@ -2126,7 +2130,7 @@ fn collect_stats_expressions_filtered(
                     &mut nested_null_count_exprs,
                     &mut nested_min_values_exprs,
                     &mut nested_max_values_exprs,
-                    &mut nested_exact_bounds_exprs,
+                    &mut nested_tight_bounds_exprs,
                 )?;
 
                 if !nested_null_count_exprs.is_empty() {
@@ -2140,7 +2144,7 @@ fn collect_stats_expressions_filtered(
                     max_values_exprs
                         .push(Arc::new(Expression::struct_from(nested_max_values_exprs)));
                 }
-                exact_bounds_exprs.extend(nested_exact_bounds_exprs);
+                tight_bounds_exprs.extend(nested_tight_bounds_exprs);
             }
             _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
                 if !column_to_field_id.contains_key(&field_path) {
@@ -2171,11 +2175,11 @@ fn collect_stats_expressions_filtered(
                 }
                 if has_min_values || has_max_values {
                     // coalesce to true to match delta semantics
-                    exact_bounds_exprs.push(Arc::new(Expression::coalesce([
+                    tight_bounds_exprs.push(Arc::new(Expression::coalesce([
                         Expression::Column(ColumnName::new([
                             crate::content_tree::CONTENT_STATS_FIELD_NAME,
                             &field_path,
-                            EXACT_BOUNDS,
+                            TIGHT_BOUNDS,
                         ])),
                         Expression::literal(Scalar::Boolean(true)),
                     ])));
@@ -2283,16 +2287,15 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, lower_bound, upper_bound, exact_bounds
+        // Should have: lower_bound, upper_bound, tight_bounds, value_count
         assert_eq!(id_stats_struct.fields().count(), 4);
         assert!(id_stats_struct.field(VALUE_COUNT).is_some());
         assert!(id_stats_struct.field(NULL_VALUE_COUNT).is_none()); // not nullable
         assert!(id_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
-        assert!(id_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
-        assert!(id_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
+        assert!(id_stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).is_none()); // fixed-length
         assert!(id_stats_struct.field(LOWER_BOUND).is_some());
         assert!(id_stats_struct.field(UPPER_BOUND).is_some());
-        assert!(id_stats_struct.field(EXACT_BOUNDS).is_some());
+        assert!(id_stats_struct.field(TIGHT_BOUNDS).is_some());
 
         // Check field IDs: base is 10_200 (field_id 1 -> 10_000 + 200*1)
         assert_stats_field_ids(id_stats_struct, 10_200, &field);
@@ -2318,9 +2321,9 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound,
-        // upper_bound, exact_bounds
-        assert_eq!(name_stats_struct.fields().count(), 7);
+        // Should have: lower_bound, upper_bound, tight_bounds, value_count, null_value_count,
+        // avg_value_size_in_bytes
+        assert_eq!(name_stats_struct.fields().count(), 6);
         assert!(name_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
         assert!(name_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
 
@@ -2357,12 +2360,8 @@ mod tests {
 
         if field.data_type.eq(&DataType::STRING) || field.data_type.eq(&DataType::BINARY) {
             assert_eq!(
-                get_field_id(stats_struct.field(AVG_VALUE_SIZE).unwrap()),
-                Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE)
-            );
-            assert_eq!(
-                get_field_id(stats_struct.field(MAX_VALUE_SIZE).unwrap()),
-                Some(base_id + STATS_OFFSET_MAX_VALUE_SIZE)
+                get_field_id(stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).unwrap()),
+                Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES)
             );
         }
 
@@ -2375,8 +2374,8 @@ mod tests {
             Some(base_id + STATS_OFFSET_UPPER_BOUND)
         );
         assert_eq!(
-            get_field_id(stats_struct.field(EXACT_BOUNDS).unwrap()),
-            Some(base_id + STATS_OFFSET_EXACT_BOUNDS)
+            get_field_id(stats_struct.field(TIGHT_BOUNDS).unwrap()),
+            Some(base_id + STATS_OFFSET_TIGHT_BOUNDS)
         );
     }
 
@@ -2397,8 +2396,7 @@ mod tests {
         assert_eq!(score_stats_struct.fields().count(), 6);
         assert!(score_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
         assert!(score_stats_struct.field(NAN_VALUE_COUNT).is_some()); // double
-        assert!(score_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
-        assert!(score_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
+        assert!(score_stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).is_none()); // fixed-length
 
         // Check field IDs: base is 11_000
         assert_stats_field_ids(score_stats_struct, 11_000, &field)
@@ -2421,8 +2419,7 @@ mod tests {
         assert_eq!(value_stats_struct.fields().count(), 5);
         assert!(value_stats_struct.field(NULL_VALUE_COUNT).is_none()); // not nullable
         assert!(value_stats_struct.field(NAN_VALUE_COUNT).is_some()); // float
-        assert!(value_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
-        assert!(value_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
+        assert!(value_stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).is_none()); // fixed-length
         assert_stats_field_ids(value_stats_struct, 30_000, &field)
     }
 
@@ -2624,8 +2621,8 @@ mod tests {
     }
 
     /// Helper function to get a column's stats field value in AMT format
-    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound,
-    /// exact_bounds}}
+    /// AMT format: {col_name: {lower_bound, upper_bound, tight_bounds?, value_count,
+    /// null_value_count?, ...}}
     fn get_column_stat<'a>(
         stats: &'a StructData,
         column: &str,
@@ -2732,7 +2729,7 @@ mod tests {
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", EXACT_BOUNDS),
+            get_column_stat(&content_stats, "id", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
 
@@ -2799,9 +2796,9 @@ mod tests {
             Some(&Scalar::Long(50))
         );
 
-        // exact_bounds should default to true
+        // tight_bounds should default to true
         assert_eq!(
-            get_column_stat(&content_stats, "id", EXACT_BOUNDS),
+            get_column_stat(&content_stats, "id", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
     }
@@ -2871,11 +2868,11 @@ mod tests {
                 .expect("should convert stats")
                 .expect("should have stats");
 
-        // In AMT format, exact_bounds is per-column
+        // In AMT format, tight_bounds is per-column
         assert_eq!(
-            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
+            get_column_stat(&content_stats, "value", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true)),
-            "exact_bounds should be true"
+            "tight_bounds should be true"
         );
     }
 
@@ -2898,11 +2895,11 @@ mod tests {
                 .expect("should convert stats")
                 .expect("should have stats");
 
-        // In AMT format, exact_bounds is per-column
+        // In AMT format, tight_bounds is per-column
         assert_eq!(
-            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
+            get_column_stat(&content_stats, "value", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(false)),
-            "exact_bounds should be false"
+            "tight_bounds should be false"
         );
     }
 
@@ -2924,11 +2921,11 @@ mod tests {
                 .expect("should convert stats")
                 .expect("should have stats");
 
-        // In AMT format, exact_bounds defaults to true when tightBounds is absent
+        // In AMT format, tight_bounds defaults to true when tightBounds is absent
         assert_eq!(
-            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
+            get_column_stat(&content_stats, "value", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true)),
-            "exact_bounds should default to true when tightBounds is absent"
+            "tight_bounds should default to true when tightBounds is absent"
         );
     }
 
@@ -2963,9 +2960,9 @@ mod tests {
             .expect("should have stats");
 
             assert_eq!(
-                get_column_stat(&content_stats, "value", EXACT_BOUNDS),
+                get_column_stat(&content_stats, "value", TIGHT_BOUNDS),
                 Some(&Scalar::Boolean(false)),
-                "exact_bounds should be false when tight_bounds_when_null is Some(false) (DV present)"
+                "tight_bounds should be false when tight_bounds_when_null is Some(false) (DV present)"
             );
         }
     }
@@ -3173,8 +3170,8 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_content_stats_exact_bounds() {
-        // Test that exact_bounds is AND'ed across all entries
+    fn test_aggregate_content_stats_tight_bounds() {
+        // Test that tight_bounds is AND'ed across all entries
         let table_schema =
             StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
 
@@ -3200,21 +3197,21 @@ mod tests {
             .expect("should convert")
             .expect("should have stats");
 
-        // Aggregate - exact_bounds should be false because one input is false
+        // Aggregate - tight_bounds should be false because one input is false
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // In AMT format, exact_bounds is per-column
+        // In AMT format, tight_bounds is per-column
         assert_eq!(
-            get_column_stat(&aggregated, "value", EXACT_BOUNDS),
+            get_column_stat(&aggregated, "value", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(false)),
-            "exact_bounds should be false when any input is false"
+            "tight_bounds should be false when any input is false"
         );
     }
 
     #[test]
-    fn test_aggregate_content_stats_all_exact_bounds_true() {
-        // Test that exact_bounds is true when all inputs are true
+    fn test_aggregate_content_stats_all_tight_bounds_true() {
+        // Test that tight_bounds is true when all inputs are true
         let table_schema =
             StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
 
@@ -3241,11 +3238,11 @@ mod tests {
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // In AMT format, exact_bounds is per-column
+        // In AMT format, tight_bounds is per-column
         assert_eq!(
-            get_column_stat(&aggregated, "value", EXACT_BOUNDS),
+            get_column_stat(&aggregated, "value", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true)),
-            "exact_bounds should be true when all inputs are true"
+            "tight_bounds should be true when all inputs are true"
         );
     }
 
@@ -3376,16 +3373,12 @@ mod tests {
             "variant value field stats should have upper_bound"
         );
         assert!(
-            value_inner.field(EXACT_BOUNDS).is_some(),
-            "variant value field stats should have exact_bounds"
+            value_inner.field(TIGHT_BOUNDS).is_none(),
+            "variant value field stats should not have tight_bounds"
         );
         assert!(
-            value_inner.field(AVG_VALUE_SIZE).is_some(),
-            "variant value BINARY field stats should have avg_value_size"
-        );
-        assert!(
-            value_inner.field(MAX_VALUE_SIZE).is_some(),
-            "variant value BINARY field stats should have max_value_size"
+            value_inner.field(AVG_VALUE_SIZE_IN_BYTES).is_some(),
+            "variant value BINARY field stats should have avg_value_size_in_bytes"
         );
     }
 
@@ -3411,6 +3404,10 @@ mod tests {
 
         assert_eq!(content_stats.fields().len(), 1);
         let value_stats = extract_variant_value_stats(&content_stats, "v");
+        assert!(
+            get_struct_field(value_stats, TIGHT_BOUNDS).is_none(),
+            "variant stats should not have tight_bounds"
+        );
         assert_eq!(
             get_struct_field(value_stats, VALUE_COUNT),
             Some(&Scalar::Long(50)),
@@ -3418,10 +3415,6 @@ mod tests {
         assert_eq!(
             get_struct_field(value_stats, NULL_VALUE_COUNT),
             Some(&Scalar::Long(2)),
-        );
-        assert_eq!(
-            get_struct_field(value_stats, EXACT_BOUNDS),
-            Some(&Scalar::Boolean(false)),
         );
         assert_eq!(
             get_struct_field(value_stats, LOWER_BOUND),
@@ -3432,11 +3425,7 @@ mod tests {
             Some(&Scalar::Binary(max_bytes)),
         );
         assert_eq!(
-            get_struct_field(value_stats, AVG_VALUE_SIZE),
-            Some(&Scalar::Null(DataType::INTEGER)),
-        );
-        assert_eq!(
-            get_struct_field(value_stats, MAX_VALUE_SIZE),
+            get_struct_field(value_stats, AVG_VALUE_SIZE_IN_BYTES),
             Some(&Scalar::Null(DataType::INTEGER)),
         );
     }
@@ -3546,24 +3535,24 @@ mod tests {
 
         let value_stats = extract_variant_value_stats(&content_stats, "v");
         assert_eq!(
-            get_struct_field(value_stats, VALUE_COUNT),
-            Some(&Scalar::Long(100)),
-        );
-        assert_eq!(
-            get_struct_field(value_stats, NULL_VALUE_COUNT),
-            Some(&Scalar::Long(5)),
-        );
-        assert_eq!(
-            get_struct_field(value_stats, EXACT_BOUNDS),
-            Some(&Scalar::Boolean(true)),
-        );
-        assert_eq!(
             get_struct_field(value_stats, LOWER_BOUND),
             Some(&Scalar::Binary(min_bytes)),
         );
         assert_eq!(
             get_struct_field(value_stats, UPPER_BOUND),
             Some(&Scalar::Binary(max_bytes)),
+        );
+        assert!(
+            get_struct_field(value_stats, TIGHT_BOUNDS).is_none(),
+            "variant stats should not have tight_bounds"
+        );
+        assert_eq!(
+            get_struct_field(value_stats, VALUE_COUNT),
+            Some(&Scalar::Long(100)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, NULL_VALUE_COUNT),
+            Some(&Scalar::Long(5)),
         );
     }
 
@@ -3741,7 +3730,7 @@ mod tests {
     }
 
     /// Verifies that tightBounds in the stats_parsed expression is not hardcoded to false when
-    /// the table has stat columns. It should be derived from content_stats.exact_bounds.
+    /// the table has stat columns. It should be derived from content_stats.tight_bounds.
     #[test]
     fn test_create_content_stats_to_stats_parsed_expr_tight_bounds_not_literal_false() {
         let table_schema = StructType::new_unchecked([
@@ -3763,7 +3752,7 @@ mod tests {
         let tight_bounds_expr = exprs[4].as_ref();
         assert!(
             !matches!(tight_bounds_expr, Expression::Literal(Scalar::Boolean(false))),
-            "tightBounds must not be hardcoded to false; should be derived from content_stats.exact_bounds"
+            "tightBounds must not be hardcoded to false; should be derived from content_stats.tight_bounds"
         );
         // With two columns in stats, it should be an AND of two coalesce expressions (Predicate)
         assert!(
@@ -3835,16 +3824,16 @@ mod tests {
                 .expect("some");
 
         assert_eq!(
-            get_column_stat(&content_true, "id", EXACT_BOUNDS),
+            get_column_stat(&content_true, "id", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
         assert_eq!(
-            get_column_stat(&content_false, "id", EXACT_BOUNDS),
+            get_column_stat(&content_false, "id", TIGHT_BOUNDS),
             Some(&Scalar::Boolean(false))
         );
 
-        // Expression should AND exact_bounds from columns; for one column that's just
-        // coalesce(cs.id.exact_bounds, true). So when evaluated with content_true we'd get
+        // Expression should AND tight_bounds from columns; for one column that's just
+        // coalesce(cs.id.tight_bounds, true). So when evaluated with content_true we'd get
         // true, with content_false we'd get false.
         let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
         let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
@@ -3862,7 +3851,7 @@ mod tests {
         // rather than AND(...), so we only verify it is not a hardcoded literal.
         assert!(
             !matches!(tight_bounds_expr, Expression::Literal(_)),
-            "tightBounds must not be a hardcoded literal; should be derived from content_stats.exact_bounds"
+            "tightBounds must not be a hardcoded literal; should be derived from content_stats.tight_bounds"
         );
     }
 
@@ -3939,10 +3928,10 @@ mod tests {
         let expected_id = StructData::try_new(
             id_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(100),     // value_count
                 Scalar::Long(1),       // lower_bound
                 Scalar::Long(50),      // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Boolean(true), // tight_bounds
+                Scalar::Long(100),     // value_count
             ],
         )
         .expect("valid struct");
@@ -3966,13 +3955,12 @@ mod tests {
         let expected_part = StructData::try_new(
             part_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(100),                   // value_count
-                Scalar::Long(0),                     // null_value_count
-                Scalar::Null(DataType::INTEGER),     // avg_value_size
-                Scalar::Null(DataType::INTEGER),     // max_value_size
                 Scalar::String("hello".to_string()), // lower_bound
                 Scalar::String("hello".to_string()), // upper_bound
-                Scalar::Boolean(true),               // exact_bounds
+                Scalar::Boolean(true),               // tight_bounds
+                Scalar::Long(100),                   // value_count
+                Scalar::Long(0),                     // null_value_count
+                Scalar::Null(DataType::INTEGER),     // avg_value_size_in_bytes
             ],
         )
         .expect("valid struct");
@@ -4023,13 +4011,12 @@ mod tests {
         let expected_region = StructData::try_new(
             region_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(50),                // value_count
-                Scalar::Long(50),                // null_value_count (all null)
-                Scalar::Null(DataType::INTEGER), // avg_value_size
-                Scalar::Null(DataType::INTEGER), // max_value_size
                 Scalar::Null(DataType::STRING),  // lower_bound (null partition)
                 Scalar::Null(DataType::STRING),  // upper_bound (null partition)
-                Scalar::Boolean(true),           // exact_bounds
+                Scalar::Boolean(true),           // tight_bounds
+                Scalar::Long(50),                // value_count
+                Scalar::Long(50),                // null_value_count (all null)
+                Scalar::Null(DataType::INTEGER), // avg_value_size_in_bytes
             ],
         )
         .expect("valid struct");
@@ -4068,11 +4055,11 @@ mod tests {
         let expected_date = StructData::try_new(
             date_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(200),     // value_count
-                Scalar::Long(0),       // null_value_count
                 Scalar::Date(19737),   // lower_bound (2024-01-15)
                 Scalar::Date(19737),   // upper_bound (2024-01-15)
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Boolean(true), // tight_bounds
+                Scalar::Long(200),     // value_count
+                Scalar::Long(0),       // null_value_count
             ],
         )
         .expect("valid struct");
@@ -4167,13 +4154,12 @@ mod tests {
         let expected_data = StructData::try_new(
             data_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(75),                  // value_count
-                Scalar::Long(5),                   // null_value_count
-                Scalar::Null(DataType::INTEGER),   // avg_value_size
-                Scalar::Null(DataType::INTEGER),   // max_value_size
                 Scalar::String("abc".to_string()), // lower_bound
                 Scalar::String("xyz".to_string()), // upper_bound
-                Scalar::Boolean(true),             // exact_bounds
+                Scalar::Boolean(true),             // tight_bounds
+                Scalar::Long(75),                  // value_count
+                Scalar::Long(5),                   // null_value_count
+                Scalar::Null(DataType::INTEGER),   // avg_value_size_in_bytes
             ],
         )
         .expect("valid struct");
@@ -4197,10 +4183,10 @@ mod tests {
         let expected_year = StructData::try_new(
             year_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(75),      // value_count
                 Scalar::Integer(2024), // lower_bound
                 Scalar::Integer(2024), // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Boolean(true), // tight_bounds
+                Scalar::Long(75),      // value_count
             ],
         )
         .expect("valid struct");
@@ -4255,13 +4241,12 @@ mod tests {
         let expected_data = StructData::try_new(
             data_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(30),                // value_count
-                Scalar::Long(0),                 // null_value_count
-                Scalar::Null(DataType::INTEGER), // avg_value_size
-                Scalar::Null(DataType::INTEGER), // max_value_size
                 Scalar::String("a".to_string()), // lower_bound
                 Scalar::String("z".to_string()), // upper_bound
-                Scalar::Boolean(true),           // exact_bounds
+                Scalar::Boolean(true),           // tight_bounds
+                Scalar::Long(30),                // value_count
+                Scalar::Long(0),                 // null_value_count
+                Scalar::Null(DataType::INTEGER), // avg_value_size_in_bytes
             ],
         )
         .expect("valid struct");
@@ -4277,7 +4262,7 @@ mod tests {
             "data column stats mismatch for 'data'"
         );
 
-        // Integer partition column (non-nullable): value_count, lower, upper, exact_bounds
+        // Integer partition column (non-nullable): lower, upper, tight_bounds, value_count
         let year_stats_field = full_stats_schema.field("year").expect("year field");
         let DataType::Struct(year_inner) = year_stats_field.data_type() else {
             panic!("year stats should be a struct");
@@ -4285,10 +4270,10 @@ mod tests {
         let expected_year = StructData::try_new(
             year_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(30),      // value_count
                 Scalar::Integer(2023), // lower_bound
                 Scalar::Integer(2023), // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Boolean(true), // tight_bounds
+                Scalar::Long(30),      // value_count
             ],
         )
         .expect("valid struct");
@@ -4304,8 +4289,8 @@ mod tests {
             "partition stats mismatch for 'year'"
         );
 
-        // Double partition column (nullable): value_count, null_value_count, nan_value_count,
-        // lower, upper, exact_bounds
+        // Double partition column (nullable): lower, upper, tight_bounds, value_count,
+        // null_value_count, nan_value_count
         let score_stats_field = full_stats_schema.field("score").expect("score field");
         let DataType::Struct(score_inner) = score_stats_field.data_type() else {
             panic!("score stats should be a struct");
@@ -4313,12 +4298,12 @@ mod tests {
         let expected_score = StructData::try_new(
             score_inner.fields().cloned().collect(),
             vec![
+                Scalar::Double(19.15),        // lower_bound
+                Scalar::Double(19.15),        // upper_bound
+                Scalar::Boolean(true),        // tight_bounds
                 Scalar::Long(30),             // value_count
                 Scalar::Long(0),              // null_value_count
                 Scalar::Null(DataType::LONG), // nan_value_count (not set by partition stats)
-                Scalar::Double(19.15),        // lower_bound
-                Scalar::Double(19.15),        // upper_bound
-                Scalar::Boolean(true),        // exact_bounds
             ],
         )
         .expect("valid struct");

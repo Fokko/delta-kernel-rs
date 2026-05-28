@@ -1106,15 +1106,15 @@ mod tests {
                 .expect("upper_bound should be Int32");
             assert_eq!(id_ub_array.value(0), 1000, "id.upper_bound should be 1000");
 
-            // Verify id.exact_bounds
-            let id_exact = id_struct
-                .column_by_name(crate::content_tree::EXACT_BOUNDS)
-                .expect("id.exact_bounds should exist");
-            let id_eb_array = id_exact
+            // Verify id.tight_bounds
+            let id_tight = id_struct
+                .column_by_name(crate::content_tree::TIGHT_BOUNDS)
+                .expect("id.tight_bounds should exist");
+            let id_tb_array = id_tight
                 .as_any()
                 .downcast_ref::<crate::arrow::array::BooleanArray>()
-                .expect("exact_bounds should be Boolean");
-            assert!(id_eb_array.value(0), "id.exact_bounds should be true");
+                .expect("tight_bounds should be Boolean");
+            assert!(id_tb_array.value(0), "id.tight_bounds should be true");
 
             // Verify 'value' column stats exist
             let value_stats = stats_struct.column_by_name("value");
@@ -1180,15 +1180,15 @@ mod tests {
                 "value.upper_bound should be 'zoe'"
             );
 
-            // Verify value.exact_bounds
-            let value_exact = value_struct
-                .column_by_name(crate::content_tree::EXACT_BOUNDS)
-                .expect("value.exact_bounds should exist");
-            let value_eb_array = value_exact
+            // Verify value.tight_bounds
+            let value_tight = value_struct
+                .column_by_name(crate::content_tree::TIGHT_BOUNDS)
+                .expect("value.tight_bounds should exist");
+            let value_tb_array = value_tight
                 .as_any()
                 .downcast_ref::<crate::arrow::array::BooleanArray>()
-                .expect("exact_bounds should be Boolean");
-            assert!(value_eb_array.value(0), "value.exact_bounds should be true");
+                .expect("tight_bounds should be Boolean");
+            assert!(value_tb_array.value(0), "value.tight_bounds should be true");
 
             found_stats = true;
         }

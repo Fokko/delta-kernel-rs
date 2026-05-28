@@ -1639,8 +1639,8 @@ pub(crate) fn build_delta_stats_schema(
 /// Builds a content_stats expression (AMT format) from a `stats_parsed` column in Delta format.
 ///
 /// Converts `stats_parsed: {numRecords, minValues, maxValues, nullCount, tightBounds}` (Delta JSON
-/// format) to `content_stats: {col: {value_count, [null_value_count], lower_bound, upper_bound,
-/// exact_bounds}}` (AMT format) using struct expressions.
+/// format) to `content_stats: {col: {lower_bound, upper_bound, tight_bounds, value_count,
+/// [null_value_count], ...}}` (AMT format) using struct expressions.
 ///
 /// Column names used for field access come from `table_schema` field names (physical names when
 /// column mapping is enabled, which must match the JSON keys in the Delta stats).
@@ -1667,6 +1667,20 @@ fn build_content_stats_from_delta_stats_parsed(
                 .fields()
                 .map(|f| {
                     Arc::new(match f.name().as_str() {
+                        crate::content_tree::LOWER_BOUND => Expression::column([
+                            STATS_PARSED_NAME,
+                            DELTA_STATS_MIN_VALUES,
+                            col_name.as_str(),
+                        ]),
+                        crate::content_tree::UPPER_BOUND => Expression::column([
+                            STATS_PARSED_NAME,
+                            DELTA_STATS_MAX_VALUES,
+                            col_name.as_str(),
+                        ]),
+                        crate::content_tree::TIGHT_BOUNDS => Expression::coalesce([
+                            Expression::column([STATS_PARSED_NAME, DELTA_STATS_TIGHT_BOUNDS]),
+                            Expression::literal(Scalar::Boolean(true)),
+                        ]),
                         crate::content_tree::VALUE_COUNT => {
                             Expression::column([STATS_PARSED_NAME, DELTA_STATS_NUM_RECORDS])
                         }
@@ -1678,26 +1692,9 @@ fn build_content_stats_from_delta_stats_parsed(
                         crate::content_tree::NAN_VALUE_COUNT => {
                             Expression::null_literal(DataType::LONG)
                         }
-                        crate::content_tree::AVG_VALUE_SIZE => {
+                        crate::content_tree::AVG_VALUE_SIZE_IN_BYTES => {
                             Expression::null_literal(DataType::INTEGER)
                         }
-                        crate::content_tree::MAX_VALUE_SIZE => {
-                            Expression::null_literal(DataType::INTEGER)
-                        }
-                        crate::content_tree::LOWER_BOUND => Expression::column([
-                            STATS_PARSED_NAME,
-                            DELTA_STATS_MIN_VALUES,
-                            col_name.as_str(),
-                        ]),
-                        crate::content_tree::UPPER_BOUND => Expression::column([
-                            STATS_PARSED_NAME,
-                            DELTA_STATS_MAX_VALUES,
-                            col_name.as_str(),
-                        ]),
-                        crate::content_tree::EXACT_BOUNDS => Expression::coalesce([
-                            Expression::column([STATS_PARSED_NAME, DELTA_STATS_TIGHT_BOUNDS]),
-                            Expression::literal(Scalar::Boolean(true)),
-                        ]),
                         _ => Expression::null_literal(f.data_type().clone()),
                     })
                 })
@@ -2835,13 +2832,12 @@ mod tests {
         let expected_category = StructData::try_new(
             category_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(100),               // value_count
-                Scalar::Long(0),                 // null_value_count (not null)
-                Scalar::Null(DataType::INTEGER), // avg_value_size (string has this but no value)
-                Scalar::Null(DataType::INTEGER), // max_value_size
                 Scalar::String("A".to_string()), // lower_bound
                 Scalar::String("A".to_string()), // upper_bound
-                Scalar::Boolean(true),           // exact_bounds
+                Scalar::Boolean(true),           // tight_bounds
+                Scalar::Long(100),               // value_count
+                Scalar::Long(0),                 // null_value_count (not null)
+                Scalar::Null(DataType::INTEGER), // avg_value_size_in_bytes
             ],
         )?;
 
@@ -2854,10 +2850,10 @@ mod tests {
         let expected_year = StructData::try_new(
             year_inner.fields().cloned().collect(),
             vec![
-                Scalar::Long(100),     // value_count
                 Scalar::Integer(2024), // lower_bound
                 Scalar::Integer(2024), // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Boolean(true), // tight_bounds
+                Scalar::Long(100),     // value_count
             ],
         )?;
 
