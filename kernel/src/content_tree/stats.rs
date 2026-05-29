@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use serde_json::Value as JsonValue;
+use tracing::warn;
 
 use crate::content_tree::{
     AVG_VALUE_SIZE_IN_BYTES, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES,
@@ -24,133 +25,124 @@ use crate::schema::{
 };
 use crate::{DeltaResult, Engine, EngineData};
 
-/// Number of supported stats per column.
+/// Number of supported stats per column (each column gets a range of 200 field IDs).
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
-
-/// Number of reserved field IDs at the top of the i32 range.
-const NUM_RESERVED_FIELD_IDS: i32 = 200;
 
 /// Name of the variant inner field for which we track stats. Other variant fields
 /// (e.g. `metadata`) are excluded from stats collection.
 const VARIANT_VALUE_FIELD_NAME: &str = "value";
 
-/// Starting field ID of the stats space for the data field IDs (regular column stats).
+/// Starting field ID of the stats space for data field IDs (regular column stats).
 const STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS: i32 = 10_000;
 
-/// Starting field ID of the stats space for the metadata field IDs (reserved field stats).
-const STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS: i32 = 2_147_000_000;
+/// Starting field ID of the stats space for metadata (reserved) field IDs.
+/// Metadata stats occupy `[9_000, 10_000)`, just below the data stats space.
+const STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS: i32 = 9_000;
 
-/// Field ID where reserved field IDs begin.
-const RESERVED_FIELD_IDS_START: i32 = i32::MAX - NUM_RESERVED_FIELD_IDS;
+/// Exclusive upper bound of the stats field ID range reserved for content_stats.
+/// Valid stats field IDs are in `[STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS,
+/// STATS_SPACE_FIELD_ID_END)`.
+const STATS_SPACE_FIELD_ID_END: i32 = 200_000_000;
+
+/// The maximum stats field ID for data columns (the base-id for the last data field that fits).
+const MAX_DATA_STATS_FIELD_ID: i32 = STATS_SPACE_FIELD_ID_END - NUM_SUPPORTED_STATS_PER_COLUMN;
+
+/// The maximum data field ID whose stats struct fits within the reserved range.
+const MAX_DATA_FIELD_ID: i32 = (MAX_DATA_STATS_FIELD_ID
+    - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
+    / NUM_SUPPORTED_STATS_PER_COLUMN;
+
+/// The set of reserved metadata field IDs that have stats tracked in `content_stats`.
+/// Per the spec, only `_last_updated_sequence_number` (2147483539) and `_row_id` (2147483540)
+/// are supported.
+const SUPPORTED_METADATA_FIELD_IDS: [i32; 2] = [2_147_483_539, 2_147_483_540];
+
+/// The smallest field ID in [`SUPPORTED_METADATA_FIELD_IDS`]. Metadata stats offsets are
+/// computed relative to this value.
+const FIRST_SUPPORTED_METADATA_FIELD_ID: i32 = SUPPORTED_METADATA_FIELD_IDS[0];
 
 /// Computes the base field ID for a column's stats struct, given a parent struct field ID.
 ///
-/// Base stats field IDs are computed in different "spaces" depending on the input field ID:
-/// - Regular field IDs (0 to `RESERVED_FIELD_IDS_START - 1`) use the data space starting at 10,000
-/// - Reserved field IDs (`RESERVED_FIELD_IDS_START` to `i32::MAX`) use the metadata space starting
-///   at 2,147,000,000
+/// Stats field IDs occupy the range `[9_000, 200_000_000)`:
+/// - Metadata fields in [`SUPPORTED_METADATA_FIELD_IDS`] use `[9_000, 10_000)`, computed as `9_000
+///   + 200 * (field_id - FIRST_SUPPORTED_METADATA_FIELD_ID)`
+/// - Data fields `[0, MAX_DATA_FIELD_ID]` use `[10_000, 200_000_000)`, computed as `10_000 + 200 *
+///   field_id`
 ///
-/// # Arguments
-///
-/// * `field_id` - The parent struct field ID to compute the base stats field ID for
-///
-/// # Returns
-///
-/// Returns `Some(base_stats_field_id)` if the computation succeeds, or `None` if the computed
-/// field ID would overflow or overlap with another ID range.
+/// Returns `None` for negative field IDs, unsupported metadata field IDs, or data field IDs
+/// whose stats would fall outside the reserved range.
 ///
 /// # Examples
 ///
-/// ```ignore
-/// let stats_id = field_id_to_statistics_base(0);
-/// assert_eq!(stats_id, Some(10_000));
+/// These examples use `ignore` because the function is `pub(crate)`.
 ///
-/// let stats_id = field_id_to_statistics_base(1);
-/// assert_eq!(stats_id, Some(10_200));
+/// ```ignore
+/// assert_eq!(field_id_to_statistics_base(0), Some(10_000));
+/// assert_eq!(field_id_to_statistics_base(1), Some(10_200));
+/// // _last_updated_sequence_number (2147483539) -> 9_000
+/// assert_eq!(field_id_to_statistics_base(2_147_483_539), Some(9_000));
+/// // _row_id (2147483540) -> 9_200
+/// assert_eq!(field_id_to_statistics_base(2_147_483_540), Some(9_200));
 /// ```
 pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
-    if field_id < 0 {
-        // Short circuit on negative field-IDs
-        return None;
-    }
-
-    let (id_space_start, id) = if field_id >= RESERVED_FIELD_IDS_START {
-        // This is a reserved field ID, which uses a different calculation
-        let id = NUM_RESERVED_FIELD_IDS - (i32::MAX - field_id);
-        (STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS, id)
+    if SUPPORTED_METADATA_FIELD_IDS.contains(&field_id) {
+        let offset = field_id - FIRST_SUPPORTED_METADATA_FIELD_ID;
+        Some(
+            STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS
+                + (NUM_SUPPORTED_STATS_PER_COLUMN * offset),
+        )
+    } else if (0..=MAX_DATA_FIELD_ID).contains(&field_id) {
+        Some(
+            STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS
+                + (NUM_SUPPORTED_STATS_PER_COLUMN * field_id),
+        )
     } else {
-        (STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS, field_id)
-    };
+        None
+    }
+}
 
-    // Calculate final_id, checking for overflow
-    let stats_offset = NUM_SUPPORTED_STATS_PER_COLUMN.checked_mul(id)?;
-    let final_id = id_space_start.checked_add(stats_offset)?;
-
-    // Check for overlap with other ID ranges:
-    // Data space IDs should not overlap into metadata space
-    if field_id < RESERVED_FIELD_IDS_START
-        && final_id >= STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS
+/// Computes the original field ID from a stats field ID (inverse of
+/// [`field_id_to_statistics_base`]).
+///
+/// Only stats field IDs in `[9_000, 200_000_000)` that are multiples of 200 are valid.
+/// For the metadata range `[9_000, 10_000)`, the recovered field ID must be in
+/// [`SUPPORTED_METADATA_FIELD_IDS`]; otherwise `None` is returned.
+///
+/// # Examples
+///
+/// These examples use `ignore` because the function is `#[cfg(test)] pub(crate)`.
+///
+/// ```ignore
+/// assert_eq!(statistics_base_to_field_id(10_000), Some(0));
+/// assert_eq!(statistics_base_to_field_id(10_200), Some(1));
+/// assert_eq!(statistics_base_to_field_id(9_000), Some(2_147_483_539));
+/// assert_eq!(statistics_base_to_field_id(9_200), Some(2_147_483_540));
+/// ```
+#[cfg(test)]
+pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
+    if !(STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS..STATS_SPACE_FIELD_ID_END)
+        .contains(&stats_field_id)
+        || stats_field_id % NUM_SUPPORTED_STATS_PER_COLUMN != 0
     {
         return None;
     }
 
-    Some(final_id)
-}
-
-/// Computes the original field ID from a stats field ID.
-///
-/// This is the inverse of [`field_id_to_statistics_base`]. Given a stats field ID,
-/// it returns the original parent struct field ID that would produce that stats field ID.
-///
-/// # Arguments
-///
-/// * `stats_field_id` - The stats field ID to convert back to a field ID
-///
-/// # Returns
-///
-/// Returns `Some(field_id)` if the stats field ID is valid, or `None` if:
-/// - The stats field ID is negative
-/// - The stats field ID is not a multiple of `NUM_STATS_PER_COLUMN` (200)
-/// - The resulting field ID would be negative
-///
-/// # Examples
-///
-/// ```ignore
-/// let field_id = statistics_base_to_field_id(10_000);
-/// assert_eq!(field_id, Some(0));
-///
-/// let field_id = statistics_base_to_field_id(10_200);
-/// assert_eq!(field_id, Some(1));
-/// ```
-#[cfg(test)]
-pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
-    // Invalid stats field ID: negative or not a multiple of NUM_STATS_PER_COLUMN
-    if stats_field_id < 0 || stats_field_id % NUM_SUPPORTED_STATS_PER_COLUMN != 0 {
-        return None;
-    }
-
-    let final_id = if stats_field_id < STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS {
-        // Data space: reverse the calculation
-        // stats_field_id = DATA_SPACE_FIELD_ID_START + NUM_STATS_PER_COLUMN * field_id
-        // => field_id = (stats_field_id - DATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
-        (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
+    if stats_field_id < STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS {
+        // Metadata space: reverse 9_000 + 200 * (field_id - FIRST_SUPPORTED)
+        let field_id = (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS)
             / NUM_SUPPORTED_STATS_PER_COLUMN
+            + FIRST_SUPPORTED_METADATA_FIELD_ID;
+        if SUPPORTED_METADATA_FIELD_IDS.contains(&field_id) {
+            Some(field_id)
+        } else {
+            None
+        }
     } else {
-        // ContentTreeNode space (reserved field IDs): reverse the calculation
-        // stats_field_id = METADATA_SPACE_FIELD_ID_START + NUM_STATS_PER_COLUMN * id
-        // where id = RESERVED_FIELD_IDS - (i32::MAX - field_id)
-        // => id = (stats_field_id - METADATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
-        // => field_id = i32::MAX - (RESERVED_FIELD_IDS - id) = RESERVED_FIELD_IDS_START + id
-        let id = (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS)
-            / NUM_SUPPORTED_STATS_PER_COLUMN;
-        RESERVED_FIELD_IDS_START + id
-    };
-
-    // Return None if final_id is negative (invalid stats field ID for data space)
-    if final_id < 0 {
-        None
-    } else {
-        Some(final_id)
+        // Data space: reverse 10_000 + 200 * field_id
+        Some(
+            (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
+                / NUM_SUPPORTED_STATS_PER_COLUMN,
+        )
     }
 }
 
@@ -249,14 +241,23 @@ impl SchemaVisitor for StatsSchemaVisitor {
             ))
         })?;
 
-        // Compute the base stats field ID
-        let base_stats_id = field_id_to_statistics_base(field_id).ok_or_else(|| {
-            crate::Error::generic(format!(
-                "Failed to compute stats field ID for field '{}' with id {}",
-                field.name(),
-                field_id
-            ))
-        })?;
+        // Compute the base stats field ID. Fields whose field ID falls outside the
+        // supported stats range `[9_000, 200_000_000)` are skipped with a warning rather
+        // than an error: the spec explicitly limits which fields can have stats, so a
+        // missing mapping is expected for unsupported reserved metadata columns or data
+        // fields with very large IDs. Implementations are not required to write a stats
+        // struct for every table field.
+        let base_stats_id = match field_id_to_statistics_base(field_id) {
+            Some(id) => id,
+            None => {
+                warn!(
+                    "Skipping stats for field '{}' (field_id={}): outside supported stats range",
+                    field.name(),
+                    field_id
+                );
+                return Ok(type_result);
+            }
+        };
 
         // Build the stats struct based on the field's data type.
         let stats_struct = match field.data_type() {
@@ -1841,13 +1842,19 @@ fn filtered_stats_schema_fields(
                 table_field.metadata()
             ))
         })?;
-        let base_stats_id = field_id_to_statistics_base(field_id).ok_or_else(|| {
-            crate::Error::generic(format!(
-                "Failed to compute stats field ID for field '{}' with id {}",
-                table_field.name(),
-                field_id
-            ))
-        })?;
+        // Skip fields whose ID falls outside the supported stats range -- see the
+        // comment in StatsSchemaVisitor::field for why this is a warning, not an error.
+        let base_stats_id = match field_id_to_statistics_base(field_id) {
+            Some(id) => id,
+            None => {
+                warn!(
+                    "Skipping stats for field '{}' (field_id={}): outside supported stats range",
+                    table_field.name(),
+                    field_id
+                );
+                continue;
+            }
+        };
 
         let stats_struct = match table_field.data_type() {
             DataType::Primitive(_) => {
@@ -2199,18 +2206,24 @@ mod tests {
     fn test_field_id_to_statistics_base() {
         // field_id -> expected stats_field_id
         let cases = [
+            // Data fields: 10_000 + 200 * field_id
             (0, Some(10_000)),
             (1, Some(10_200)),
             (2, Some(10_400)),
             (5, Some(11_000)),
             (100, Some(30_000)),
-            (-1, None),                     // negative
-            (1_000_000, Some(200_010_000)), // 1_000_000 = max data field id
-            (2_147_483_447, Some(2_147_000_000)),
-            (2_147_483_448, Some(2_147_000_200)),
-            (2_147_483_541, Some(2_147_018_800)),
-            (2_147_483_645, Some(2_147_039_600)),
-            (2_147_483_646, Some(2_147_039_800)),
+            (MAX_DATA_FIELD_ID, Some(MAX_DATA_STATS_FIELD_ID)),
+            // Negative field IDs are invalid
+            (-1, None),
+            // Data field IDs above MAX_DATA_FIELD_ID are invalid
+            (MAX_DATA_FIELD_ID + 1, None),
+            // Supported metadata fields: 9_000 + 200 * (field_id - FIRST_SUPPORTED)
+            (2_147_483_539, Some(9_000)), // _last_updated_sequence_number
+            (2_147_483_540, Some(9_200)), // _row_id
+            // Unsupported reserved metadata fields
+            (2_147_483_541, None), // _commit_snapshot_id
+            (2_147_483_645, None), // _pos
+            (2_147_483_646, None), // _file
         ];
         for (field_id, expected) in cases {
             assert_eq!(
@@ -2226,27 +2239,36 @@ mod tests {
     fn test_statistics_base_to_field_id() {
         // stats_field_id -> expected field_id
         let cases = [
+            // Data space
             (10_000, Some(0)),
             (10_200, Some(1)),
             (10_400, Some(2)),
             (11_000, Some(5)),
             (30_000, Some(100)),
-            (200_010_000, Some(1_000_000)), // 1_000_000 = max data field id
-            (2_147_000_000, Some(2_147_483_447)),
-            (2_147_000_200, Some(2_147_483_448)),
-            (2_147_018_800, Some(2_147_483_541)),
-            (2_147_039_600, Some(2_147_483_645)),
-            (2_147_039_800, Some(2_147_483_646)),
-            // Invalid cases
-            (-1, None), // negative
-            // below data space start (would give negative field_id)
+            (MAX_DATA_STATS_FIELD_ID, Some(MAX_DATA_FIELD_ID)),
+            // Metadata space (supported)
+            (9_000, Some(2_147_483_539)), // _last_updated_sequence_number
+            (9_200, Some(2_147_483_540)), // _row_id
+            // Metadata space (unsupported -- outside SUPPORTED_METADATA_FIELD_IDS)
+            (9_400, None),
+            (9_600, None),
+            (9_800, None),
+            // Invalid: below the metadata space start
+            (-1, None),
             (0, None),
+            (200, None),
             (5_000, None),
-            // not a multiple of 200
+            (8_600, None),
+            (8_800, None),
+            // Invalid: not a multiple of 200
             (10_001, None),
             (10_201, None),
             (10_500, None),
             (10_900, None),
+            // Invalid: at or above the exclusive upper bound
+            (STATS_SPACE_FIELD_ID_END, None),
+            (STATS_SPACE_FIELD_ID_END + 200, None),
+            (i32::MAX, None),
         ];
         for (stats_field_id, expected) in cases {
             assert_eq!(
@@ -3682,8 +3704,10 @@ mod tests {
         let id = field_with_id("id", DataType::LONG, false, 0);
         let name = field_with_id("name", DataType::STRING, true, 1);
         let score = field_with_id("score", DataType::DOUBLE, true, 2);
+        // _file and _pos are unsupported metadata fields -- they should be skipped
         let file = field_with_id("_file", DataType::STRING, false, 2147483646);
         let pos = field_with_id("_pos", DataType::LONG, false, 2147483645);
+        // _row_id and _last_updated_sequence_number are supported metadata fields
         let row_id = field_with_id("_row_id", DataType::LONG, false, 2147483540);
         let last_updated_seq_no = field_with_id(
             "_last_updated_sequence_number",
@@ -3702,20 +3726,23 @@ mod tests {
         ]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        assert_eq!(stats.fields().count(), 7);
+        // Only 5 fields: 3 data + 2 supported metadata (_file and _pos are skipped)
+        assert_eq!(stats.fields().count(), 5);
         assert_stats_field_ids(&_field_stats_struct_for(&id, &stats), 10_000, &id);
         assert_stats_field_ids(&_field_stats_struct_for(&name, &stats), 10_200, &name);
         assert_stats_field_ids(&_field_stats_struct_for(&score, &stats), 10_400, &score);
-        assert_stats_field_ids(&_field_stats_struct_for(&file, &stats), 2147039800, &file);
-        assert_stats_field_ids(&_field_stats_struct_for(&pos, &stats), 2147039600, &pos);
-        assert_stats_field_ids(
-            &_field_stats_struct_for(&row_id, &stats),
-            2147018600,
-            &row_id,
+        assert!(
+            stats.field("_file").is_none(),
+            "_file should be skipped (unsupported)"
         );
+        assert!(
+            stats.field("_pos").is_none(),
+            "_pos should be skipped (unsupported)"
+        );
+        assert_stats_field_ids(&_field_stats_struct_for(&row_id, &stats), 9_200, &row_id);
         assert_stats_field_ids(
             &_field_stats_struct_for(&last_updated_seq_no, &stats),
-            2147018400,
+            9_000,
             &last_updated_seq_no,
         );
     }
