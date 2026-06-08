@@ -148,7 +148,11 @@ impl Iterator for LazyContentRootIterator {
                     path_in_log,
                     context,
                 } => {
-                    // Lazily construct the ContentTreeNode object on first access
+                    // Lazily construct the ContentTreeNode object on first access. The root
+                    // manifest is required by the AMT protocol to carry non-null
+                    // `tracking.sequence_number` / `tracking.file_sequence_number` on every
+                    // entry, so we pass batches through unchanged; the visitor will surface
+                    // any violation as an error.
                     let data: Vec<Box<dyn EngineData>> = {
                         let _span =
                             tracing::info_span!("content_tree.collect_root_batches").entered();

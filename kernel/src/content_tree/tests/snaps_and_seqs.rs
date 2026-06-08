@@ -241,6 +241,11 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     let manifest_info = &manifest_entry.tracking;
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
+    // The DataManifest entry's sequence_number / file_sequence_number must equal the
+    // commit version (self.version). This is the inheritance literal the read-side coalesce
+    // uses for leaf entries with null sequence_number / file_sequence_number.
+    assert_eq!(manifest_info.sequence_number, Some(3));
+    assert_eq!(manifest_info.file_sequence_number, Some(3));
 
     // Verify min_sequence_number in manifest_info
     let manifest_info = manifest_entry

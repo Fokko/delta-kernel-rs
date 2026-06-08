@@ -441,8 +441,12 @@ impl ManifestCommitState {
         log_start_version: Version,
         root_path: Option<&str>,
     ) -> DeltaResult<ContentTreeNodeBuilder> {
-        let mut processor =
-            ContentRootRebuildProcessor::new(engine, self.snapshot_id, &physical_schema)?;
+        let mut processor = ContentRootRebuildProcessor::new(
+            engine,
+            self.snapshot_id,
+            self.version_to_write as i64,
+            &physical_schema,
+        )?;
         let mut builder = ContentTreeNodeBuilder::new_for(
             table_root.clone(),
             self.version_to_write,

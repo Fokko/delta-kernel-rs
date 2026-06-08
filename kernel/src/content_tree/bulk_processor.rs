@@ -92,6 +92,11 @@ struct ManifestProcessingState {
     /// Add evaluators (per-manifest: embed the manifest path as a literal)
     add_evaluators: ManifestAddEvaluators,
 
+    /// Per-leaf coalesce evaluator that materializes `tracking.sequence_number` /
+    /// `tracking.file_sequence_number` from the parent `DataManifest` entry's values.
+    /// Applied before stats / add / remove evaluators so they see the non-null shape.
+    tracking_coalesce: Arc<dyn crate::ExpressionEvaluator>,
+
     /// Whether we're still on the first batch for this manifest (for span tracking)
     is_first_batch: bool,
 }
@@ -118,6 +123,12 @@ pub(crate) struct BulkManifestStreamProcessor {
 
     /// Evaluators shared across all manifests (computed once)
     shared: SharedEvaluators,
+
+    /// Read schema used for parquet reads. Holds `tracking.sequence_number` /
+    /// `tracking.file_sequence_number` as nullable so the parquet read tolerates leaf
+    /// manifests written with the "inherited when null" optimization; the per-manifest
+    /// coalesce evaluator restores the non-null kernel shape.
+    read_schema: SchemaRef,
 
     /// Whether the output schema requests Add actions
     has_add: bool,
@@ -179,6 +190,12 @@ impl BulkManifestStreamProcessor {
         // Include content_stats only when stats_schema is provided (i.e., stats_parsed
         // transformation will be applied). Without stats_schema, content_stats is not needed
         // and including it would wastefully read per-column statistics for every entry.
+        //
+        // The kernel-side `tracking.{sequence_number,file_sequence_number}` are non-null, but
+        // on-disk leaf manifests may carry null values that inherit from the root. Override the
+        // read schema so those fields are read as nullable; the per-leaf coalesce evaluator
+        // (built in `setup_next_manifest_state`) restores the non-null shape before downstream
+        // evaluators run.
         let base_schema = if let (Some(ref ts), Some(ref ss)) = (&table_schema, &stats_schema) {
             ContentTreeNodeEntry::to_schema_with_content_stats(ts.as_ref(), ss.as_ref())?
         } else {
@@ -187,6 +204,13 @@ impl BulkManifestStreamProcessor {
                 ContentTreeNodeEntry::to_schema()
             }
         };
+        let base_schema = super::make_tracking_fields_nullable_in_schema(
+            &base_schema,
+            &[
+                super::TRACKING_SEQUENCE_NUMBER_FIELD,
+                super::TRACKING_FILE_SEQUENCE_NUMBER_FIELD,
+            ],
+        );
         let mut read_fields: Vec<StructField> = base_schema.fields().cloned().collect();
         read_fields.push(StructField::create_metadata_column(
             "_pos",
@@ -204,7 +228,7 @@ impl BulkManifestStreamProcessor {
             .map(|mr| mr.data_manifest.to_file_meta(&table_root))
             .collect::<DeltaResult<Vec<_>>>()?;
         let data_batch_iter =
-            parquet_handler.read_parquet_files(&data_file_metas, read_schema, None)?;
+            parquet_handler.read_parquet_files(&data_file_metas, read_schema.clone(), None)?;
 
         // Pre-compute manifest-independent evaluators once.
         let table_schema_ref = table_schema.as_ref().map(|s| s.as_ref());
@@ -289,6 +313,7 @@ impl BulkManifestStreamProcessor {
             schema,
             table_root,
             shared,
+            read_schema,
             has_add,
             current_manifest_state: None,
             pending_actions: std::collections::VecDeque::new(),
@@ -371,10 +396,42 @@ impl BulkManifestStreamProcessor {
             }
         };
 
+        // Build a per-leaf coalesce evaluator using the parent's `DataManifest` entry as the
+        // inheritance source. Per AMT protocol, the root manifest's entries must carry
+        // non-null `sequence_number` / `file_sequence_number`; missing values here indicate
+        // a malformed root manifest.
+        let parent = &manifest_ref.data_manifest.manifest.tracking;
+        let parent_sequence_number = parent.sequence_number.ok_or_else(|| {
+            crate::Error::generic(
+                "root DataManifest entry is missing tracking.sequence_number (required by protocol)",
+            )
+        })?;
+        let parent_file_sequence_number = parent.file_sequence_number.ok_or_else(|| {
+            crate::Error::generic(
+                "root DataManifest entry is missing tracking.file_sequence_number \
+                 (required by protocol)",
+            )
+        })?;
+        let tracking_coalesce = super::build_tracking_coalesce_evaluator(
+            self.evaluation_handler.as_ref(),
+            self.read_schema.clone(),
+            &[
+                (
+                    super::TRACKING_SEQUENCE_NUMBER_FIELD,
+                    parent_sequence_number,
+                ),
+                (
+                    super::TRACKING_FILE_SEQUENCE_NUMBER_FIELD,
+                    parent_file_sequence_number,
+                ),
+            ],
+        )?;
+
         self.current_manifest_state = Some(ManifestProcessingState {
             current_file_path,
             manifest_dv_applicator,
             add_evaluators,
+            tracking_coalesce,
             is_first_batch: true,
         });
 
@@ -468,6 +525,14 @@ impl Iterator for BulkManifestStreamProcessor {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => return Some(Err(e)),
                 None => unreachable!("Peeked batch should be available"),
+            };
+
+            // Materialize tracking.sequence_number / tracking.file_sequence_number (coalesce
+            // nulls against the parent's literal) before any downstream processing. After this,
+            // the batch matches the canonical non-null kernel schema.
+            let batch = match state.tracking_coalesce.evaluate(batch.as_ref()) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
             };
 
             // Try to append inline DV columns; None means no DVs present in this batch.

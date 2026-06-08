@@ -1096,11 +1096,14 @@ impl ContentTreeNodeBuilder {
                 .tracking(TrackingInfo {
                     status: TrackingStatus::Added,
                     snapshot_id: Some(snapshot_id),
-                    // TODO: Manifest entries in root should have sequence_number and
-                    // file_sequence_number set to self.version so that leaf
-                    // entries can inherit them when null.
-                    sequence_number: None,
-                    file_sequence_number: None,
+                    // For manifest entries, sequence_number and file_sequence_number are both set
+                    // to self.version (the sequence number of the snapshot that adds the manifest)
+                    // and must be equal. There is no data-vs-file sequence distinction for
+                    // manifests: a manifest is added at a single, known sequence number. Both are
+                    // required (non-null) in the root so that leaf data entries can inherit the
+                    // value when their own sequence numbers are null and status == Added.
+                    sequence_number: Some(self.version as i64),
+                    file_sequence_number: Some(self.version as i64),
                     // Set to the starting row ID used for data entries in this leaf
                     first_row_id: Some(starting_first_row_id),
                     changes_dv: None,
@@ -1860,6 +1863,7 @@ fn build_log_batch_evaluator(
 fn build_action_to_content_tree_entry_evaluator(
     engine: &dyn Engine,
     snapshot_id: i64,
+    commit_version: i64,
     table_schema: &Schema,
     delta_stats_schema: &SchemaRef,
     output_schema: &SchemaRef,
@@ -1889,7 +1893,13 @@ fn build_action_to_content_tree_entry_evaluator(
         snapshot_id,
         location: Expression::column([ADD_NAME, "path"]),
         file_size_in_bytes: Expression::column([ADD_NAME, "size"]),
-        sequence_number: Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+        // `defaultRowCommitVersion` is optional on Add actions (only populated when row
+        // tracking is enabled). Coalesce against `commit_version` so entries always carry
+        // a meaningful sequence number even when the Add action lacks it.
+        sequence_number: Expression::coalesce([
+            Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+            Expression::literal(Scalar::Long(commit_version)),
+        ]),
         dv_info: Some(flat_dv_columns_to_dv_info_expr()),
         record_count: Expression::coalesce([
             Expression::column([STATS_PARSED_NAME, DELTA_STATS_NUM_RECORDS]),
@@ -2223,6 +2233,7 @@ impl ContentRootRebuildProcessor {
     pub(crate) fn new(
         engine: &dyn Engine,
         snapshot_id: i64,
+        commit_version: i64,
         table_schema: &Schema,
     ) -> DeltaResult<Self> {
         let delta_stats_schema = Arc::new(build_delta_stats_schema(table_schema));
@@ -2235,6 +2246,7 @@ impl ContentRootRebuildProcessor {
         let action_to_content_tree_entry_evaluator = build_action_to_content_tree_entry_evaluator(
             engine,
             snapshot_id,
+            commit_version,
             table_schema,
             &delta_stats_schema,
             &output_schema,

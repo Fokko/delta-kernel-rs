@@ -26,7 +26,7 @@ use url::Url;
 
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
-use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
+use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData, Transform};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, StructField, StructType};
@@ -86,6 +86,128 @@ static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::new("dv_sizeInBytes", DataType::INTEGER, true),
     ]))
 });
+
+/// Kernel-schema field name for `TrackingInfo.sequence_number` (camelCase per `ToSchema` derive).
+const TRACKING_SEQUENCE_NUMBER_FIELD: &str = "sequenceNumber";
+
+/// Kernel-schema field name for `TrackingInfo.file_sequence_number` (camelCase per `ToSchema`).
+const TRACKING_FILE_SEQUENCE_NUMBER_FIELD: &str = "fileSequenceNumber";
+
+/// Returns a copy of `schema` with the named subfields of `tracking` forced to nullable.
+///
+/// Used to build the parquet *read* schema for content-tree files. On-disk leaf manifests may
+/// carry null values for fields the protocol marks "inherited when null" (currently
+/// `sequence_number` and `file_sequence_number`). After parquet read, the scan path runs a
+/// coalesce evaluator (see [`build_tracking_coalesce_evaluator`]) that materializes the
+/// inherited value, producing batches that match the canonical non-null kernel schema.
+///
+/// `nullable_tracking_fields` are the kernel (camelCase) names of subfields to force nullable.
+/// Fields not present in `tracking` are silently ignored.
+fn make_tracking_fields_nullable_in_schema(
+    schema: &StructType,
+    nullable_tracking_fields: &[&str],
+) -> StructType {
+    let new_fields: Vec<StructField> = schema
+        .fields()
+        .map(|f| {
+            if f.name() != TRACKING {
+                return f.clone();
+            }
+            let DataType::Struct(tracking_struct) = f.data_type() else {
+                return f.clone();
+            };
+            let new_inner: Vec<StructField> = tracking_struct
+                .fields()
+                .map(|inner| {
+                    if nullable_tracking_fields.contains(&inner.name().as_str()) {
+                        StructField::nullable(inner.name(), inner.data_type().clone())
+                            .with_metadata(inner.metadata.clone())
+                    } else {
+                        inner.clone()
+                    }
+                })
+                .collect();
+            StructField::new(f.name(), StructType::new_unchecked(new_inner), f.nullable)
+                .with_metadata(f.metadata.clone())
+        })
+        .collect();
+    StructType::new_unchecked(new_fields)
+}
+
+/// Build an [`ExpressionEvaluator`] that materializes inherited tracking fields via coalesce.
+///
+/// For each `(field_name, literal)` in `replacements`, the evaluator replaces
+/// `tracking.<field_name>` with `coalesce(tracking.<field_name>, literal(<literal>))`. The
+/// output schema is identical to `input_schema` except those subfields are marked non-null.
+/// All other columns (including metadata columns like `_pos` / `_file`) pass through unchanged
+/// thanks to the sparse [`Expression::Transform`] used here.
+///
+/// `input_schema` must have the listed subfields marked nullable (see
+/// [`make_tracking_fields_nullable_in_schema`]); a non-nullable input field is allowed but the
+/// coalesce is then a no-op at the data level.
+fn build_tracking_coalesce_evaluator(
+    handler: &dyn EvaluationHandler,
+    input_schema: SchemaRef,
+    replacements: &[(&str, i64)],
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let tracking_field = input_schema.field(TRACKING).ok_or_else(|| {
+        Error::internal_error("input_schema has no `tracking` field for coalesce evaluator")
+    })?;
+    let DataType::Struct(tracking_struct) = tracking_field.data_type() else {
+        return Err(Error::internal_error(
+            "`tracking` field is not a struct in input_schema",
+        ));
+    };
+
+    // Build a struct expression for the new `tracking` value: every original field passes
+    // through unchanged except the named ones, which become coalesce(field, literal).
+    let inner_exprs: Vec<Arc<Expression>> = tracking_struct
+        .fields()
+        .map(|inner| -> Arc<Expression> {
+            let inner_path = Expression::column([TRACKING, inner.name()]);
+            if let Some((_, literal)) = replacements.iter().find(|(name, _)| *name == inner.name())
+            {
+                Arc::new(Expression::coalesce([
+                    inner_path,
+                    Expression::literal(*literal),
+                ]))
+            } else {
+                Arc::new(inner_path)
+            }
+        })
+        .collect();
+    let new_tracking_expr = Arc::new(Expression::struct_from(inner_exprs));
+
+    // Output schema: same as input but with the replaced subfields forced not-null.
+    let replacement_names: Vec<&str> = replacements.iter().map(|(n, _)| *n).collect();
+    let output_fields: Vec<StructField> = input_schema
+        .fields()
+        .map(|f| {
+            if f.name() != TRACKING {
+                return f.clone();
+            }
+            let new_inner: Vec<StructField> = tracking_struct
+                .fields()
+                .map(|inner| {
+                    if replacement_names.contains(&inner.name().as_str()) {
+                        StructField::not_null(inner.name(), inner.data_type().clone())
+                            .with_metadata(inner.metadata.clone())
+                    } else {
+                        inner.clone()
+                    }
+                })
+                .collect();
+            StructField::new(f.name(), StructType::new_unchecked(new_inner), f.nullable)
+                .with_metadata(f.metadata.clone())
+        })
+        .collect();
+    let output_schema = DataType::Struct(Box::new(StructType::new_unchecked(output_fields)));
+
+    let transform = Transform::new_top_level().with_replaced_field(TRACKING, new_tracking_expr);
+    let expr = Arc::new(Expression::transform(transform));
+
+    handler.new_expression_evaluator(input_schema, expr, output_schema)
+}
 
 /// A stats provider that extracts min/max statistics from AMT manifest `content_stats`.
 ///
@@ -1349,6 +1471,12 @@ impl ContentTreeNode {
         // Cached schema for reading ContentTreeNodeEntry from parquet files without content_stats.
         // Uses ToSchema which excludes content_stats (requires both table and stats schemas).
         // Includes _pos metadata column for tracking row positions within the manifest.
+        //
+        // The root manifest is protocol-required to carry non-null `tracking.sequence_number`
+        // / `tracking.file_sequence_number`, so we read with the canonical kernel schema
+        // (non-null). Leaf manifests, which may use the "inherited when null" optimization,
+        // are read by `BulkManifestStreamProcessor` with its own nullability override and
+        // per-leaf coalesce -- they do not go through this code path.
         static READ_SCHEMA_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
             use crate::schema::{MetadataColumnSpec, ToSchema as _};
             let base_schema = ContentTreeNodeEntry::to_schema();
@@ -3886,19 +4014,190 @@ mod tests {
     }
 
     #[test]
+    fn test_make_tracking_fields_nullable_in_schema_sequence_fields() {
+        use crate::schema::ToSchema as _;
+        // Start from a tracking struct with the sequence fields marked non-null so the test
+        // can verify the helper actually flips them. The canonical kernel schema marks them
+        // nullable (the on-disk inheritance optimization), which would make the helper a
+        // no-op on those fields and weaken the test.
+        let baseline_tracking = match ContentTreeNodeEntry::to_schema()
+            .field(TRACKING)
+            .expect("tracking field")
+            .data_type()
+        {
+            DataType::Struct(s) => s.as_ref().clone(),
+            _ => panic!("tracking should be a struct"),
+        };
+        let non_null_inner: Vec<StructField> = baseline_tracking
+            .fields()
+            .map(|f| {
+                if f.name() == TRACKING_SEQUENCE_NUMBER_FIELD
+                    || f.name() == TRACKING_FILE_SEQUENCE_NUMBER_FIELD
+                {
+                    StructField::not_null(f.name(), f.data_type().clone())
+                        .with_metadata(f.metadata.clone())
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let kernel_schema = StructType::new_unchecked(vec![StructField::new(
+            TRACKING,
+            StructType::new_unchecked(non_null_inner),
+            false,
+        )]);
+
+        let nullable = make_tracking_fields_nullable_in_schema(
+            &kernel_schema,
+            &[
+                TRACKING_SEQUENCE_NUMBER_FIELD,
+                TRACKING_FILE_SEQUENCE_NUMBER_FIELD,
+            ],
+        );
+        let DataType::Struct(nullable_tracking) = nullable.field(TRACKING).unwrap().data_type()
+        else {
+            panic!();
+        };
+        assert!(nullable_tracking
+            .field(TRACKING_SEQUENCE_NUMBER_FIELD)
+            .unwrap()
+            .is_nullable());
+        assert!(nullable_tracking
+            .field(TRACKING_FILE_SEQUENCE_NUMBER_FIELD)
+            .unwrap()
+            .is_nullable());
+        // status untouched.
+        assert_eq!(
+            nullable_tracking.field("status").map(|f| f.is_nullable()),
+            baseline_tracking.field("status").map(|f| f.is_nullable()),
+        );
+    }
+
+    #[test]
+    fn test_sequence_number_coalesce_substitutes_null_and_passes_through() -> DeltaResult<()> {
+        use crate::arrow::array::{Array as _, Int32Array, Int64Array, RecordBatch, StructArray};
+        use crate::arrow::datatypes::{
+            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        };
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::engine_data::{RowVisitor, TypedGetData as _};
+        use crate::Engine;
+
+        let engine = SyncEngine::new();
+
+        // Minimal input schema: just `tracking` with status + two sequence-number fields.
+        let kernel_input = StructType::new_unchecked(vec![StructField::new(
+            TRACKING,
+            StructType::new_unchecked(vec![
+                StructField::new("status", DataType::INTEGER, false),
+                StructField::new(TRACKING_SEQUENCE_NUMBER_FIELD, DataType::LONG, true),
+                StructField::new(TRACKING_FILE_SEQUENCE_NUMBER_FIELD, DataType::LONG, true),
+            ]),
+            false,
+        )]);
+
+        let evaluator = build_tracking_coalesce_evaluator(
+            engine.evaluation_handler().as_ref(),
+            Arc::new(kernel_input),
+            &[
+                (TRACKING_SEQUENCE_NUMBER_FIELD, 777),
+                (TRACKING_FILE_SEQUENCE_NUMBER_FIELD, 888),
+            ],
+        )?;
+
+        // 3 rows: row 0 nulls, row 1 non-null (42, 99), row 2 nulls.
+        let seq = Int64Array::from(vec![None as Option<i64>, Some(42), None as Option<i64>]);
+        let file_seq = Int64Array::from(vec![None as Option<i64>, Some(99), None as Option<i64>]);
+        let status = Int32Array::from(vec![1_i32, 1, 1]);
+
+        let tracking_struct = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("status", ArrowDataType::Int32, false)),
+                Arc::new(status) as Arc<dyn crate::arrow::array::Array>,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    TRACKING_SEQUENCE_NUMBER_FIELD,
+                    ArrowDataType::Int64,
+                    true,
+                )),
+                Arc::new(seq) as Arc<dyn crate::arrow::array::Array>,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    TRACKING_FILE_SEQUENCE_NUMBER_FIELD,
+                    ArrowDataType::Int64,
+                    true,
+                )),
+                Arc::new(file_seq) as Arc<dyn crate::arrow::array::Array>,
+            ),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            TRACKING,
+            tracking_struct.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(tracking_struct) as Arc<dyn crate::arrow::array::Array>],
+        )
+        .unwrap();
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let out = evaluator.evaluate(engine_data.as_ref())?;
+
+        #[derive(Default)]
+        struct PairReader {
+            values: Vec<(i64, i64)>,
+        }
+        impl RowVisitor for PairReader {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NT: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
+                    (
+                        vec![
+                            ColumnName::new([TRACKING, TRACKING_SEQUENCE_NUMBER_FIELD]),
+                            ColumnName::new([TRACKING, TRACKING_FILE_SEQUENCE_NUMBER_FIELD]),
+                        ],
+                        vec![DataType::LONG, DataType::LONG],
+                    )
+                });
+                (NT.0.as_slice(), NT.1.as_slice())
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn crate::engine_data::GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let s: i64 = getters[0].get(i, "tracking.sequenceNumber")?;
+                    let f: i64 = getters[1].get(i, "tracking.fileSequenceNumber")?;
+                    self.values.push((s, f));
+                }
+                Ok(())
+            }
+        }
+        let mut reader = PairReader::default();
+        reader.visit_rows_of(out.as_ref())?;
+        assert_eq!(reader.values, vec![(777, 888), (42, 99), (777, 888)]);
+        Ok(())
+    }
+
+    #[test]
     fn test_roundtrip_with_optional_fields_null() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create entry with many optional fields set to None
+        // Create entry with optional fields set to None and explicit sequence numbers.
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/file.parquet")
             .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: None,
-                sequence_number: None,
-                file_sequence_number: None,
+                sequence_number: Some(5),
+                file_sequence_number: Some(5),
                 first_row_id: None,
                 changes_dv: None,
             })
@@ -3919,12 +4218,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_metadata_entry_eq(&expected_entry, &entries[0]);
 
-        // Specifically verify the None values (except first_row_id which gets assigned)
+        // Specifically verify the remaining None values.
         let actual = &entries[0];
         let ti = &actual.tracking;
         assert!(ti.snapshot_id.is_none());
-        assert!(ti.sequence_number.is_none());
-        assert!(ti.file_sequence_number.is_none());
+        assert_eq!(ti.sequence_number, Some(5));
+        assert_eq!(ti.file_sequence_number, Some(5));
         assert_eq!(ti.first_row_id, Some(0));
         assert!(ti.changes_dv.is_none());
         assert!(actual
