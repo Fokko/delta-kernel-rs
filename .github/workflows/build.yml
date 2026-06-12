@@ -346,7 +346,7 @@ jobs:
       - name: Generate code coverage
         run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs --skip handle::tests::invalid_handle_code
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           files: codecov.json
           fail_ci_if_error: true
