@@ -10,11 +10,9 @@ use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorSt
 use crate::actions::Add;
 use crate::actions::ADD_NAME;
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
-use crate::content_tree::stats::{self, aggregate_content_stats};
 #[cfg(test)]
-use crate::content_tree::stats::{
-    delta_json_stats_to_content_stats, merge_partition_values_into_stats,
-};
+use crate::content_tree::stats::delta_json_stats_to_content_stats;
+use crate::content_tree::stats::{self, aggregate_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 #[cfg(test)]
 use crate::content_tree::ManifestInfo;
@@ -23,7 +21,7 @@ use crate::content_tree::{
     DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
     CONTENT_TYPE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, DV_INFO, FILE_FORMAT, FILE_SIZE_IN_BYTES,
-    LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID, TRACKING,
+    LOCATION, PARTITION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID, TRACKING,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
@@ -32,8 +30,8 @@ use crate::row_tracking::CursorRowIdAllocator;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{DEFAULT_ROW_COMMIT_VERSION_NAME, STATS_PARSED_NAME};
 use crate::schema::{
-    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, MapType, Schema, SchemaRef,
-    StructField, StructType,
+    column_name, ArrayType, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MapType,
+    MetadataValue, Schema, SchemaRef, StructField, StructType,
 };
 use crate::utils::require;
 #[cfg(test)]
@@ -73,6 +71,45 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
             ))
         },
     )
+}
+
+/// Builds the partition struct type for the AMT partition field from a table's partition columns
+/// and logical schema. Field names are logical column names (matching Delta's `partitionValues`
+/// map keys), and each field carries its `PARQUET:field_id` metadata from the source column.
+/// This follows the Iceberg convention where partition struct field IDs correspond to partition
+/// spec field IDs (in Delta's case, the source column's field ID since all transforms are
+/// identity). All fields are nullable since `MapToStruct` map lookups can return null. Returns
+/// `None` if `partition_columns` is empty.
+///
+/// The returned type is self-contained and requires no further schema fixup. Column mapping
+/// metadata (physicalName, id) is intentionally not propagated because the partition struct is
+/// written by kernel and always uses logical names directly as Parquet field names.
+pub(crate) fn build_partition_type(
+    partition_columns: &[String],
+    logical_schema: &StructType,
+) -> Option<StructType> {
+    if partition_columns.is_empty() {
+        return None;
+    }
+    let fields: Vec<StructField> = partition_columns
+        .iter()
+        .filter_map(|col_name| {
+            let field = logical_schema.field(col_name)?;
+            let mut partition_field = StructField::nullable(col_name, field.data_type().clone());
+            if let Some(MetadataValue::Number(id)) = field
+                .metadata
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref())
+            {
+                partition_field = partition_field
+                    .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), *id)]);
+            }
+            Some(partition_field)
+        })
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(StructType::new_unchecked(fields))
 }
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -211,6 +248,11 @@ pub(crate) struct ContentTreeNodeBuilder {
     /// This schema must match the schema used to write the files and must include
     /// PARQUET:field_id metadata on fields for proper stats mapping.
     table_schema: Schema,
+    /// Partition type for the partition tuple field in the AMT. Built from the table's partition
+    /// columns and their data types. `None` for unpartitioned tables. Field names are logical
+    /// column names (matching the keys in Delta's `partitionValues` map). Fields carry
+    /// `PARQUET:field_id` metadata from the source column for Iceberg compatibility.
+    partition_type: Option<StructType>,
     /// Set of seen file paths to prevent duplicate entries.
     /// Only populated when processing existing actions, not new actions.
     values_seen: HashSet<String>,
@@ -273,12 +315,22 @@ impl ContentTreeNodeBuilder {
             pending_entries: Vec::new(),
             version,
             table_schema,
+            partition_type: None,
             values_seen: HashSet::new(),
             cached_schema: OnceLock::new(),
             dv_cache: HashMap::new(),
             pre_built_data: Vec::new(),
             pre_built_aggregates: Vec::new(),
         }
+    }
+
+    /// Sets the partition struct type for the AMT partition field. Built from the table's
+    /// partition columns and their data types. Field names must be logical column names
+    /// (matching the keys in Delta's `partitionValues` map). Fields should carry
+    /// `PARQUET:field_id` metadata matching the source column's field ID.
+    pub(crate) fn with_partition_type(mut self, partition_type: Option<StructType>) -> Self {
+        self.partition_type = partition_type;
+        self
     }
 
     /// Creates a [`ContentTreeNodeBuilder`] by reading an existing content root parquet file.
@@ -293,6 +345,8 @@ impl ContentTreeNodeBuilder {
     /// * `table_root` - The root URL of the table
     /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion
     /// * `new_version` - The version number for the new metadata being built
+    /// * `partition_type` - Optional partition struct type for including partition columns in the
+    ///   schema
     #[instrument(
         name = "content_tree.read_root_for_txn",
         skip_all,
@@ -305,6 +359,7 @@ impl ContentTreeNodeBuilder {
         table_root: Url,
         table_schema: Schema,
         new_version: Version,
+        partition_type: Option<StructType>,
     ) -> DeltaResult<Self> {
         let content_root_url = table_root
             .join(&content_root.path)
@@ -328,7 +383,8 @@ impl ContentTreeNodeBuilder {
         )?;
 
         let entries = node.entries()?;
-        let mut builder = Self::new_for(table_root, new_version, table_schema);
+        let mut builder = Self::new_for(table_root, new_version, table_schema)
+            .with_partition_type(partition_type);
         for entry in entries {
             // Preserve Added only for entries whose sequence_number matches new_version (no-op
             // rebuild); everything else predates this commit and becomes Existing.
@@ -435,10 +491,12 @@ impl ContentTreeNodeBuilder {
             return Ok(schema.clone());
         }
 
-        // Compute the schema (include all columns for writing)
         let delta_stats = build_delta_stats_schema(&self.table_schema);
-        let schema =
-            ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema, &delta_stats)?;
+        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &self.table_schema,
+            &delta_stats,
+            self.partition_type.as_ref(),
+        )?;
         let schema_ref = Arc::new(schema);
 
         // Try to cache it (ignore if another thread beat us to it)
@@ -506,22 +564,20 @@ impl ContentTreeNodeBuilder {
             &self.table_schema,
             add.deletion_vector.is_some().then_some(false),
         )?;
-        let content_stats = merge_partition_values_into_stats(
-            content_stats,
-            &add.partition_values,
-            &self.table_schema,
-            Some(record_count),
-        )?;
 
-        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+        let partition = self.build_partition_data(&add.partition_values)?;
+
+        let mut builder = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(add.path)
             .with_tracking(status, version, snapshot_id)
             .deletion_vector_opt(dv_content)
             .record_count(record_count)
             .file_size_in_bytes(add.size)
-            .content_stats_opt(content_stats)
-            .build();
-        self.pending_entries.push(entry);
+            .content_stats_opt(content_stats);
+        if let Some(partition) = partition {
+            builder = builder.partition(partition);
+        }
+        self.pending_entries.push(builder.build());
         Ok(())
     }
 
@@ -530,6 +586,41 @@ impl ContentTreeNodeBuilder {
     #[cfg(test)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_status(add, version, snapshot_id, TrackingStatus::Added)
+    }
+
+    /// Builds a [`StructData`] from the `partitionValues` map of an [`Add`] action, using the
+    /// builder's `partition_type` to determine field names and types. Returns `None` if the
+    /// table is unpartitioned.
+    #[cfg(test)]
+    fn build_partition_data(
+        &self,
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<Option<crate::expressions::StructData>> {
+        let partition_type = match &self.partition_type {
+            Some(pt) if pt.fields().len() > 0 => pt,
+            _ => return Ok(None),
+        };
+        let mut fields = Vec::new();
+        let mut values = Vec::new();
+        for field in partition_type.fields() {
+            fields.push(field.clone());
+            let scalar = match partition_values.get(field.name()) {
+                Some(raw_val) => match field.data_type() {
+                    DataType::Primitive(p) => p.parse_scalar(raw_val)?,
+                    other => {
+                        return Err(Error::generic(format!(
+                            "partition field '{}' has non-primitive type {other:?}",
+                            field.name()
+                        )))
+                    }
+                },
+                None => Scalar::Null(field.data_type().clone()),
+            };
+            values.push(scalar);
+        }
+        Ok(Some(crate::expressions::StructData::try_new(
+            fields, values,
+        )?))
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
@@ -542,11 +633,6 @@ impl ContentTreeNodeBuilder {
     /// the full stats are passed through and record counts are extracted. When stats
     /// are not in AMT format (e.g., empty or unconverted), content_stats is set to null
     /// and record_count defaults to 0.
-    ///
-    /// TODO: Partition values from the `partitionValues` column are not yet merged into
-    /// `content_stats` in this columnar path. The row-by-row `add()` path handles this via
-    /// `merge_partition_values_into_stats`. Supporting this here requires building expressions
-    /// that parse partition map entries into typed AMT stats structs.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for expression evaluation
@@ -652,6 +738,11 @@ impl ContentTreeNodeBuilder {
             None => (Expression::literal(Scalar::Long(0)), None),
         };
 
+        let partition = self
+            .partition_type
+            .as_ref()
+            .map(|_| Expression::map_to_struct(Expression::column(["partitionValues"])));
+
         let projections = ContentTreeEntryProjections {
             status: TrackingStatus::Added,
             snapshot_id,
@@ -661,6 +752,7 @@ impl ContentTreeNodeBuilder {
             dv_info: None,
             record_count,
             content_stats,
+            partition,
         };
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -1199,6 +1291,9 @@ impl ContentTreeNodeBuilder {
         // Detect whether flat decoded DV columns are present in the input schema.
         let has_decoded_dv = scan_row_input_schema.field(DV_LOCATION).is_some();
 
+        // TODO: Thread partitionValues through the scan-row projection pipeline so partition
+        // data can be populated from existing scan rows. Currently the step2_input_schema
+        // only projects {path, size, stats, stats_parsed} and partitionValues is dropped.
         let projections = ContentTreeEntryProjections {
             status: TrackingStatus::Existing,
             snapshot_id,
@@ -1216,6 +1311,7 @@ impl ContentTreeNodeBuilder {
                 &self.table_schema,
                 &stats_struct,
             )?),
+            partition: None,
         };
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -1558,8 +1654,8 @@ impl RowVisitor for RecordCountVisitor {
 /// Projects only the fields used by [`LogBatchDedupVisitor`], [`DecodedDvVisitor`], and
 /// the `action_evaluator` in [`ContentRootRebuildProcessor`]:
 ///
-/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `deletionVector` (all 5 DV
-///   sub-fields for z85 decode)
+/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `partitionValues`, `deletionVector`
+///   (all 5 DV sub-fields for z85 decode)
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
 ///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
@@ -1582,6 +1678,10 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
                 StructField::nullable("size", DataType::LONG),
                 StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                 StructField::nullable("stats", DataType::STRING),
+                StructField::nullable(
+                    "partitionValues",
+                    MapType::new(DataType::STRING, DataType::STRING, true),
+                ),
                 StructField::nullable("deletionVector", add_dv),
             ]))),
         ),
@@ -1734,12 +1834,16 @@ static LOG_BATCH_EVALUATOR_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
             StructField::nullable("size", DataType::LONG),
             StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
             StructField::nullable("stats", DataType::STRING),
+            StructField::nullable(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
         ]))),
     )]))
 });
 
-/// `add.{path, size, defaultRowCommitVersion}`, threaded from the log-batch evaluator into
-/// the action-to-entry evaluator.
+/// `add.{path, size, defaultRowCommitVersion, partitionValues}`, threaded from the log-batch
+/// evaluator into the action-to-entry evaluator.
 fn log_add_projection_field() -> StructField {
     StructField::nullable(
         ADD_NAME,
@@ -1747,6 +1851,10 @@ fn log_add_projection_field() -> StructField {
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+            StructField::nullable(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
         ]))),
     )
 }
@@ -1777,6 +1885,9 @@ struct ContentTreeEntryProjections {
     record_count: Expression,
     /// `None` emits a null of the field's type.
     content_stats: Option<Expression>,
+    /// Expression to extract partition values into a typed struct. Typically a `MapToStruct`
+    /// expression over the `partitionValues` map column. `None` emits a null of the field's type.
+    partition: Option<Expression>,
 }
 
 /// Builds the row-to-`ContentTreeNodeEntry` projection expression shared by the blind-append
@@ -1808,6 +1919,10 @@ fn build_content_tree_entry_expression(
                     None => Expression::null_literal(field.data_type().clone()),
                 },
                 PARTITION_SPEC_ID => Expression::literal(Scalar::Integer(0)),
+                PARTITION => match &projections.partition {
+                    Some(expr) => expr.clone(),
+                    None => Expression::null_literal(field.data_type().clone()),
+                },
                 SORT_ORDER_ID => Expression::null_literal(DataType::INTEGER),
                 RECORD_COUNT => projections.record_count.clone(),
                 CONTENT_STATS_FIELD_NAME => match &projections.content_stats {
@@ -1843,6 +1958,7 @@ fn build_log_batch_evaluator(
             Expression::column([ADD_NAME, "path"]),
             Expression::column([ADD_NAME, "size"]),
             Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+            Expression::column([ADD_NAME, "partitionValues"]),
         ]),
         Expression::parse_json(
             Expression::column([ADD_NAME, "stats"]),
@@ -1888,6 +2004,10 @@ fn build_action_to_content_tree_entry_evaluator(
             .collect::<Vec<_>>(),
     ));
 
+    let partition = output_schema
+        .field(PARTITION)
+        .map(|_| Expression::map_to_struct(Expression::column([ADD_NAME, "partitionValues"])));
+
     let projections = ContentTreeEntryProjections {
         status: TrackingStatus::Existing,
         snapshot_id,
@@ -1910,6 +2030,7 @@ fn build_action_to_content_tree_entry_evaluator(
             table_schema,
             &amt_content_stats_schema,
         )?),
+        partition,
     };
 
     engine.evaluation_handler().new_expression_evaluator(
@@ -2230,16 +2351,19 @@ impl ContentRootRebuildProcessor {
     /// - `snapshot_id`: Stamped into tracking info for each emitted log-batch entry.
     /// - `table_schema`: Physical table schema. Used to derive the content_stats output schema.
     ///   Only read during construction; not retained.
+    /// - `partition_type`: The partition struct type, or `None` for unpartitioned tables.
     pub(crate) fn new(
         engine: &dyn Engine,
         snapshot_id: i64,
         commit_version: i64,
         table_schema: &Schema,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Self> {
         let delta_stats_schema = Arc::new(build_delta_stats_schema(table_schema));
         let output_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             table_schema,
             &delta_stats_schema,
+            partition_type,
         )?);
 
         let log_batch_evaluator = build_log_batch_evaluator(engine, &delta_stats_schema)?;
@@ -2380,7 +2504,6 @@ mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     use crate::content_tree::{absolute_to_relative_path, parse_or_join_url, ContentTreeNode};
-    use crate::expressions::StructData;
 
     /// Helper: builds a root manifest, writes it to disk, and reads it back.
     fn build_and_read_root(
@@ -2737,10 +2860,9 @@ mod tests {
     }
 
     #[test]
-    fn test_add_merges_partition_values_into_content_stats(
+    fn test_add_stores_partition_values_in_partition_tuple(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::Add;
-        use crate::content_tree::stats::stats_schema;
         use crate::expressions::Scalar;
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
 
@@ -2789,9 +2911,13 @@ mod tests {
             ]),
         ]);
 
+        let partition_columns = vec!["category".to_string(), "year".to_string()];
+        let partition_type = build_partition_type(&partition_columns, &table_schema);
+
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+        builder = builder.with_partition_type(partition_type);
 
         let add = Add {
             path: "category=A/year=2024/part-00000.parquet".to_string(),
@@ -2818,93 +2944,199 @@ mod tests {
         builder.add(add, 1, 1)?;
 
         assert_eq!(builder.pending_entries.len(), 1);
-        let content_stats = builder.pending_entries[0]
+        let entry = &builder.pending_entries[0];
+
+        // content_stats covers all table columns (data + partition) from the stats schema,
+        // but partition column entries have null stats -- actual partition values live in the
+        // dedicated partition tuple.
+        let content_stats = entry
             .content_stats
             .as_ref()
             .expect("should have content_stats");
-
-        // All three columns (data + 2 partition) should be in content_stats
         assert_eq!(
             content_stats.fields().len(),
             3,
-            "should have stats for id, category, year"
+            "stats schema covers all table columns"
         );
+        // Partition columns should NOT have real partition values merged in -- their
+        // lower_bound/upper_bound should be null since the stats JSON has no min/max for
+        // partition columns. (Actual partition values live in the partition tuple.)
+        for col in ["category", "year"] {
+            let idx = content_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == col)
+                .unwrap_or_else(|| panic!("content_stats should have {col} field"));
+            let Scalar::Struct(ref inner) = content_stats.values()[idx] else {
+                panic!("{col} stats should be a struct");
+            };
+            let lb = inner
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .map(|i| &inner.values()[i]);
+            let ub = inner
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .map(|i| &inner.values()[i]);
+            assert!(
+                lb.is_none_or(|v| v.is_null()),
+                "{col} lower_bound should be null"
+            );
+            assert!(
+                ub.is_none_or(|v| v.is_null()),
+                "{col} upper_bound should be null"
+            );
+        }
 
-        // Build expected partition stats using the same schema infrastructure.
-        // category (string, nullable): field_id=2 -> stats base 10400
-        // year (integer, non-nullable): field_id=3 -> stats base 10600
-        let full_stats_schema = stats_schema(&table_schema)?;
+        // Partition values should be in the dedicated partition tuple
+        let partition = entry
+            .partition
+            .as_ref()
+            .expect("should have partition tuple");
+        assert_eq!(partition.fields().len(), 2, "should have category and year");
 
-        let category_stats_field = full_stats_schema
-            .field("category")
-            .expect("stats schema should have category");
-        let DataType::Struct(category_inner) = category_stats_field.data_type() else {
-            panic!("category stats should be a struct");
-        };
-        let expected_category = StructData::try_new(
-            category_inner.fields().cloned().collect(),
-            vec![
-                Scalar::String("A".to_string()), // lower_bound
-                Scalar::String("A".to_string()), // upper_bound
-                Scalar::Boolean(true),           // tight_bounds
-                Scalar::Long(100),               // value_count
-                Scalar::Long(0),                 // null_value_count (not null)
-                Scalar::Null(DataType::INTEGER), // avg_value_size_in_bytes
-            ],
-        )?;
-
-        let year_stats_field = full_stats_schema
-            .field("year")
-            .expect("stats schema should have year");
-        let DataType::Struct(year_inner) = year_stats_field.data_type() else {
-            panic!("year stats should be a struct");
-        };
-        let expected_year = StructData::try_new(
-            year_inner.fields().cloned().collect(),
-            vec![
-                Scalar::Integer(2024), // lower_bound
-                Scalar::Integer(2024), // upper_bound
-                Scalar::Boolean(true), // tight_bounds
-                Scalar::Long(100),     // value_count
-            ],
-        )?;
-
-        // Compare partition column stats by StructData equality
-        let category_value = content_stats
+        let cat_idx = partition
             .fields()
             .iter()
             .position(|f| f.name() == "category")
-            .map(|idx| &content_stats.values()[idx]);
-        assert_eq!(
-            category_value,
-            Some(&Scalar::Struct(expected_category)),
-            "category partition stats mismatch"
-        );
+            .expect("partition should have category");
+        assert_eq!(partition.values()[cat_idx], Scalar::String("A".to_string()));
 
-        let year_value = content_stats
+        let year_idx = partition
             .fields()
             .iter()
             .position(|f| f.name() == "year")
-            .map(|idx| &content_stats.values()[idx]);
+            .expect("partition should have year");
+        assert_eq!(partition.values()[year_idx], Scalar::Integer(2024));
+
+        // Partition fields should carry PARQUET:field_id metadata
         assert_eq!(
-            year_value,
-            Some(&Scalar::Struct(expected_year)),
-            "year partition stats mismatch"
+            partition.fields()[cat_idx]
+                .metadata
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            Some(&MetadataValue::Number(2)),
+        );
+        assert_eq!(
+            partition.fields()[year_idx]
+                .metadata
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            Some(&MetadataValue::Number(3)),
         );
 
-        // Verify outer field metadata: stats schema fields carry correct PARQUET:field_id
-        let category_field = content_stats
-            .fields()
-            .iter()
-            .find(|f| f.name() == "category")
-            .unwrap();
-        let year_field = content_stats
-            .fields()
-            .iter()
-            .find(|f| f.name() == "year")
-            .unwrap();
-        assert_eq!(category_field, category_stats_field);
-        assert_eq!(year_field, year_stats_field);
+        Ok(())
+    }
+
+    /// Round-trips Delta `partitionValues` through the AMT partition tuple: parse string values
+    /// into typed scalars via `build_partition_data`, then serialize back via
+    /// `serialize_partition_value` and assert the original map is recovered.
+    #[test]
+    fn test_partition_values_round_trip_through_partition_tuple(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::partition::serialization::serialize_partition_value;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
+
+        let table_schema = crate::schema::StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new("region", DataType::STRING, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+            StructField::new("year", DataType::INTEGER, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(3),
+            )]),
+            StructField::new("score", DataType::DOUBLE, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(4),
+            )]),
+        ]);
+
+        let partition_columns = vec![
+            "region".to_string(),
+            "year".to_string(),
+            "score".to_string(),
+        ];
+        let partition_type = build_partition_type(&partition_columns, &table_schema);
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+        builder = builder.with_partition_type(partition_type);
+
+        let original_partition_values = HashMap::from([
+            ("region".to_string(), "us-west-2".to_string()),
+            ("year".to_string(), "2024".to_string()),
+            ("score".to_string(), "3.14".to_string()),
+        ]);
+
+        let partition = builder
+            .build_partition_data(&original_partition_values)?
+            .expect("partitioned table should produce a partition tuple");
+
+        // Reconstruct partitionValues from the typed partition tuple
+        let mut reconstructed: HashMap<String, String> = HashMap::new();
+        for (field, value) in partition.fields().iter().zip(partition.values()) {
+            if let Some(s) = serialize_partition_value(value)? {
+                reconstructed.insert(field.name().to_string(), s);
+            }
+        }
+
+        assert_eq!(reconstructed, original_partition_values);
+
+        Ok(())
+    }
+
+    /// Round-trip with a null partition value: null partition columns produce `Scalar::Null`
+    /// in the partition tuple, and `serialize_partition_value` returns `None` for nulls (matching
+    /// Delta's convention of omitting null partition values from the map).
+    #[test]
+    fn test_partition_values_round_trip_with_null_value() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::partition::serialization::serialize_partition_value;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
+
+        let table_schema = crate::schema::StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new("region", DataType::STRING, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+        ]);
+
+        let partition_columns = vec!["region".to_string()];
+        let partition_type = build_partition_type(&partition_columns, &table_schema);
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+        builder = builder.with_partition_type(partition_type);
+
+        // Empty map -> partition column is null (key absent from partitionValues)
+        let original_partition_values = HashMap::new();
+        let partition = builder
+            .build_partition_data(&original_partition_values)?
+            .expect("partitioned table should produce a partition tuple");
+
+        assert_eq!(partition.fields().len(), 1);
+        assert!(partition.values()[0].is_null());
+
+        // Serialize back: null should produce None, so the reconstructed map is empty
+        let mut reconstructed: HashMap<String, String> = HashMap::new();
+        for (field, value) in partition.fields().iter().zip(partition.values()) {
+            if let Some(s) = serialize_partition_value(value)? {
+                reconstructed.insert(field.name().to_string(), s);
+            }
+        }
+
+        assert_eq!(reconstructed, original_partition_values);
 
         Ok(())
     }

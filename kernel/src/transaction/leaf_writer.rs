@@ -9,7 +9,7 @@ use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
 use crate::row_tracking::CursorRowIdAllocator;
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version};
 
 /// Output from finishing a leaf writer.
@@ -227,13 +227,16 @@ impl LeafNodeWriter {
     /// * `version` - The version this leaf is being written for
     /// * `snapshot_id` - The snapshot ID for tracking info
     /// * `table_schema` - The table's data schema with PARQUET:field_id metadata
+    /// * `partition_type` - The partition struct type, or `None` for unpartitioned tables
     /// * `track_root_removals` - Whether to track root entries for removal
     /// * `root_manifest_url` - Optional URL of the root manifest for validation
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table_root: Url,
         version: Version,
         snapshot_id: i64,
         table_schema: SchemaRef,
+        partition_type: Option<StructType>,
         track_root_removals: bool,
         root_manifest_path: Option<String>,
         starting_first_row_id: i64,
@@ -243,7 +246,8 @@ impl LeafNodeWriter {
                 table_root.clone(),
                 version,
                 table_schema.as_ref().clone(),
-            ),
+            )
+            .with_partition_type(partition_type),
             version,
             table_schema: table_schema.clone(),
             manifest_dvs: HashMap::new(),
@@ -831,6 +835,7 @@ mod tests {
             crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
                 schema,
                 &delta_stats,
+                None,
             )?,
         );
         let mut found = false;
@@ -950,6 +955,7 @@ mod tests {
             version,
             snapshot_id,
             schema.clone(),
+            None,
             true,
             None,
             0,
@@ -1029,6 +1035,7 @@ mod tests {
             crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
                 &schema,
                 &delta_stats,
+                None,
             )?,
         );
 
@@ -1209,6 +1216,7 @@ mod tests {
             version,
             snapshot_id,
             schema,
+            None,
             true,
             None,
             0,
@@ -1250,6 +1258,7 @@ mod tests {
             version,
             snapshot_id,
             schema,
+            None,
             true,
             None,
             0,
@@ -1286,6 +1295,7 @@ mod tests {
             version,
             snapshot_id,
             schema,
+            None,
             true,
             None,
             0,
@@ -1415,6 +1425,7 @@ mod tests {
             version,
             snapshot_id,
             schema.clone(),
+            None,
             true,
             None,
             0,
@@ -1465,6 +1476,7 @@ mod tests {
             version,
             snapshot_id,
             schema.clone(),
+            None,
             true,
             None,
             0,

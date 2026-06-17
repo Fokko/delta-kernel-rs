@@ -6,7 +6,7 @@ use url::Url;
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 use crate::content_tree::builder::{
-    log_replay_schema, ContentRootRebuildProcessor, ContentTreeNodeBuilder,
+    build_partition_type, log_replay_schema, ContentRootRebuildProcessor, ContentTreeNodeBuilder,
 };
 use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
@@ -14,7 +14,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::{HasSelectionVector, LogReplayProcessor};
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
-use crate::schema::Schema;
+use crate::schema::{Schema, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, FileMeta, FilteredEngineData, Version};
@@ -180,6 +180,13 @@ impl ManifestCommitState {
         }
     }
 
+    /// Builds the partition struct type for the AMT partition field from the snapshot's partition
+    /// columns and logical schema. Returns `None` for unpartitioned tables.
+    fn partition_type(&self) -> Option<StructType> {
+        let tc = self.read_snapshot.table_configuration();
+        build_partition_type(tc.partition_columns(), &tc.logical_schema())
+    }
+
     /// Returns a [`Scan`] that replays actions from both the root manifest (if present) and the
     /// delta log.
     ///
@@ -282,6 +289,7 @@ impl ManifestCommitState {
             self.version_to_write,
             self.snapshot_id,
             physical_schema,
+            self.partition_type(),
             track_root_removals,
             root_manifest_path,
             starting_first_row_id,
@@ -384,6 +392,7 @@ impl ManifestCommitState {
             .make_physical(column_mapping_mode)?;
         let table_root = self.read_snapshot.table_root().clone();
         let current_version = self.read_snapshot.version();
+        let partition_type = self.partition_type();
 
         // If a content root exists and is current, load it directly and return — no replay needed.
         // Otherwise fall through: either no checkpoint (replay from v0) or log commits exist
@@ -396,6 +405,7 @@ impl ManifestCommitState {
                     table_root,
                     physical_schema,
                     self.version_to_write,
+                    partition_type,
                 )?
             }
             _ if self.root_released => {
@@ -404,12 +414,14 @@ impl ManifestCommitState {
                 // discarding the returned batches, and then applying
                 // `processor.deleted_leaf_positions_by_location()` to `builder`.
                 ContentTreeNodeBuilder::new_for(table_root, self.version_to_write, physical_schema)
+                    .with_partition_type(partition_type)
             }
             Some(checkpoint_action) => {
                 return self.replay_actions_and_apply_to_builder(
                     engine,
                     table_root,
                     physical_schema,
+                    partition_type,
                     checkpoint_action.version + 1,
                     Some(checkpoint_action.content_root.path.as_str()),
                 )
@@ -419,6 +431,7 @@ impl ManifestCommitState {
                     engine,
                     table_root,
                     physical_schema,
+                    partition_type,
                     0,
                     None,
                 )
@@ -438,6 +451,7 @@ impl ManifestCommitState {
         engine: &dyn Engine,
         table_root: Url,
         physical_schema: Schema,
+        partition_type: Option<StructType>,
         log_start_version: Version,
         root_path: Option<&str>,
     ) -> DeltaResult<ContentTreeNodeBuilder> {
@@ -446,12 +460,14 @@ impl ManifestCommitState {
             self.snapshot_id,
             self.version_to_write as i64,
             &physical_schema,
+            partition_type.as_ref(),
         )?;
         let mut builder = ContentTreeNodeBuilder::new_for(
             table_root.clone(),
             self.version_to_write,
             physical_schema,
-        );
+        )
+        .with_partition_type(partition_type);
         let log_segment = self.read_snapshot.log_segment();
         for data in replay_log_commits(engine, &mut processor, log_segment, log_start_version)? {
             builder.add_pre_built_log_batch(data)?;

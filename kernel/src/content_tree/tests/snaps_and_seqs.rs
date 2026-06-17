@@ -6,18 +6,22 @@
 //! then read back into a fresh builder via `from_content_root`, mirroring the
 //! production round-trip.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use url::Url;
 
 use crate::actions::{Add, CheckpointAction, ContentRoot, Metadata, Protocol};
-use crate::content_tree::builder::ContentTreeNodeBuilder;
+use crate::content_tree::builder::{build_partition_type, ContentTreeNodeBuilder};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
     TrackingStatus,
 };
+use crate::engine_data::{GetData, RowVisitor, TypedGetData};
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, Schema, StructField};
-use crate::{DeltaResult, Version};
+use crate::{DeltaResult, Engine, Version};
 
 /// Minimal table schema with the required PARQUET:field_id metadata.
 fn test_table_schema() -> Schema {
@@ -163,6 +167,7 @@ fn test_two_commits_to_root_tracking() -> Result<(), Box<dyn std::error::Error>>
         table_root,
         test_table_schema(),
         2,
+        None,
     )?;
     builder.add(make_add("file_b.parquet", 2048), 2, 2)?;
 
@@ -221,6 +226,7 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
         table_root.clone(),
         test_table_schema(),
         2,
+        None,
     )?;
     builder.add(make_add("file_b.parquet", 2048), 2, 2)?;
     let v2_path = write_root_manifest(&mut builder, &engine, &table_root, 2)?;
@@ -232,6 +238,7 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
         table_root,
         test_table_schema(),
         3,
+        None,
     )?;
 
     // Write as a leaf manifest and verify the DataManifest entry
@@ -310,6 +317,7 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
         table_root.clone(),
         test_table_schema(),
         2,
+        None,
     )?;
     builder.add(make_add("file_b.parquet", 2048), 2, 2)?;
     let v2_path = write_root_manifest(&mut builder, &engine, &table_root, 2)?;
@@ -321,6 +329,7 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
         table_root,
         test_table_schema(),
         3,
+        None,
     )?;
     builder.mark_deleted(Some("file_a.parquet"), None, 3)?;
 
@@ -347,6 +356,376 @@ fn test_two_commits_delete_first_tracking() -> Result<(), Box<dyn std::error::Er
 
     // snapshot_ids differ between entries
     assert_ne!(a_tracking.snapshot_id, b_tracking.snapshot_id);
+
+    Ok(())
+}
+
+/// Table schema with `id` and a `year` partition column.
+fn partitioned_table_schema() -> Schema {
+    Schema::new_unchecked([
+        StructField::new("id", DataType::INTEGER, false).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-id".to_string()),
+            ),
+        ]),
+        StructField::new("year", DataType::INTEGER, false).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-year".to_string()),
+            ),
+        ]),
+    ])
+}
+
+/// Table schema with `id`, `year`, and `month` partition columns for multi-column tests.
+fn multi_partitioned_table_schema() -> Schema {
+    Schema::new_unchecked([
+        StructField::new("id", DataType::INTEGER, false).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-id".to_string()),
+            ),
+        ]),
+        StructField::new("year", DataType::INTEGER, false).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-year".to_string()),
+            ),
+        ]),
+        StructField::new("month", DataType::INTEGER, false).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(3),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(3),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-month".to_string()),
+            ),
+        ]),
+    ])
+}
+
+/// Write a leaf manifest with multiple partition values (year=2024, year=2025), read it back,
+/// and verify the `partition.year` values round-trip through parquet.
+#[test]
+fn test_leaf_write_round_trips_partition_field_multiple_values(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = crate::engine::sync::SyncEngine::new();
+    let temp_dir = tempfile::tempdir()?;
+    let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("_delta_log"))?;
+
+    let table_schema = partitioned_table_schema();
+    let partition_columns = vec!["year".to_string()];
+    let partition_type =
+        build_partition_type(&partition_columns, &table_schema).expect("non-empty partition type");
+
+    // Verify that build_partition_type propagates field IDs from the source column
+    let year_field = partition_type
+        .field("year")
+        .expect("year field should exist");
+    assert_eq!(
+        year_field
+            .metadata
+            .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+        Some(&MetadataValue::Number(2)),
+    );
+
+    let mut builder = ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone())
+        .with_partition_type(Some(partition_type.clone()));
+
+    let mut pv_2024 = HashMap::new();
+    pv_2024.insert("year".to_string(), "2024".to_string());
+    builder.add(
+        Add {
+            path: "year=2024/part-00000.parquet".to_string(),
+            partition_values: pv_2024,
+            size: 1024,
+            modification_time: 0,
+            data_change: true,
+            stats: Some(r#"{"numRecords":10}"#.to_string()),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+        },
+        1,
+        1,
+    )?;
+
+    let mut pv_2025 = HashMap::new();
+    pv_2025.insert("year".to_string(), "2025".to_string());
+    builder.add(
+        Add {
+            path: "year=2025/part-00001.parquet".to_string(),
+            partition_values: pv_2025,
+            size: 2048,
+            modification_time: 0,
+            data_change: true,
+            stats: Some(r#"{"numRecords":20}"#.to_string()),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+        },
+        1,
+        1,
+    )?;
+
+    let leaf_entry = builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
+
+    // Read the leaf manifest back with a schema that includes the partition field
+    let delta_stats = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
+    let read_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+        &table_schema,
+        &delta_stats,
+        Some(&partition_type),
+    )?);
+
+    let leaf_relative = leaf_entry
+        .location
+        .as_ref()
+        .expect("leaf manifest should have a location");
+    let leaf_url = table_root
+        .join(leaf_relative.trim_start_matches('/'))
+        .unwrap();
+
+    let batches: Vec<_> = engine
+        .parquet_handler()
+        .read_parquet_files(
+            &[crate::FileMeta {
+                location: leaf_url,
+                last_modified: 0,
+                size: 0,
+            }],
+            read_schema,
+            None,
+        )?
+        .collect::<DeltaResult<Vec<_>>>()?;
+    assert!(!batches.is_empty());
+
+    struct PartitionYearVisitor {
+        values: Vec<i32>,
+    }
+    impl RowVisitor for PartitionYearVisitor {
+        fn selected_column_names_and_types(
+            &self,
+        ) -> (&'static [crate::schema::ColumnName], &'static [DataType]) {
+            use std::sync::LazyLock;
+            static NAMES_AND_TYPES: LazyLock<crate::schema::ColumnNamesAndTypes> =
+                LazyLock::new(|| {
+                    (
+                        vec![crate::schema::ColumnName::new(["partition", "year"])],
+                        vec![DataType::INTEGER],
+                    )
+                        .into()
+                });
+            NAMES_AND_TYPES.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                self.values.push(getters[0].get(i, "partition.year")?);
+            }
+            Ok(())
+        }
+    }
+
+    let mut visitor = PartitionYearVisitor { values: vec![] };
+    for batch in &batches {
+        visitor.visit_rows_of(batch.as_ref())?;
+    }
+    assert_eq!(visitor.values, vec![2024, 2025]);
+
+    Ok(())
+}
+
+/// Write a leaf manifest with multiple partition columns (year and month), read it back,
+/// and verify both `partition.year` and `partition.month` values round-trip through parquet.
+#[test]
+fn test_leaf_write_round_trips_multi_column_partition() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = crate::engine::sync::SyncEngine::new();
+    let temp_dir = tempfile::tempdir()?;
+    let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("_delta_log"))?;
+
+    let table_schema = multi_partitioned_table_schema();
+    let partition_columns = vec!["year".to_string(), "month".to_string()];
+    let partition_type =
+        build_partition_type(&partition_columns, &table_schema).expect("non-empty partition type");
+
+    // Verify field IDs are propagated for both partition columns
+    let year_field = partition_type
+        .field("year")
+        .expect("year field should exist");
+    assert_eq!(
+        year_field
+            .metadata
+            .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+        Some(&MetadataValue::Number(2)),
+    );
+    let month_field = partition_type
+        .field("month")
+        .expect("month field should exist");
+    assert_eq!(
+        month_field
+            .metadata
+            .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+        Some(&MetadataValue::Number(3)),
+    );
+
+    let mut builder = ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone())
+        .with_partition_type(Some(partition_type.clone()));
+
+    // Add files from three different partitions
+    let test_partitions: Vec<(i32, i32)> = vec![(2024, 1), (2024, 6), (2025, 3)];
+    for (idx, (year, month)) in test_partitions.iter().enumerate() {
+        let mut pv = HashMap::new();
+        pv.insert("year".to_string(), year.to_string());
+        pv.insert("month".to_string(), month.to_string());
+        builder.add(
+            Add {
+                path: format!("year={year}/month={month}/part-{idx:05}.parquet"),
+                partition_values: pv,
+                size: 1024,
+                modification_time: 0,
+                data_change: true,
+                stats: Some(r#"{"numRecords":10}"#.to_string()),
+                tags: None,
+                deletion_vector: None,
+                base_row_id: None,
+                default_row_commit_version: None,
+                clustering_provider: None,
+                data_manifest_path: None,
+                data_manifest_position: None,
+            },
+            1,
+            1,
+        )?;
+    }
+
+    let leaf_entry = builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
+
+    // Read the leaf manifest back with a schema that includes both partition columns
+    let delta_stats = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
+    let read_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+        &table_schema,
+        &delta_stats,
+        Some(&partition_type),
+    )?);
+
+    let leaf_relative = leaf_entry
+        .location
+        .as_ref()
+        .expect("leaf manifest should have a location");
+    let leaf_url = table_root
+        .join(leaf_relative.trim_start_matches('/'))
+        .unwrap();
+
+    let batches: Vec<_> = engine
+        .parquet_handler()
+        .read_parquet_files(
+            &[crate::FileMeta {
+                location: leaf_url,
+                last_modified: 0,
+                size: 0,
+            }],
+            read_schema,
+            None,
+        )?
+        .collect::<DeltaResult<Vec<_>>>()?;
+    assert!(!batches.is_empty());
+
+    struct MultiPartitionVisitor {
+        years: Vec<i32>,
+        months: Vec<i32>,
+    }
+    impl RowVisitor for MultiPartitionVisitor {
+        fn selected_column_names_and_types(
+            &self,
+        ) -> (&'static [crate::schema::ColumnName], &'static [DataType]) {
+            use std::sync::LazyLock;
+            static NAMES_AND_TYPES: LazyLock<crate::schema::ColumnNamesAndTypes> =
+                LazyLock::new(|| {
+                    (
+                        vec![
+                            crate::schema::ColumnName::new(["partition", "year"]),
+                            crate::schema::ColumnName::new(["partition", "month"]),
+                        ],
+                        vec![DataType::INTEGER, DataType::INTEGER],
+                    )
+                        .into()
+                });
+            NAMES_AND_TYPES.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                self.years.push(getters[0].get(i, "partition.year")?);
+                self.months.push(getters[1].get(i, "partition.month")?);
+            }
+            Ok(())
+        }
+    }
+
+    let mut visitor = MultiPartitionVisitor {
+        years: vec![],
+        months: vec![],
+    };
+    for batch in &batches {
+        visitor.visit_rows_of(batch.as_ref())?;
+    }
+    assert_eq!(visitor.years, vec![2024, 2024, 2025]);
+    assert_eq!(visitor.months, vec![1, 6, 3]);
 
     Ok(())
 }

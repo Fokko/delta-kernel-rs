@@ -217,6 +217,7 @@ fn visit_metadata_entry_at<'a>(
         tracking,
         deletion_vector,
         spec_id,
+        partition: None, // Dynamic schema based on partition spec - not included in base schema
         sort_order_id,
         record_count,
         file_size_in_bytes,

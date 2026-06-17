@@ -188,7 +188,7 @@ impl Iterator for LazyContentRootIterator {
                             .as_ref()
                             .zip(context.stats_schema.as_ref())
                             .and_then(|(ts, ss)| {
-                                crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)
+                                crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, None)
                                     .ok()
                                     .map(Arc::new)
                             });

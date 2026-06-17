@@ -197,7 +197,7 @@ impl BulkManifestStreamProcessor {
         // (built in `setup_next_manifest_state`) restores the non-null shape before downstream
         // evaluators run.
         let base_schema = if let (Some(ref ts), Some(ref ss)) = (&table_schema, &stats_schema) {
-            ContentTreeNodeEntry::to_schema_with_content_stats(ts.as_ref(), ss.as_ref())?
+            ContentTreeNodeEntry::to_schema_with_content_stats(ts.as_ref(), ss.as_ref(), None)?
         } else {
             {
                 use crate::schema::ToSchema as _;

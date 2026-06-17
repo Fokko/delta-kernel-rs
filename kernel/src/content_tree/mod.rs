@@ -42,6 +42,7 @@ pub(crate) const FILE_FORMAT: &str = "fileFormat";
 pub(crate) const TRACKING: &str = "tracking";
 pub(crate) const DV_INFO: &str = "deletionVector";
 pub(crate) const PARTITION_SPEC_ID: &str = "specId";
+pub(crate) const PARTITION: &str = "partition";
 pub(crate) const SORT_ORDER_ID: &str = "sortOrderId";
 pub(crate) const RECORD_COUNT: &str = "recordCount";
 pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
@@ -1495,7 +1496,8 @@ impl ContentTreeNode {
         let read_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
             use crate::schema::MetadataColumnSpec;
 
-            let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)?;
+            let schema_with_stats =
+                ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, None)?;
             let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
 
             // Add _pos metadata column to track row indices (needed for data_manifest_position)
@@ -1735,6 +1737,21 @@ pub(crate) fn metadata_entry_to_scalars(
                 None => Scalar::Null(field.data_type().clone()),
             },
             PARTITION_SPEC_ID => Scalar::from(entry.spec_id),
+            PARTITION => match &entry.partition {
+                Some(struct_data) => Scalar::Struct(struct_data.clone()),
+                None => {
+                    let struct_fields = if let DataType::Struct(st) = field.data_type() {
+                        st.fields().cloned().collect::<Vec<_>>()
+                    } else {
+                        return Err(Error::generic("partition field should be a struct"));
+                    };
+                    let null_values: Vec<Scalar> = struct_fields
+                        .iter()
+                        .map(|f| Scalar::Null(f.data_type().clone()))
+                        .collect();
+                    Scalar::Struct(StructData::new_unchecked(struct_fields, null_values))
+                }
+            },
             SORT_ORDER_ID => Scalar::from(entry.sort_order_id),
             RECORD_COUNT => Scalar::from(entry.record_count),
             FILE_SIZE_IN_BYTES => Scalar::from(entry.file_size_in_bytes),
@@ -2058,6 +2075,14 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 141]
     pub(crate) spec_id: i32,
 
+    /// Partition data tuple, schema based on the partition spec. Required (non-nullable)
+    /// when present in the schema. The schema is dynamically generated based on the
+    /// partition spec via [`Self::to_schema_with_content_stats`]. When `None` in Rust,
+    /// a struct with null-valued fields is produced during serialization.
+    #[skip_schema]
+    #[field_id = 102]
+    pub(crate) partition: Option<StructData>,
+
     /// ID representing sort order for this file. Can only be set if content_type is Data.
     #[field_id = 140]
     pub(crate) sort_order_id: Option<i32>,
@@ -2148,6 +2173,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     tracking: TrackingInfo,
     deletion_vector: Option<DeletionVectorInfo>,
     spec_id: i32,
+    partition: Option<StructData>,
     sort_order_id: Option<i32>,
     record_count: i64,
     file_size_in_bytes: Option<i64>,
@@ -2177,6 +2203,7 @@ impl ContentTreeNodeEntryBuilder {
             },
             deletion_vector: None,
             spec_id: 0,
+            partition: None,
             sort_order_id: None,
             record_count: 0,
             file_size_in_bytes: None,
@@ -2267,6 +2294,12 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn partition(mut self, partition: StructData) -> Self {
+        self.partition = Some(partition);
+        self
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn sort_order_id(mut self, sort_order_id: i32) -> Self {
         self.sort_order_id = Some(sort_order_id);
         self
@@ -2302,6 +2335,7 @@ impl ContentTreeNodeEntryBuilder {
             tracking: self.tracking,
             deletion_vector: self.deletion_vector,
             spec_id: self.spec_id,
+            partition: self.partition,
             sort_order_id: self.sort_order_id,
             record_count: self.record_count,
             file_size_in_bytes: self.file_size_in_bytes,
@@ -2326,7 +2360,7 @@ impl ContentTreeNodeEntry {
         use crate::schema::{MetadataColumnSpec, ToSchema as _};
 
         let base_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
-            Self::to_schema_with_content_stats(ts, ss)?
+            Self::to_schema_with_content_stats(ts, ss, None)?
         } else {
             Self::to_schema()
         };
@@ -2425,23 +2459,30 @@ impl ContentTreeNodeEntry {
         )?))
     }
 
-    /// Returns ContentTreeNodeEntry schema with content_stats based on the given table schema.
+    /// Returns ContentTreeNodeEntry schema with dynamic fields (partition and content_stats).
     ///
     /// The content_stats field schema is dynamically generated in Delta JSON stats format
     /// (numRecords, nullCount, minValues, maxValues, tightBounds) matching the format
     /// used by [`Transaction::add_files_schema`].
     ///
+    /// The partition field is a required struct whose type is derived from the partition spec.
+    /// When `partition_type` is `None`, the partition field is omitted from the schema.
+    ///
     /// # Arguments
     ///
     /// * `table_schema` - The table's data schema to generate stats schema from
+    /// * `stats_schema` - The stats schema for content_stats
+    /// * `partition_type` - The partition type from the partition spec, or `None` for unpartitioned
+    ///   tables
     ///
     /// # Returns
     ///
-    /// Returns `Ok(StructType)` containing the full ContentTreeNodeEntry schema with content_stats,
-    /// or an error if stats schema generation fails.
+    /// Returns `Ok(StructType)` containing the full ContentTreeNodeEntry schema with partition
+    /// and content_stats, or an error if stats schema generation fails.
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
         stats_schema: &StructType,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<StructType> {
         use crate::schema::{ColumnMetadataKey, ToSchema};
 
@@ -2449,18 +2490,32 @@ impl ContentTreeNodeEntry {
         // avoiding wasteful reads of per-column statistics that won't be used.
         let amt_stats = stats::filtered_stats_schema(table_schema, stats_schema)?;
 
-        // Build on the derived base schema (which includes field_ids) and insert content_stats
+        // Build on the derived base schema (which includes field_ids) and insert dynamic fields
         let base = Self::to_schema();
+
+        // Omit partition field for unpartitioned tables: Parquet cannot represent empty
+        // groups, so we skip the field when the partition type has no fields. This matches
+        // the Iceberg approach in V4Metadata.fileType (apache/iceberg#15634).
+        let partition_field = partition_type.filter(|pt| pt.fields().len() > 0).map(|pt| {
+            StructField::not_null(PARTITION, DataType::Struct(Box::new(pt.clone())))
+                .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 102i64)])
+        });
+
         let content_stats_field = StructField::nullable(
             CONTENT_STATS_FIELD_NAME,
             DataType::Struct(Box::new(amt_stats)),
         )
         .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 146i64)]);
 
-        // Insert content_stats after fileSizeInBytes
+        // Insert partition after specId (when present) and content_stats after fileSizeInBytes
         let mut fields = Vec::new();
         for field in base.fields() {
             fields.push(field.clone());
+            if field.name() == PARTITION_SPEC_ID {
+                if let Some(pf) = &partition_field {
+                    fields.push(pf.clone());
+                }
+            }
             if field.name() == FILE_SIZE_IN_BYTES {
                 fields.push(content_stats_field.clone());
             }
@@ -2819,10 +2874,14 @@ mod tests {
 
         // Generate schema with content_stats (using all columns)
         let delta_stats_schema = test_delta_stats_schema(&table_schema);
-        let schema_with_stats =
-            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &delta_stats_schema)?;
+        let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+            None,
+        )?;
 
-        // Schema should have 14 top-level fields (13 base + 1 for content_stats)
+        // Schema should have 14 top-level fields (13 base + content_stats; partition omitted
+        // because partition_type is None)
         assert_eq!(schema_with_stats.fields().len(), 14);
 
         // Verify content_stats field exists
@@ -2901,6 +2960,120 @@ mod tests {
     }
 
     #[test]
+    fn schema_with_partition_type_includes_partition_field() -> DeltaResult<()> {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
+
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("category", DataType::STRING, true, 2),
+            field_with_id("value", DataType::DOUBLE, true, 3),
+        ]);
+
+        let partition_type =
+            StructType::new_unchecked([field_with_id("category", DataType::STRING, true, 2)]);
+
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
+        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+            Some(&partition_type),
+        )?;
+
+        // 13 base + partition + content_stats = 15
+        assert_eq!(schema.fields().len(), 15);
+
+        let partition_field = schema
+            .field(PARTITION)
+            .expect("partition field should exist");
+        assert!(!partition_field.nullable);
+
+        let partition_struct = match partition_field.data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("Expected partition to be a struct"),
+        };
+        assert_eq!(partition_struct.fields().count(), 1);
+        assert!(partition_struct.field("category").is_some());
+        assert_eq!(
+            partition_struct.field("category").unwrap().data_type(),
+            &DataType::STRING
+        );
+
+        // Verify field_id = 102
+        let field_id = partition_field
+            .metadata
+            .get(ColumnMetadataKey::ParquetFieldId.as_ref())
+            .expect("partition field should have field_id metadata");
+        assert_eq!(*field_id, MetadataValue::Number(102));
+
+        // Verify partition is positioned after specId
+        let field_names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+        let spec_id_pos = field_names
+            .iter()
+            .position(|&n| n == PARTITION_SPEC_ID)
+            .unwrap();
+        let partition_pos = field_names.iter().position(|&n| n == PARTITION).unwrap();
+        assert_eq!(partition_pos, spec_id_pos + 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_omits_partition_for_unpartitioned_tables() -> DeltaResult<()> {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
+
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::INTEGER, false, 1)]);
+
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
+
+        // partition_type = None -> partition field omitted (Parquet cannot represent
+        // empty structs, matching Iceberg V4Metadata.fileType behavior)
+        let schema_none = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+            None,
+        )?;
+        assert!(schema_none.field(PARTITION).is_none());
+        assert_eq!(schema_none.fields().len(), 14);
+
+        // empty partition_type -> partition field omitted
+        let empty_pt = StructType::new_unchecked(vec![]);
+        let schema_empty = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+            Some(&empty_pt),
+        )?;
+        assert!(schema_empty.field(PARTITION).is_none());
+        assert_eq!(schema_empty.fields().len(), 14);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_into_engine_data_with_content_stats() -> DeltaResult<()> {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
         use crate::IntoEngineData;
@@ -2931,6 +3104,7 @@ mod tests {
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
             &delta_stats_schema,
+            None,
         )?);
 
         // Create content_stats in AMT format:
@@ -3059,6 +3233,7 @@ mod tests {
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
             &delta_stats_schema,
+            None,
         )?);
 
         // Create a ContentTreeNodeEntry with content_stats set to None
@@ -3129,11 +3304,11 @@ mod tests {
             ]),
         ]);
 
-        // Generate the schema with content_stats (using all columns)
         let delta_stats_schema = test_delta_stats_schema(&table_schema);
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
             &delta_stats_schema,
+            None,
         )?);
 
         // Create content_stats data in AMT format:
@@ -3310,7 +3485,7 @@ mod tests {
         let table_schema = test_table_schema();
         let stats_schema = test_delta_stats_schema(&table_schema);
         Arc::new(
-            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &stats_schema)
+            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &stats_schema, None)
                 .expect("test schema should be valid"),
         )
     }
@@ -3566,14 +3741,20 @@ mod tests {
             136,
         );
 
-        // Verify content_stats field_id in to_schema_with_content_stats
+        // Verify content_stats and partition field_ids in to_schema_with_content_stats
         let table_schema =
             StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)
                 .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 1i64)])]);
         let delta_stats_schema = test_delta_stats_schema(&table_schema);
-        let schema_with_stats =
-            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &delta_stats_schema)?;
+        let partition_type =
+            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(
+            &table_schema,
+            &delta_stats_schema,
+            Some(&partition_type),
+        )?;
         assert_field_id(&schema_with_stats, CONTENT_STATS_FIELD_NAME, 146);
+        assert_field_id(&schema_with_stats, PARTITION, 102);
 
         Ok(())
     }
