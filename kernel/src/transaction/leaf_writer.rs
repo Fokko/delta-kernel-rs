@@ -1346,6 +1346,7 @@ mod tests {
             manifest_location.to_string(),
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let manifest_metadata = ContentTreeNode::from_batches_with_version(

@@ -37,6 +37,8 @@ struct ContentRootContext {
     stats_schema: Option<StructType>,
     /// Table schema (physical schema with field IDs for AMT)
     table_schema: Option<StructType>,
+    /// Partition type schema (physical fields with field IDs for the partition tuple)
+    partition_type: Option<StructType>,
 }
 
 enum LazyContentRootState {
@@ -79,6 +81,7 @@ impl LazyContentRootIterator {
     /// - `stats_schema`: Optional stats schema (from table configuration or predicate columns)
     /// - `table_schema`: Optional table physical schema (with field IDs) for AMT content_stats
     ///   reading
+    /// - `partition_type`: Optional partition type schema (physical fields with field IDs)
     #[instrument(
         name = "content_tree.open_root",
         skip_all,
@@ -97,10 +100,12 @@ impl LazyContentRootIterator {
         skip_leaf_manifests: bool,
         stats_schema: Option<&StructType>,
         table_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Self> {
         // Convert schemas to owned for storage in context
         let stats_schema = stats_schema.cloned();
         let table_schema = table_schema.cloned();
+        let partition_type = partition_type.cloned();
 
         // Open the parquet stream using the metadata helper
         // Pass both schemas so content_stats is filtered to only requested columns
@@ -111,6 +116,7 @@ impl LazyContentRootIterator {
                 path_in_log,
                 table_schema.as_ref(),
                 stats_schema.as_ref(),
+                partition_type.as_ref(),
             )?;
 
         let context = ContentRootContext {
@@ -122,6 +128,7 @@ impl LazyContentRootIterator {
             skip_leaf_manifests,
             stats_schema,
             table_schema,
+            partition_type,
         };
 
         Ok(Self {
@@ -188,9 +195,13 @@ impl Iterator for LazyContentRootIterator {
                             .as_ref()
                             .zip(context.stats_schema.as_ref())
                             .and_then(|(ts, ss)| {
-                                crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, None)
-                                    .ok()
-                                    .map(Arc::new)
+                                crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                                    ts,
+                                    ss,
+                                    context.partition_type.as_ref(),
+                                )
+                                .ok()
+                                .map(Arc::new)
                             });
 
                         let leaf_refs = match metadata.manifest_references(
@@ -214,6 +225,7 @@ impl Iterator for LazyContentRootIterator {
                                 context.data_predicate.as_ref(),
                                 context.table_schema.as_ref(),
                                 context.stats_schema.as_ref(),
+                                context.partition_type.as_ref(),
                             ) {
                                 Ok(iter) => iter,
                                 Err(e) => return Some(Err(e)),
@@ -224,10 +236,10 @@ impl Iterator for LazyContentRootIterator {
                     let root_iter = match metadata.root_action_batches_with_handler(
                         context.evaluation_handler.as_ref(),
                         &context.checkpoint_read_schema,
-                        &[],
                         context.data_predicate.as_ref(),
                         context.table_schema.as_ref(),
                         context.stats_schema.as_ref(),
+                        context.partition_type.as_ref(),
                     ) {
                         Ok(iter) => iter,
                         Err(e) => return Some(Err(e)),

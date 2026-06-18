@@ -3455,6 +3455,7 @@ mod tests {
             content_root_path.clone(),
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let root_metadata = ContentTreeNode::from_batches_with_version(
@@ -3519,6 +3520,7 @@ mod tests {
             engine.parquet_handler(),
             &leaf_manifest_url,
             leaf_manifest_path.clone(),
+            None,
             None,
             None,
         )?;

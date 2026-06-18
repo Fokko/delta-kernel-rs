@@ -369,11 +369,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         expr: &'a PartitionValuesToMapExpression,
     ) -> Self::Output<PartitionValuesToMapExpression> {
-        map_owned_or_else(
-            expr,
-            self.transform_expr(&expr.struct_expr),
-            PartitionValuesToMapExpression::new,
-        )
+        map_owned_or_else(expr, self.transform_expr(&expr.struct_expr), |e| {
+            PartitionValuesToMapExpression::new(e, expr.struct_type.clone())
+        })
     }
 
     /// Recursively transforms the child expression of a map-to-struct expression (unary).

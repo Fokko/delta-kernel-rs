@@ -16,7 +16,7 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::{DataType, DeltaResult, DynPartialEq};
 
@@ -266,6 +266,10 @@ pub struct ParsePartitionValuesExpression {
 pub struct PartitionValuesToMapExpression {
     /// The expression that evaluates to a struct column containing typed partition values.
     pub struct_expr: Box<Expression>,
+    /// Output type of the struct expression. When present, passed as `result_type` when
+    /// evaluating `struct_expr` so the standard struct evaluation path can resolve field
+    /// names and types.
+    pub struct_type: Option<StructType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -641,9 +645,10 @@ impl ParsePartitionValuesExpression {
 }
 
 impl PartitionValuesToMapExpression {
-    pub(crate) fn new(struct_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(struct_expr: impl Into<Expression>, struct_type: Option<StructType>) -> Self {
         Self {
             struct_expr: Box::new(struct_expr.into()),
+            struct_type,
         }
     }
 }
@@ -846,9 +851,16 @@ impl Expression {
     }
 
     /// Creates a new PartitionValuesToMap expression that converts a typed partition values
-    /// struct back to a Map<String, String>.
-    pub fn partition_values_to_map(struct_expr: impl Into<Expression>) -> Self {
-        Self::PartitionValuesToMap(PartitionValuesToMapExpression::new(struct_expr))
+    /// struct back to a Map<String, String>. When `struct_type` is provided it is forwarded to
+    /// the evaluator so the inner struct expression can be evaluated with a known output schema.
+    pub fn partition_values_to_map(
+        struct_expr: impl Into<Expression>,
+        struct_type: Option<StructType>,
+    ) -> Self {
+        Self::PartitionValuesToMap(PartitionValuesToMapExpression::new(
+            struct_expr,
+            struct_type,
+        ))
     }
 
     /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using

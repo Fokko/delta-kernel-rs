@@ -119,6 +119,7 @@ fn replay_content_root(
         root_path_str.to_owned(),
         None,
         None,
+        None,
     )?;
     let mut entries = Vec::new();
     for batch in content_root_iter {

@@ -15,7 +15,7 @@ use super::{
     parse_or_join_url, ContentTreeNodeEntry, FilteredManifest, ManifestReference, SchemaRef,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor};
-use crate::expressions::PredicateRef;
+use crate::expressions::{Expression, PredicateRef};
 use crate::log_replay::ActionsBatch;
 use crate::schema::{ColumnName, DataType, MetadataColumnSpec, StructField, StructType};
 use crate::{DeltaResult, Error, EvaluationHandler, FileMeta, ParquetHandler};
@@ -138,6 +138,9 @@ pub(crate) struct BulkManifestStreamProcessor {
 
     /// Buffer of pending action batches to yield
     pending_actions: std::collections::VecDeque<ActionsBatch>,
+
+    /// Pre-built partition values expression (shared across all manifests).
+    partition_values_expr: Option<Expression>,
 }
 
 impl FilteredManifest {
@@ -183,6 +186,7 @@ impl BulkManifestStreamProcessor {
         _predicate: Option<PredicateRef>,
         table_schema: Option<Arc<StructType>>,
         stats_schema: Option<Arc<StructType>>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Self> {
         let manifest_refs: Vec<ManifestReference> = manifest_references.collect();
 
@@ -197,12 +201,13 @@ impl BulkManifestStreamProcessor {
         // (built in `setup_next_manifest_state`) restores the non-null shape before downstream
         // evaluators run.
         let base_schema = if let (Some(ref ts), Some(ref ss)) = (&table_schema, &stats_schema) {
-            ContentTreeNodeEntry::to_schema_with_content_stats(ts.as_ref(), ss.as_ref(), None)?
+            ContentTreeNodeEntry::to_schema_with_content_stats(
+                ts.as_ref(),
+                ss.as_ref(),
+                partition_type,
+            )?
         } else {
-            {
-                use crate::schema::ToSchema as _;
-                ContentTreeNodeEntry::to_schema()
-            }
+            ContentTreeNodeEntry::to_schema_with_partition(partition_type)
         };
         let base_schema = super::make_tracking_fields_nullable_in_schema(
             &base_schema,
@@ -236,6 +241,7 @@ impl BulkManifestStreamProcessor {
         let metadata_schema = super::ContentTreeNodeEntry::processing_schema_with_pos(
             table_schema_ref,
             stats_schema_ref,
+            partition_type,
         )?;
 
         // Evaluator input schemas are the same for all manifests.
@@ -250,9 +256,13 @@ impl BulkManifestStreamProcessor {
         let has_add = schema.contains(crate::actions::ADD_NAME);
         let has_remove = schema.contains(REMOVE_NAME);
 
+        // Build partition values expression from the dedicated `partition` tuple.
+        let partition_values_expr = match partition_type.filter(|pt| pt.fields().len() > 0) {
+            Some(pt) => Some(super::stats::build_partition_values_expr(pt)?),
+            None => None,
+        };
+
         // Remove evaluators are manifest-independent (no manifest path literal)
-        // TODO: partition values from content_stats are not yet supported in the bulk
-        // processor path. See the corresponding TODO in builder.rs for add_from_engine_data_write.
         let remove_evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
             evaluation_handler.as_ref(),
             evaluator_schema_with_dv.clone(),
@@ -261,7 +271,7 @@ impl BulkManifestStreamProcessor {
             false, // has_add
             has_remove,
             true,
-            None, // partition_values_expr
+            None, // partition_values_expr not needed for remove actions
         )?;
         let remove_evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
             evaluation_handler.as_ref(),
@@ -271,7 +281,7 @@ impl BulkManifestStreamProcessor {
             false, // has_add
             has_remove,
             false,
-            None, // partition_values_expr
+            None, // partition_values_expr not needed for remove actions
         )?;
 
         // Stats transform evaluators are also manifest-independent.
@@ -317,6 +327,7 @@ impl BulkManifestStreamProcessor {
             has_add,
             current_manifest_state: None,
             pending_actions: std::collections::VecDeque::new(),
+            partition_values_expr,
         })
     }
 
@@ -363,8 +374,6 @@ impl BulkManifestStreamProcessor {
                 .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
             // Reuse pre-computed evaluator schemas from shared — avoids redundant schema building.
-            // TODO: partition values from content_stats are not yet supported in the bulk
-            // processor path.
             let evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
                 self.shared.evaluator_schema_with_dv.clone(),
@@ -373,7 +382,7 @@ impl BulkManifestStreamProcessor {
                 true,  // has_add
                 false, // has_remove (handled by shared evaluators)
                 true,
-                None, // partition_values_expr
+                self.partition_values_expr.as_ref(),
             )?;
             let evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
@@ -383,7 +392,7 @@ impl BulkManifestStreamProcessor {
                 true,  // has_add
                 false, // has_remove
                 false,
-                None, // partition_values_expr
+                self.partition_values_expr.as_ref(),
             )?;
             ManifestAddEvaluators {
                 with_dv: evaluators_with_dv.add_evaluator,

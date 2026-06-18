@@ -371,6 +371,7 @@ impl ContentTreeNodeBuilder {
             content_root.path.clone(),
             None,
             None,
+            None,
         )?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
@@ -2524,6 +2525,7 @@ mod tests {
             root_path,
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let root =
@@ -3596,6 +3598,7 @@ mod tests {
             leaf_path.clone(),
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let leaf_metadata = ContentTreeNode::from_batches_with_version(
@@ -3674,6 +3677,7 @@ mod tests {
             engine.parquet_handler(),
             &leaf_url,
             leaf_path.clone(),
+            None,
             None,
             None,
         )?;

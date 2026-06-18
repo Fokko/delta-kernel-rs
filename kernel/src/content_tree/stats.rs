@@ -1167,6 +1167,7 @@ pub(crate) fn delta_json_stats_to_content_stats(
 }
 
 /// Selects how [`build_partition_values_from_content_stats_expr`] materializes partition columns.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartitionValuesFromContentStats {
     /// Delta `partitionValues` as `Map<String, String>` via
@@ -1201,6 +1202,7 @@ pub(crate) enum PartitionValuesFromContentStats {
 ///   exists in the table before reading its stats)
 /// * `partition_columns` - Physical names of partition columns
 /// * `output` - Map output for Delta `partitionValues`, or a typed struct of `lower_bound` columns
+#[cfg(test)]
 pub(crate) fn build_partition_values_from_content_stats_expr(
     physical_table_schema: Option<&StructType>,
     partition_columns: &[String],
@@ -1234,7 +1236,7 @@ pub(crate) fn build_partition_values_from_content_stats_expr(
             }
 
             let struct_expr = Expression::struct_from(field_exprs);
-            Ok(Expression::partition_values_to_map(struct_expr))
+            Ok(Expression::partition_values_to_map(struct_expr, None))
         }
         PartitionValuesFromContentStats::AsTypedStruct => {
             let Some(physical_table_schema) = physical_table_schema else {
@@ -1252,6 +1254,7 @@ pub(crate) fn build_partition_values_from_content_stats_expr(
 }
 
 /// Returns an expression that evaluates to an empty struct (no fields).
+#[cfg(test)]
 pub(crate) fn empty_partition_values_struct_expr() -> DeltaResult<Expression> {
     Ok(Expression::struct_from(Vec::<ExpressionRef>::new()))
 }
@@ -1263,6 +1266,35 @@ pub(crate) fn empty_partition_values_map_expr() -> DeltaResult<Expression> {
         Vec::<(Scalar, Scalar)>::new(),
     )?;
     Ok(Expression::literal(Scalar::Map(empty_map)))
+}
+
+/// Builds a `Map<String, String>` expression for `add.partitionValues` that reads typed
+/// partition values from the dedicated `partition` tuple.
+///
+/// For each partition column (derived from `partition_type` fields), the expression reads
+/// `partition.<col>` directly. Data file entries store their partition values in this tuple;
+/// `content_stats` does not carry partition bounds for data files.
+///
+/// Returns an empty map expression when `partition_type` has no fields.
+pub(crate) fn build_partition_values_expr(partition_type: &StructType) -> DeltaResult<Expression> {
+    let mut field_exprs: Vec<ExpressionRef> = Vec::with_capacity(partition_type.fields().len());
+    for field in partition_type.fields() {
+        let expr = Expression::Column(ColumnName::new([
+            crate::content_tree::PARTITION,
+            field.name(),
+        ]));
+        field_exprs.push(Arc::new(expr));
+    }
+
+    if field_exprs.is_empty() {
+        return empty_partition_values_map_expr();
+    }
+
+    let struct_expr = Expression::struct_from(field_exprs);
+    Ok(Expression::partition_values_to_map(
+        struct_expr,
+        Some(partition_type.clone()),
+    ))
 }
 
 /// Checks if a schema's stats column is in Delta JSON format (has numRecords).

@@ -1028,7 +1028,7 @@ impl ContentTreeNode {
         predicate: Option<&PredicateRef>,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
-        partition_columns: &[String],
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         use crate::actions::{ADD_NAME, REMOVE_NAME};
 
@@ -1042,18 +1042,16 @@ impl ContentTreeNode {
         let has_remove = schema.contains(REMOVE_NAME);
 
         // Get metadata schema that matches actual batches from open_stream.
-        let metadata_schema =
-            ContentTreeNodeEntry::processing_schema_with_pos(table_schema, stats_schema)?;
+        let metadata_schema = ContentTreeNodeEntry::processing_schema_with_pos(
+            table_schema,
+            stats_schema,
+            partition_type,
+        )?;
 
-        // Build partition values expression from content_stats when partition columns are known.
-        let partition_values_expr = if !partition_columns.is_empty() && table_schema.is_some() {
-            Some(stats::build_partition_values_from_content_stats_expr(
-                table_schema,
-                partition_columns,
-                stats::PartitionValuesFromContentStats::AsMap,
-            )?)
-        } else {
-            None
+        // Build partition values expression from the dedicated `partition` tuple.
+        let partition_values_expr = match partition_type.filter(|pt| pt.fields().len() > 0) {
+            Some(pt) => Some(stats::build_partition_values_expr(pt)?),
+            None => None,
         };
 
         // Build two evaluator variants:
@@ -1163,10 +1161,10 @@ impl ContentTreeNode {
         &self,
         evaluation_handler: &dyn EvaluationHandler,
         schema: &SchemaRef,
-        partition_columns: &[String],
         predicate: Option<&PredicateRef>,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Return empty iterator if schema doesn't contain Add or Remove
         if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
@@ -1180,7 +1178,7 @@ impl ContentTreeNode {
             predicate,
             table_schema,
             stats_schema,
-            partition_columns,
+            partition_type,
         )
     }
 
@@ -1364,6 +1362,7 @@ impl ContentTreeNode {
         predicate: Option<&PredicateRef>,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Use BulkManifestStreamProcessor for lazy processing of manifests
         let processor = bulk_processor::BulkManifestStreamProcessor::new(
@@ -1375,6 +1374,7 @@ impl ContentTreeNode {
             predicate.cloned(),
             table_schema.map(|s| Arc::new(s.clone())),
             stats_schema.map(|s| Arc::new(s.clone())),
+            partition_type,
         )?;
 
         Ok(Box::new(processor))
@@ -1468,6 +1468,7 @@ impl ContentTreeNode {
         path_in_log: String,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<ParquetStreamResult> {
         // Cached schema for reading ContentTreeNodeEntry from parquet files without content_stats.
         // Uses ToSchema which excludes content_stats (requires both table and stats schemas).
@@ -1492,20 +1493,31 @@ impl ContentTreeNode {
             Arc::new(StructType::new_unchecked(fields))
         });
 
-        // Build read schema with content_stats if both table and stats schemas are provided
+        // Build read schema:
+        //   - with content_stats when both table and stats schemas are provided
+        //   - with partition when partition_type is provided (independent of content_stats)
         let read_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
             use crate::schema::MetadataColumnSpec;
 
             let schema_with_stats =
-                ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, None)?;
+                ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, partition_type)?;
             let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
-
             // Add _pos metadata column to track row indices (needed for data_manifest_position)
             fields.push(StructField::create_metadata_column(
                 "_pos",
                 MetadataColumnSpec::RowIndex,
             ));
+            Arc::new(StructType::new_unchecked(fields))
+        } else if partition_type.is_some_and(|pt| pt.fields().len() > 0) {
+            use crate::schema::MetadataColumnSpec;
 
+            let base = ContentTreeNodeEntry::to_schema_with_partition(partition_type);
+            let mut fields: Vec<StructField> = base.fields().cloned().collect();
+            // Add _pos metadata column to track row indices (needed for data_manifest_position)
+            fields.push(StructField::create_metadata_column(
+                "_pos",
+                MetadataColumnSpec::RowIndex,
+            ));
             Arc::new(StructType::new_unchecked(fields))
         } else {
             READ_SCHEMA_BASE.clone()
@@ -2351,21 +2363,24 @@ impl ContentTreeNodeEntryBuilder {
 impl ContentTreeNodeEntry {
     /// Helper to create metadata schema for reading/processing manifest batches.
     ///
-    /// This includes `_pos` metadata column and optionally `content_stats` based on table_schema.
+    /// This includes `_pos` metadata column, optionally `content_stats` based on table_schema,
+    /// and optionally the `partition` tuple based on `partition_type`.
     /// Use this when you need a schema that matches actual manifest batch data.
     pub(crate) fn processing_schema_with_pos(
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<SchemaRef> {
-        use crate::schema::{MetadataColumnSpec, ToSchema as _};
+        use crate::schema::MetadataColumnSpec;
 
         let base_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
-            Self::to_schema_with_content_stats(ts, ss, None)?
+            Self::to_schema_with_content_stats(ts, ss, partition_type)?
         } else {
-            Self::to_schema()
+            Self::to_schema_with_partition(partition_type)
         };
 
         let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
+        // Add _pos metadata column to track row indices (needed for data_manifest_position)
         fields.push(StructField::create_metadata_column(
             "_pos",
             MetadataColumnSpec::RowIndex,
@@ -2459,6 +2474,36 @@ impl ContentTreeNodeEntry {
         )?))
     }
 
+    /// Returns the base ContentTreeNodeEntry schema with an optional `partition` field.
+    ///
+    /// The `partition` field is a required struct inserted after `specId`, whose type is
+    /// derived from the partition spec. Omitted for unpartitioned tables: when `partition_type`
+    /// is `None` or has no fields, the field is skipped because Parquet cannot represent empty
+    /// groups. This matches the Iceberg approach in V4Metadata.fileType
+    /// (apache/iceberg#15634).
+    pub(crate) fn to_schema_with_partition(partition_type: Option<&StructType>) -> StructType {
+        use crate::schema::{ColumnMetadataKey, ToSchema};
+
+        let base = Self::to_schema();
+        let partition_field = partition_type.filter(|pt| pt.fields().len() > 0).map(|pt| {
+            StructField::not_null(PARTITION, DataType::Struct(Box::new(pt.clone())))
+                .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 102i64)])
+        });
+
+        let Some(partition_field) = partition_field else {
+            return base;
+        };
+
+        let mut fields = Vec::new();
+        for field in base.fields() {
+            fields.push(field.clone());
+            if field.name() == PARTITION_SPEC_ID {
+                fields.push(partition_field.clone());
+            }
+        }
+        StructType::new_unchecked(fields)
+    }
+
     /// Returns ContentTreeNodeEntry schema with dynamic fields (partition and content_stats).
     ///
     /// The content_stats field schema is dynamically generated in Delta JSON stats format
@@ -2484,22 +2529,14 @@ impl ContentTreeNodeEntry {
         stats_schema: &StructType,
         partition_type: Option<&StructType>,
     ) -> DeltaResult<StructType> {
-        use crate::schema::{ColumnMetadataKey, ToSchema};
+        use crate::schema::ColumnMetadataKey;
 
         // Generate filtered AMT schema: only columns requested in stats_schema are included,
         // avoiding wasteful reads of per-column statistics that won't be used.
         let amt_stats = stats::filtered_stats_schema(table_schema, stats_schema)?;
-
-        // Build on the derived base schema (which includes field_ids) and insert dynamic fields
-        let base = Self::to_schema();
-
-        // Omit partition field for unpartitioned tables: Parquet cannot represent empty
-        // groups, so we skip the field when the partition type has no fields. This matches
-        // the Iceberg approach in V4Metadata.fileType (apache/iceberg#15634).
-        let partition_field = partition_type.filter(|pt| pt.fields().len() > 0).map(|pt| {
-            StructField::not_null(PARTITION, DataType::Struct(Box::new(pt.clone())))
-                .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 102i64)])
-        });
+        // Build on the base schema with partition (which includes field_ids) and insert
+        // content_stats
+        let base = Self::to_schema_with_partition(partition_type);
 
         let content_stats_field = StructField::nullable(
             CONTENT_STATS_FIELD_NAME,
@@ -2507,15 +2544,10 @@ impl ContentTreeNodeEntry {
         )
         .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 146i64)]);
 
-        // Insert partition after specId (when present) and content_stats after fileSizeInBytes
+        // Insert content_stats after fileSizeInBytes
         let mut fields = Vec::new();
         for field in base.fields() {
             fields.push(field.clone());
-            if field.name() == PARTITION_SPEC_ID {
-                if let Some(pf) = &partition_field {
-                    fields.push(pf.clone());
-                }
-            }
             if field.name() == FILE_SIZE_IN_BYTES {
                 fields.push(content_stats_field.clone());
             }
@@ -4503,6 +4535,7 @@ mod tests {
             path_in_log,
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         ContentTreeNode::from_batches_with_version(
@@ -4565,6 +4598,7 @@ mod tests {
             "metadata/abc-root-1.parquet".to_string(),
             None,
             None,
+            None,
         )?;
 
         // Round-trip through from_batches_with_version and verify entries
@@ -4617,7 +4651,7 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -4668,7 +4702,7 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -4729,7 +4763,7 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -4782,7 +4816,7 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -4918,7 +4952,7 @@ mod tests {
         let action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -4989,7 +5023,7 @@ mod tests {
         let action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &schema,
-            &[],
+            None,
             None,
             None,
             None,
@@ -5316,6 +5350,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )?;
 
         // Collect all Add actions
@@ -5636,6 +5671,7 @@ mod tests {
             checkpoint_action.path().to_string(),
             None,
             None,
+            None,
         )?;
         let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let root_metadata = ContentTreeNode::from_batches_with_version(
@@ -5663,6 +5699,7 @@ mod tests {
                     engine.parquet_handler(),
                     &manifest_url,
                     manifest_path.clone(),
+                    None,
                     None,
                     None,
                 )?;
@@ -5895,10 +5932,10 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &action_schema,
-            &[],
             None,
             None, // table_schema
             Some(&stats_schema),
+            None,
         )?;
 
         let batch = action_batches.next().unwrap()?;
@@ -6013,7 +6050,7 @@ mod tests {
         let mut action_batches = metadata.root_action_batches_with_handler(
             engine.evaluation_handler().as_ref(),
             &action_schema,
-            &[],
+            None,
             None,
             None,
             None,

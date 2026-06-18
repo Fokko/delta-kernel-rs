@@ -391,8 +391,12 @@ pub fn evaluate_expression(
         (PartitionValuesToMap(p), _) => {
             use crate::engine::arrow_utils::partition_values_to_map_impl;
 
+            let result_type = p
+                .struct_type
+                .as_ref()
+                .map(|st| DataType::Struct(Box::new(st.clone())));
             // Evaluate the struct expression
-            let struct_arr = evaluate_expression(&p.struct_expr, batch, None)?;
+            let struct_arr = evaluate_expression(&p.struct_expr, batch, result_type.as_ref())?;
 
             // Convert typed struct to map of strings
             let result = partition_values_to_map_impl(&struct_arr)?;

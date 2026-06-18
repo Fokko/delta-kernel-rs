@@ -978,6 +978,7 @@ impl LogSegment {
         skip_leaf_manifests: bool,
         stats_schema: Option<&StructType>,
         table_schema: Option<&StructType>,
+        partition_type: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let content_root_url = table_root
             .join(&content_root.path)
@@ -997,6 +998,7 @@ impl LogSegment {
                 skip_leaf_manifests,
                 stats_schema,
                 table_schema,
+                partition_type,
             )?;
 
         Ok(Box::new(lazy_iter))
@@ -1163,6 +1165,7 @@ impl LogSegment {
                     skip_leaf_manifests,
                     stats_schema,
                     table_schema,
+                    partition_schema,
                 )?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )

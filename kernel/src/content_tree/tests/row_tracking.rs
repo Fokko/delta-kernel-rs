@@ -77,8 +77,14 @@ fn build_and_roundtrip(
         .write(engine)?
         .location;
     let root_path = absolute_to_relative_path(&root_url, &table_root);
-    let (iter, version, path_in_log) =
-        ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
+    let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+        engine.parquet_handler(),
+        &root_url,
+        root_path,
+        None,
+        None,
+        None,
+    )?;
     let data = iter.collect::<DeltaResult<Vec<_>>>()?;
     let root = ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
     root.entries()
