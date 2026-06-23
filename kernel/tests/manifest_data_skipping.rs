@@ -22,8 +22,11 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::{RowVisitor, TypedGetData};
 use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, StructTypeBuilder,
+};
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use rstest::rstest;
 use test_utils::{create_table, engine_store_setup};
 
 mod common;
@@ -495,10 +498,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     txn.add_files(root_file_data);
 
     // Commit and verify content root
-    assert!(matches!(
-        txn.commit(engine.as_ref())?,
-        delta_kernel::transaction::CommitResult::CommittedTransaction(_)
-    ));
+    txn.commit(engine.as_ref())?.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(
         snapshot.checkpoint_action().is_some(),
@@ -716,17 +716,53 @@ fn create_partitioned_add_files(
     Ok(Box::new(ArrowEngineData::new(batch)))
 }
 
-/// Verifies that partition pruning works at the data file level through AMT manifests.
+/// Collects the set of file paths from a scan's metadata.
+fn collect_scan_file_paths(
+    scan: &delta_kernel::scan::Scan,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<std::collections::HashSet<String>> {
+    let mut paths = std::collections::HashSet::new();
+    for metadata in scan.scan_metadata(engine)? {
+        paths = metadata?.visit_scan_files(
+            paths,
+            |files: &mut std::collections::HashSet<_>, file| {
+                files.insert(file.path.to_string());
+            },
+        )?;
+    }
+    Ok(paths)
+}
+
+/// Builds the add_files_schema with the full stats schema from a transaction.
+fn build_add_files_schema_with_stats(
+    txn: &delta_kernel::transaction::Transaction,
+) -> DeltaResult<Arc<StructType>> {
+    let stats_schema = txn.stats_schema()?;
+    let mut builder = StructTypeBuilder::new();
+    for field in txn.add_files_schema().fields() {
+        if field.name() == "stats" {
+            builder = builder.add_field(StructField::nullable(
+                "stats",
+                DataType::Struct(Box::new((*stats_schema).clone())),
+            ));
+        } else {
+            builder = builder.add_field(field.clone());
+        }
+    }
+    Ok(builder.build_arc_unchecked())
+}
+
+/// Verifies partition pruning at the data file level through AMT manifests with a single
+/// partition column.
 ///
-/// Setup: partitioned table with `region` as the partition column, 4 data files across 2 leaf
-/// manifests + 1 file in the root:
+/// Setup: table partitioned by `region`, 4 data files across 2 leaf manifests + 1 root file:
 ///   - leaf1: file1 (region=us-east), file2 (region=eu-west)
 ///   - leaf2: file3 (region=us-east)
 ///   - root:  file4 (region=ap-south)
 ///
-/// With predicate `region = 'us-east'`, only file1 and file3 should be returned.
+/// With predicate `region = 'us-east'`, only file1 and file3 should survive.
 #[tokio::test]
-async fn test_partition_pruning_at_data_file_level() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_partition_pruning_single_column() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (store, engine, table_url) = engine_store_setup("partition_pruning_e2e", None);
@@ -753,23 +789,7 @@ async fn test_partition_pruning_at_data_file_level() -> Result<(), Box<dyn std::
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-
-    let stats_schema = txn.stats_schema()?;
-    let add_files_schema = {
-        use delta_kernel::schema::StructTypeBuilder;
-        let mut builder = StructTypeBuilder::new();
-        for field in txn.add_files_schema().fields() {
-            if field.name() == "stats" {
-                builder = builder.add_field(StructField::nullable(
-                    "stats",
-                    DataType::Struct(Box::new((*stats_schema).clone())),
-                ));
-            } else {
-                builder = builder.add_field(field.clone());
-            }
-        }
-        builder.build_arc_unchecked()
-    };
+    let add_files_schema = build_add_files_schema_with_stats(&txn)?;
 
     let (file1, file2, file3, file4) = (
         "region=us-east/part-00001.parquet",
@@ -830,59 +850,64 @@ async fn test_partition_pruning_at_data_file_level() -> Result<(), Box<dyn std::
         }],
     )?);
 
-    assert!(matches!(
-        txn.commit(engine.as_ref())?,
-        delta_kernel::transaction::CommitResult::CommittedTransaction(_)
-    ));
+    txn.commit(engine.as_ref())?.unwrap_committed();
 
     // Verify unfiltered scan returns all 4 files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let unfiltered_scan = snapshot.scan_builder().build()?;
     let (_, unfiltered_files) = count_scan_metadata_and_files(unfiltered_scan, engine.as_ref())?;
-    assert_eq!(
-        unfiltered_files, 4,
-        "unfiltered scan should return all 4 files"
-    );
+    assert_eq!(unfiltered_files, 4);
 
-    // Scan with partition predicate: region = 'us-east'
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    // Scan with partition predicate: region = 'us-east' -> file1 + file3
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let predicate = Arc::new(Pred::eq(column_expr!("region"), Expr::literal("us-east")));
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
-
-    let mut scanned_files = std::collections::HashSet::new();
-    for metadata in scan.scan_metadata(engine.as_ref())? {
-        scanned_files = metadata?.visit_scan_files(
-            scanned_files,
-            |files: &mut std::collections::HashSet<_>, file| {
-                files.insert(file.path.to_string());
-            },
-        )?;
-    }
-
-    // Only files with region=us-east should be returned
-    let expected_files: std::collections::HashSet<_> =
-        [file1.to_string(), file3.to_string()].into_iter().collect();
-    assert_eq!(
-        scanned_files, expected_files,
-        "partition pruning should keep only region=us-east files"
-    );
+    let scanned = collect_scan_file_paths(&scan, engine.as_ref())?;
+    let expected: std::collections::HashSet<_> =
+        [file1, file3].iter().map(|s| s.to_string()).collect();
+    assert_eq!(scanned, expected);
 
     Ok(())
 }
 
 /// Verifies partition pruning at the data file level with multiple partition columns.
 ///
-/// Setup: table partitioned by (region, year) with 5 data files across 2 leaf manifests + root:
-///   - leaf1: file1 (region=us-east, year=2024), file2 (region=eu-west, year=2024)
-///   - leaf2: file3 (region=us-east, year=2025), file4 (region=us-east, year=2024)
-///   - root:  file5 (region=ap-south, year=2025)
+/// Table partitioned by (region, year), 5 data files across 2 leaf manifests + root:
+///   - leaf1: file1 (us-east/2024), file2 (eu-west/2024)
+///   - leaf2: file3 (us-east/2025), file4 (us-east/2024)
+///   - root:  file5 (ap-south/2025)
 ///
-/// Tests three predicates:
-///   1. `region = 'us-east'` -> file1, file3, file4
-///   2. `region = 'us-east' AND year = '2024'` -> file1, file4
-///   3. `year = '2025'` -> file3, file5
+/// Each case tests a different predicate against this layout.
+#[rstest]
+#[case::region_only(
+    Pred::eq(column_expr!("region"), Expr::literal("us-east")),
+    vec![
+        "region=us-east/year=2024/part-00001.parquet",
+        "region=us-east/year=2025/part-00003.parquet",
+        "region=us-east/year=2024/part-00004.parquet",
+    ]
+)]
+#[case::region_and_year(
+    Pred::and(
+        Pred::eq(column_expr!("region"), Expr::literal("us-east")),
+        Pred::eq(column_expr!("year"), Expr::literal("2024")),
+    ),
+    vec![
+        "region=us-east/year=2024/part-00001.parquet",
+        "region=us-east/year=2024/part-00004.parquet",
+    ]
+)]
+#[case::year_only(
+    Pred::eq(column_expr!("year"), Expr::literal("2025")),
+    vec![
+        "region=us-east/year=2025/part-00003.parquet",
+        "region=ap-south/year=2025/part-00005.parquet",
+    ]
+)]
 #[tokio::test]
-async fn test_partition_pruning_multiple_partition_columns(
+async fn test_partition_pruning_multiple_columns(
+    #[case] predicate: Pred,
+    #[case] expected_files: Vec<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -911,31 +936,7 @@ async fn test_partition_pruning_multiple_partition_columns(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-
-    let stats_schema = txn.stats_schema()?;
-    let add_files_schema = {
-        use delta_kernel::schema::StructTypeBuilder;
-        let mut builder = StructTypeBuilder::new();
-        for field in txn.add_files_schema().fields() {
-            if field.name() == "stats" {
-                builder = builder.add_field(StructField::nullable(
-                    "stats",
-                    DataType::Struct(Box::new((*stats_schema).clone())),
-                ));
-            } else {
-                builder = builder.add_field(field.clone());
-            }
-        }
-        builder.build_arc_unchecked()
-    };
-
-    let (file1, file2, file3, file4, file5) = (
-        "region=us-east/year=2024/part-00001.parquet",
-        "region=eu-west/year=2024/part-00002.parquet",
-        "region=us-east/year=2025/part-00003.parquet",
-        "region=us-east/year=2024/part-00004.parquet",
-        "region=ap-south/year=2025/part-00005.parquet",
-    );
+    let add_files_schema = build_add_files_schema_with_stats(&txn)?;
 
     {
         let mc = txn.with_manifest_commit()?;
@@ -948,12 +949,12 @@ async fn test_partition_pruning_multiple_partition_columns(
                 &add_files_schema,
                 vec![
                     PartitionedTestFile {
-                        path: file1,
+                        path: "region=us-east/year=2024/part-00001.parquet",
                         size: 100,
                         partition_values: HashMap::from([("region", "us-east"), ("year", "2024")]),
                     },
                     PartitionedTestFile {
-                        path: file2,
+                        path: "region=eu-west/year=2024/part-00002.parquet",
                         size: 100,
                         partition_values: HashMap::from([("region", "eu-west"), ("year", "2024")]),
                     },
@@ -970,12 +971,12 @@ async fn test_partition_pruning_multiple_partition_columns(
                 &add_files_schema,
                 vec![
                     PartitionedTestFile {
-                        path: file3,
+                        path: "region=us-east/year=2025/part-00003.parquet",
                         size: 100,
                         partition_values: HashMap::from([("region", "us-east"), ("year", "2025")]),
                     },
                     PartitionedTestFile {
-                        path: file4,
+                        path: "region=us-east/year=2024/part-00004.parquet",
                         size: 100,
                         partition_values: HashMap::from([("region", "us-east"), ("year", "2024")]),
                     },
@@ -989,80 +990,29 @@ async fn test_partition_pruning_multiple_partition_columns(
     txn.add_files(create_partitioned_add_files(
         &add_files_schema,
         vec![PartitionedTestFile {
-            path: file5,
+            path: "region=ap-south/year=2025/part-00005.parquet",
             size: 100,
             partition_values: HashMap::from([("region", "ap-south"), ("year", "2025")]),
         }],
     )?);
 
-    assert!(matches!(
-        txn.commit(engine.as_ref())?,
-        delta_kernel::transaction::CommitResult::CommittedTransaction(_)
-    ));
+    txn.commit(engine.as_ref())?.unwrap_committed();
 
     // Verify unfiltered scan returns all 5 files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let unfiltered_scan = snapshot.scan_builder().build()?;
     let (_, unfiltered_files) = count_scan_metadata_and_files(unfiltered_scan, engine.as_ref())?;
-    assert_eq!(
-        unfiltered_files, 5,
-        "unfiltered scan should return all 5 files"
-    );
+    assert_eq!(unfiltered_files, 5);
 
-    // Predicate 1: region = 'us-east' -> file1, file3, file4
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let predicate = Arc::new(Pred::eq(column_expr!("region"), Expr::literal("us-east")));
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
-    let scanned = collect_scan_file_paths(&scan, engine.as_ref())?;
-    let expected: std::collections::HashSet<_> = [file1, file3, file4]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert_eq!(
-        scanned, expected,
-        "region='us-east' should match file1, file3, file4"
-    );
-
-    // Predicate 2: region = 'us-east' AND year = '2024' -> file1, file4
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let predicate = Arc::new(Pred::and(
-        Pred::eq(column_expr!("region"), Expr::literal("us-east")),
-        Pred::eq(column_expr!("year"), Expr::literal("2024")),
-    ));
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
     let scanned = collect_scan_file_paths(&scan, engine.as_ref())?;
     let expected: std::collections::HashSet<_> =
-        [file1, file4].iter().map(|s| s.to_string()).collect();
-    assert_eq!(
-        scanned, expected,
-        "region='us-east' AND year='2024' should match file1, file4"
-    );
-
-    // Predicate 3: year = '2025' -> file3, file5
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let predicate = Arc::new(Pred::eq(column_expr!("year"), Expr::literal("2025")));
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
-    let scanned = collect_scan_file_paths(&scan, engine.as_ref())?;
-    let expected: std::collections::HashSet<_> =
-        [file3, file5].iter().map(|s| s.to_string()).collect();
-    assert_eq!(scanned, expected, "year='2025' should match file3, file5");
+        expected_files.iter().map(|s| s.to_string()).collect();
+    assert_eq!(scanned, expected);
 
     Ok(())
-}
-
-/// Collects the set of file paths from a scan's metadata.
-fn collect_scan_file_paths(
-    scan: &delta_kernel::scan::Scan,
-    engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<std::collections::HashSet<String>> {
-    let mut paths = std::collections::HashSet::new();
-    for metadata in scan.scan_metadata(engine)? {
-        paths = metadata?.visit_scan_files(
-            paths,
-            |files: &mut std::collections::HashSet<_>, file| {
-                files.insert(file.path.to_string());
-            },
-        )?;
-    }
-    Ok(paths)
 }
