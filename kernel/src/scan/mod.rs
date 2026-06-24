@@ -1080,14 +1080,13 @@ impl Scan {
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
-        let path_resolver = ScanFilePathResolver::new(table_root);
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
-                let file_path = path_resolver.resolve(&scan_file.path)?;
+                let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
                     .dv_info
-                    .get_selection_vector(engine.as_ref(), path_resolver.table_root())?;
+                    .get_selection_vector(engine.as_ref(), &table_root)?;
                 let meta = FileMeta {
                     last_modified: 0,
                     size: scan_file.size.try_into().map_err(|_| {
@@ -1199,42 +1198,4 @@ pub fn selection_vector(
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
-}
-
-/// Resolves scan file paths to absolute URLs against a table root.
-///
-/// Pre-computes a trimmed root string (without trailing `/`) so that Iceberg v4 manifest
-/// paths with a leading `/` can be resolved efficiently via string concatenation. Regular
-/// relative paths (no leading `/`) are resolved via [`Url::join`] per RFC 3986.
-pub(crate) struct ScanFilePathResolver {
-    table_root: Url,
-    /// `table_root` URL string with trailing `/` stripped, computed once at construction.
-    trimmed_root: String,
-}
-
-impl ScanFilePathResolver {
-    pub(crate) fn new(table_root: Url) -> Self {
-        let trimmed_root = table_root.as_str().trim_end_matches('/').to_owned();
-        Self {
-            table_root,
-            trimmed_root,
-        }
-    }
-
-    pub(crate) fn table_root(&self) -> &Url {
-        &self.table_root
-    }
-
-    /// Resolves a path to an absolute URL.
-    ///
-    /// Leading-`/` paths (Iceberg v4 convention) are resolved by concatenation with the
-    /// pre-trimmed root. All other relative paths use [`Url::join`].
-    pub(crate) fn resolve(&self, path: &str) -> DeltaResult<Url> {
-        if path.starts_with('/') {
-            Url::parse(&format!("{}{path}", self.trimmed_root))
-                .map_err(|e| Error::generic(format!("Failed to resolve path '{path}': {e}")))
-        } else {
-            Ok(self.table_root.join(path)?)
-        }
-    }
 }

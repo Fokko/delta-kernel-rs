@@ -1637,21 +1637,31 @@ pub(crate) fn absolute_to_relative_path(absolute_url: &Url, table_root: &Url) ->
     }
 }
 
-/// Converts an absolute URL to a relative path by stripping the table location prefix. If the
-/// URL starts with the table location (without trailing `/`), the prefix is stripped and the
-/// remainder is returned (including the leading `/`). Otherwise the full absolute URL string
-/// is returned.
+/// Converts an absolute URL to a relative path for storage in manifest entry `location` fields,
+/// following the Iceberg v4 [path relativization] rules:
 ///
-/// This produces Iceberg-convention relative paths (leading `/`) for manifest entry location
-/// fields. Delta checkpoint `contentRoot.path` values use [`absolute_to_relative_path`] instead,
-/// which strips the leading `/` per the Delta convention.
-// Modeled after Iceberg's `LocationUtil.relativizeLocation`.
+/// * If the absolute path starts with the table location immediately followed by a separator
+///   character (`/`), the relative path is the remainder of the string *after* that separator (no
+///   leading `/`).
+/// * Otherwise (no separator after the prefix, or a prefix collision such as `.../tab` vs
+///   `.../table/...`), the full absolute URL string is returned and stored as-is.
+///
+/// Delta checkpoint `contentRoot.path` values use [`absolute_to_relative_path`], which applies the
+/// same no-leading-`/` convention but compares scheme/host/port instead of doing a raw string
+/// prefix match.
+/// [path relativization]: https://github.com/apache/iceberg/blob/main/format/spec.md#path-relativization
 pub(crate) fn relativize_manifest_path(absolute_url: &Url, table_root: &Url) -> String {
     let location = table_root.as_str().trim_end_matches('/');
     let absolute = absolute_url.as_str();
-    match absolute.strip_prefix(location) {
-        Some(relative) if relative.is_empty() || relative.starts_with('/') => relative.to_string(),
-        _ => absolute.to_string(),
+    // The relative path is the remainder *after* the separator, so the absolute path must begin
+    // with the table location immediately followed by `/`. A bare-location match (no separator)
+    // or a prefix collision leaves `strip_prefix('/')` returning `None`, falling back to absolute.
+    match absolute
+        .strip_prefix(location)
+        .and_then(|remainder| remainder.strip_prefix('/'))
+    {
+        Some(relative) => relative.to_string(),
+        None => absolute.to_string(),
     }
 }
 
@@ -1659,7 +1669,9 @@ pub(crate) fn relativize_manifest_path(absolute_url: &Url, table_root: &Url) -> 
 /// [RFC 3986 section 3.1](https://datatracker.ietf.org/doc/html/rfc3986#section-3.1).
 ///
 /// This is a fast string scan that avoids full URL parsing. A scheme is `ALPHA *( ALPHA /
-/// DIGIT / "+" / "-" / "." )` followed by `:`. Paths starting with `/` have no URI scheme.
+/// DIGIT / "+" / "-" / "." )` followed by `:`. The first character must be an ASCII letter, so
+/// paths starting with `/`, a digit, `+`/`-`/`.`, or a non-ASCII character (e.g. a Greek alpha)
+/// have no URI scheme and are treated as relative.
 fn has_uri_scheme(path: &str) -> bool {
     let bytes = path.as_bytes();
     // RFC 3986: scheme starts with ALPHA. Non-alphabetic first char means no scheme.
@@ -1677,12 +1689,16 @@ fn has_uri_scheme(path: &str) -> bool {
     false
 }
 
-/// Resolves a path string to an absolute URL.
+/// Resolves a path string to an absolute URL, the inverse of [`relativize_manifest_path`].
 ///
-/// If the path starts with a URI scheme it is already absolute. Otherwise it is relative and
-/// resolved by concatenating the table location (without trailing separator) with the path,
-/// inserting a `/` separator if the path doesn't already start with one. This handles both
-/// kernel-produced relative paths (no leading `/`) and Iceberg v4 manifest paths (leading `/`).
+/// If the path starts with a URI scheme it is already absolute and is parsed as-is. Otherwise, it
+/// is relative and resolved by joining it to the table location with a single `/` separator. This
+/// mirrors Iceberg's `LocationUtil.resolveLocation`, which joins
+/// `tableLocation + "/" + location`.
+///
+/// A kernel `table_root` `Url` conventionally ends in `/`, so the trailing separator is stripped
+/// before joining. Relative paths are expected not to start with `/` per the v4 spec (see
+/// [`relativize_manifest_path`]).
 pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url> {
     if has_uri_scheme(path) {
         return Url::parse(path).map_err(|e| {
@@ -1690,8 +1706,7 @@ pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url
         });
     }
     let root = table_root.as_str().trim_end_matches('/');
-    let sep = if path.starts_with('/') { "" } else { "/" };
-    Url::parse(&format!("{root}{sep}{path}"))
+    Url::parse(&format!("{root}/{path}"))
         .map_err(|e| Error::generic(format!("Failed to resolve relative path '{}': {}", path, e)))
 }
 
@@ -2625,12 +2640,23 @@ mod tests {
     #[case("file:///tmp/table", true)]
     #[case("hdfs://namenode/path", true)]
     #[case("gs+v2://bucket/path", true)]
+    #[case("git+ssh://host/repo", true)]
+    #[case("a:", true)]
     #[case("/data/file.parquet", false)]
     #[case("/metadata/root-1.parquet", false)]
     #[case("data/file.parquet", false)]
     #[case("", false)]
+    #[case("a", false)]
     // RFC 3986: scheme must start with ALPHA, not a digit
     #[case("123:foo", false)]
+    #[case("3com://host", false)]
+    // RFC 3986: scheme must start with ALPHA, not '+', '-', or '.'
+    #[case("+ssh://host", false)]
+    #[case("-foo://host", false)]
+    #[case(".bar://host", false)]
+    // RFC 3986 restricts schemes to US-ASCII; a non-ASCII leading char (Greek alpha U+03B1) is
+    // not a valid scheme character, so this is treated as relative
+    #[case("\u{03b1}scheme://host/path", false)]
     // Colon in a path segment is not a scheme
     #[case("/data/partition=key:value/file.parquet", false)]
     fn test_has_uri_scheme(#[case] input: &str, #[case] expected: bool) {
@@ -2701,38 +2727,59 @@ mod tests {
     // === parse_or_join_url ===
 
     #[rstest]
-    // Leading '/' relative paths (Iceberg v4 convention)
+    // Spec examples: join on `/`
+    #[case(
+        "s3://bucket/db/table",
+        "metadata/file.parquet",
+        "s3://bucket/db/table/metadata/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/db/table",
+        "data/00000-0.parquet",
+        "s3://bucket/db/table/data/00000-0.parquet"
+    )]
+    // Colons in path segments are not schemes
+    #[case(
+        "s3://bucket/db/table",
+        "data/partition=key:value/file.parquet",
+        "s3://bucket/db/table/data/partition=key:value/file.parquet"
+    )]
+    // Absolute locations are returned unchanged
+    #[case(
+        "s3://bucket/db/table",
+        "hdfs://wh/db/table/data/00000-0.parquet",
+        "hdfs://wh/db/table/data/00000-0.parquet"
+    )]
+    #[case(
+        "s3://bucket/db/table",
+        "s3://other-bucket/db/table/data/file.parquet",
+        "s3://other-bucket/db/table/data/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/db/table",
+        "s3://bucket/db/other-table/data/file.parquet",
+        "s3://bucket/db/other-table/data/file.parquet"
+    )]
+    // Relative paths (no leading '/', the Iceberg v4 and current kernel convention).
     #[case(
         "s3://bucket/table/",
-        "/data/file.parquet",
+        "data/file.parquet",
         "s3://bucket/table/data/file.parquet"
     )]
     #[case(
         "s3://bucket/table/",
-        "/metadata/root-1.parquet",
+        "metadata/root-1.parquet",
         "s3://bucket/table/metadata/root-1.parquet"
     )]
-    // Table root without trailing slash
+    // Table root without a trailing slash joins the same way.
     #[case(
         "s3://bucket/table",
-        "/data/file.parquet",
-        "s3://bucket/table/data/file.parquet"
-    )]
-    // No leading '/' relative paths (Delta convention)
-    #[case(
-        "s3://bucket/table/",
         "data/file.parquet",
         "s3://bucket/table/data/file.parquet"
     )]
     #[case(
         "file:///tmp/table/",
         "data/file.parquet",
-        "file:///tmp/table/data/file.parquet"
-    )]
-    // file:// scheme with leading '/'
-    #[case(
-        "file:///tmp/table/",
-        "/data/file.parquet",
         "file:///tmp/table/data/file.parquet"
     )]
     // Absolute URLs returned unchanged
@@ -2749,19 +2796,27 @@ mod tests {
     // Colons in path segments (not a scheme)
     #[case(
         "s3://bucket/table/",
-        "/data/partition=key:value/file.parquet",
+        "data/partition=key:value/file.parquet",
         "s3://bucket/table/data/partition=key:value/file.parquet"
     )]
     #[case(
         "s3://bucket/table/",
-        "/metadata/snap-123:456.avro",
+        "metadata/snap-123:456.avro",
         "s3://bucket/table/metadata/snap-123:456.avro"
     )]
     // Percent-encoded paths
     #[case(
         "s3://bucket/table/",
-        "/data/year%3D2023/file.parquet",
+        "data/year%3D2023/file.parquet",
         "s3://bucket/table/data/year%3D2023/file.parquet"
+    )]
+    // A relative path that starts with `/` is joined unconditionally with a single `/`, so it
+    // intentionally produces a fully-qualified path with a duplicate `//` separator, per the
+    // Iceberg spec. Kernel never writes such paths (relativization strips the leading separator)
+    #[case(
+        "s3://bucket/db/table",
+        "/data/00000-0.parquet",
+        "s3://bucket/db/table//data/00000-0.parquet"
     )]
     fn test_parse_or_join_url(#[case] root: &str, #[case] path: &str, #[case] expected: &str) {
         let table_root = Url::parse(root).unwrap();
@@ -2772,29 +2827,42 @@ mod tests {
     // === relativize_manifest_path ===
 
     #[rstest]
-    // Same-bucket: produces leading '/' per Iceberg convention
+    // Spec examples: strip the table location prefix and
+    // the separator (Iceberg v4 convention, no leading '/').
+    #[case(
+        "s3://bucket/db/table",
+        "s3://bucket/db/table/metadata/file.parquet",
+        "metadata/file.parquet"
+    )]
+    #[case(
+        "s3://bucket/db/table",
+        "s3://bucket/db/table/data/00000-0.parquet",
+        "data/00000-0.parquet"
+    )]
     #[case(
         "s3://bucket/table/",
         "s3://bucket/table/metadata/root.parquet",
-        "/metadata/root.parquet"
+        "metadata/root.parquet"
     )]
     #[case(
-        "s3://bucket/table/",
-        "s3://bucket/table/data/00000-0.parquet",
-        "/data/00000-0.parquet"
+        "s3://bucket/db/table",
+        "s3://other-bucket/db/table/data/file.parquet",
+        "s3://other-bucket/db/table/data/file.parquet"
     )]
-    // Cross-bucket: returns full absolute URL
+    // and same bucket, different path -- both returned as the full absolute URL.
     #[case(
-        "s3://bucket/table/",
-        "s3://other-bucket/path/file.parquet",
-        "s3://other-bucket/path/file.parquet"
+        "s3://bucket/db/table",
+        "s3://bucket/db/other-table/data/file.parquet",
+        "s3://bucket/db/other-table/data/file.parquet"
     )]
-    // Prefix collision: "s3://bucket/tab/" should NOT match "s3://bucket/table/..."
+    // "table" vs "table_v2" must NOT be relativized.
     #[case(
-        "s3://bucket/tab/",
-        "s3://bucket/table/file.parquet",
-        "s3://bucket/table/file.parquet"
+        "s3://bucket/db/table",
+        "s3://bucket/db/table_v2/data/00000-0.parquet",
+        "s3://bucket/db/table_v2/data/00000-0.parquet"
     )]
+    // no trailing separator follows the prefix, so it is returned as-is.
+    #[case("s3://bucket/db/table", "s3://bucket/db/table", "s3://bucket/db/table")]
     fn test_relativize_manifest_path(
         #[case] root: &str,
         #[case] absolute: &str,
@@ -2837,11 +2905,23 @@ mod tests {
     }
 
     #[rstest]
-    // relativize_manifest_path -> parse_or_join_url round-trip (leading '/')
+    // relativize_manifest_path -> parse_or_join_url round-trip (no leading '/')
     #[case(
-        "s3://bucket/table/",
-        "s3://bucket/table/metadata/root.parquet",
-        "/metadata/root.parquet"
+        "s3://bucket/db/table/",
+        "s3://bucket/db/table/metadata/root-manifest.parquet",
+        "metadata/root-manifest.parquet"
+    )]
+    // file:// scheme round-trip
+    #[case(
+        "file:///tmp/warehouse/table/",
+        "file:///tmp/warehouse/table/metadata/root-manifest.parquet",
+        "metadata/root-manifest.parquet"
+    )]
+    // hdfs:// scheme round-trip
+    #[case(
+        "hdfs://namenode/warehouse/table/",
+        "hdfs://namenode/warehouse/table/data/00000-0.parquet",
+        "data/00000-0.parquet"
     )]
     // Cross-bucket absolute URL preserved through round-trip
     #[case(
