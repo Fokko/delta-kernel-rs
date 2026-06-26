@@ -21,14 +21,16 @@ use crate::content_tree::{
     DataContentType, DeletionVectorInfo, TrackingInfo, TrackingStatus, CONTENT_STATS_FIELD_NAME,
     CONTENT_TYPE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, DV_INFO, FILE_FORMAT, FILE_SIZE_IN_BYTES,
-    LOCATION, PARTITION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID, TRACKING,
+    LOCATION, PARTITION, PARTITION_SPEC_ID, RECORD_COUNT, SORT_ORDER_ID, TAGS, TRACKING,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, Transform};
 use crate::log_replay::{ActionsBatch, FileActionKey, LogReplayProcessor};
 use crate::row_tracking::CursorRowIdAllocator;
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::log_replay::{DEFAULT_ROW_COMMIT_VERSION_NAME, STATS_PARSED_NAME};
+use crate::scan::log_replay::{
+    DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, STATS_PARSED_NAME,
+};
 use crate::schema::{
     column_name, ArrayType, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MapType,
     MetadataValue, Schema, SchemaRef, StructField, StructType,
@@ -574,7 +576,8 @@ impl ContentTreeNodeBuilder {
             .deletion_vector_opt(dv_content)
             .record_count(record_count)
             .file_size_in_bytes(add.size)
-            .content_stats_opt(content_stats);
+            .content_stats_opt(content_stats)
+            .tags_opt(add.tags);
         if let Some(partition) = partition {
             builder = builder.partition(partition);
         }
@@ -634,6 +637,10 @@ impl ContentTreeNodeBuilder {
     /// the full stats are passed through and record counts are extracted. When stats
     /// are not in AMT format (e.g., empty or unconverted), content_stats is set to null
     /// and record_count defaults to 0.
+    ///
+    /// The write metadata input schema does not carry `tags`, so entries produced by this method
+    /// always have `tags = None`. See the inline TODO in `evaluate_write_transform` for how to
+    /// extend this once `add_files` exposes tags.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for expression evaluation
@@ -754,6 +761,12 @@ impl ContentTreeNodeBuilder {
             record_count,
             content_stats,
             partition,
+            // TODO: Thread tags through the blind-append write path. The write metadata input
+            // schema (path, partitionValues, size, modificationTime, stats) does not carry tags,
+            // so tag values written via `add_from_engine_data_write` are silently dropped. If
+            // connector-supplied tags need to be preserved in AMT entries on blind-append commits,
+            // the write metadata schema and this projection would need to be extended.
+            tags_expr: None,
         };
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -1295,6 +1308,10 @@ impl ContentTreeNodeBuilder {
         // TODO: Thread partitionValues through the scan-row projection pipeline so partition
         // data can be populated from existing scan rows. Currently the step2_input_schema
         // only projects {path, size, stats, stats_parsed} and partitionValues is dropped.
+        let tags_expr = scan_row_input_schema
+            .field(TAGS)
+            .is_some()
+            .then(|| Expression::column([TAGS]));
         let projections = ContentTreeEntryProjections {
             status: TrackingStatus::Existing,
             snapshot_id,
@@ -1313,6 +1330,7 @@ impl ContentTreeNodeBuilder {
                 &stats_struct,
             )?),
             partition: None,
+            tags_expr,
         };
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -1484,23 +1502,34 @@ impl ContentTreeNodeBuilder {
         let mut dv_visitor = DecodedDvVisitor::for_scan_rows(engine_data.len());
         dv_visitor.visit_rows_of(engine_data)?;
 
-        // Step 2: Produce {path, size, stats_parsed} via coalesce(stats_parsed, parse_json(stats)).
-        // The input is always expected to have a `stats_parsed` column (added by
-        // `include_stats_columns()` in the scan). For rows sourced from JSON commits,
+        // Step 2: Produce {path, size, stats_parsed, tags} via coalesce(stats_parsed,
+        // parse_json(stats)). The input is always expected to have a `stats_parsed` column (added
+        // by `include_stats_columns()` in the scan). For rows sourced from JSON commits,
         // `stats_parsed` will be null and the coalesce falls back to parsing the `stats` JSON.
         // This mirrors the identical pattern in checkpoint/stats_transform.rs.
+        //
+        // `tags` is flattened out of `fileConstantValues.tags` into a top-level column so that
+        // `evaluate_scan_row_transform` can reference it uniformly.
         let delta_stats_schema = Arc::new(build_delta_stats_schema(&self.table_schema));
         let stats_parsed_type = DataType::Struct(Box::new(delta_stats_schema.as_ref().clone()));
+        let tags_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
         let step2_input_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable("stats", DataType::STRING),
             StructField::nullable(STATS_PARSED_NAME, stats_parsed_type.clone()),
+            StructField::nullable(
+                FILE_CONSTANT_VALUES_NAME,
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable(TAGS, DataType::Map(Box::new(tags_map_type.clone()))),
+                ]))),
+            ),
         ]));
         let stats_augmented_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable(STATS_PARSED_NAME, stats_parsed_type),
+            StructField::nullable(TAGS, DataType::Map(Box::new(tags_map_type))),
         ]));
         let parse_stats_expr = Expression::struct_from([
             Expression::column(["path"]),
@@ -1509,6 +1538,7 @@ impl ContentTreeNodeBuilder {
                 Expression::column([STATS_PARSED_NAME]),
                 Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
             ]),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS]),
         ]);
         let stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
             step2_input_schema,
@@ -1655,8 +1685,8 @@ impl RowVisitor for RecordCountVisitor {
 /// Projects only the fields used by [`LogBatchDedupVisitor`], [`DecodedDvVisitor`], and
 /// the `action_evaluator` in [`ContentRootRebuildProcessor`]:
 ///
-/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `partitionValues`, `deletionVector`
-///   (all 5 DV sub-fields for z85 decode)
+/// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `partitionValues`, `tags`,
+///   `deletionVector` (all 5 DV sub-fields for z85 decode)
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
 ///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
@@ -1683,6 +1713,7 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
+                StructField::nullable(TAGS, MapType::new(DataType::STRING, DataType::STRING, true)),
                 StructField::nullable("deletionVector", add_dv),
             ]))),
         ),
@@ -1839,12 +1870,13 @@ static LOG_BATCH_EVALUATOR_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
             ),
+            StructField::nullable(TAGS, MapType::new(DataType::STRING, DataType::STRING, true)),
         ]))),
     )]))
 });
 
-/// `add.{path, size, defaultRowCommitVersion, partitionValues}`, threaded from the log-batch
-/// evaluator into the action-to-entry evaluator.
+/// `add.{path, size, defaultRowCommitVersion, partitionValues, tags}`, threaded from the
+/// log-batch evaluator into the action-to-entry evaluator.
 fn log_add_projection_field() -> StructField {
     StructField::nullable(
         ADD_NAME,
@@ -1856,6 +1888,7 @@ fn log_add_projection_field() -> StructField {
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
             ),
+            StructField::nullable(TAGS, MapType::new(DataType::STRING, DataType::STRING, true)),
         ]))),
     )
 }
@@ -1889,6 +1922,8 @@ struct ContentTreeEntryProjections {
     /// Expression to extract partition values into a typed struct. Typically a `MapToStruct`
     /// expression over the `partitionValues` map column. `None` emits a null of the field's type.
     partition: Option<Expression>,
+    /// Expression extracting the tags map column. `None` emits a null of the field's type.
+    tags_expr: Option<Expression>,
 }
 
 /// Builds the row-to-`ContentTreeNodeEntry` projection expression shared by the blind-append
@@ -1931,6 +1966,10 @@ fn build_content_tree_entry_expression(
                     None => Expression::null_literal(field.data_type().clone()),
                 },
                 FILE_SIZE_IN_BYTES => projections.file_size_in_bytes.clone(),
+                TAGS => match &projections.tags_expr {
+                    Some(expr) => expr.clone(),
+                    None => Expression::null_literal(field.data_type().clone()),
+                },
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             Arc::new(expr)
@@ -1940,8 +1979,8 @@ fn build_content_tree_entry_expression(
     Expression::struct_from(field_exprs)
 }
 
-/// Projects `add.{path, size, defaultRowCommitVersion}` and parses `add.stats` into
-/// `stats_parsed`, shaped to `delta_stats_schema`.
+/// Projects `add.{path, size, defaultRowCommitVersion, partitionValues, tags}` and parses
+/// `add.stats` into `stats_parsed`, shaped to `delta_stats_schema`.
 fn build_log_batch_evaluator(
     engine: &dyn Engine,
     delta_stats_schema: &SchemaRef,
@@ -1960,6 +1999,7 @@ fn build_log_batch_evaluator(
             Expression::column([ADD_NAME, "size"]),
             Expression::column([ADD_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
             Expression::column([ADD_NAME, "partitionValues"]),
+            Expression::column([ADD_NAME, TAGS]),
         ]),
         Expression::parse_json(
             Expression::column([ADD_NAME, "stats"]),
@@ -2032,6 +2072,7 @@ fn build_action_to_content_tree_entry_evaluator(
             &amt_content_stats_schema,
         )?),
         partition,
+        tags_expr: Some(Expression::column([ADD_NAME, TAGS])),
     };
 
     engine.evaluation_handler().new_expression_evaluator(

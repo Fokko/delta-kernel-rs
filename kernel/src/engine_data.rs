@@ -162,12 +162,11 @@ impl<'a> ListItem<'a> {
 /// A pre-resolved view into a single row's map of string keys to string values. Like
 /// [`ListItem`], the string array types are resolved once at construction.
 ///
-/// Note: in conjunction with the `allow_null_container_values` attribute, [`materialize`]
-/// _drops_ any (key, value) pairs where the underlying value was null. If preserving null
-/// values is important, use the `allow_null_container_values` attribute and manually
-/// materialize the map using [`MapItem::get`].
+/// Note: [`materialize`] _drops_ any (key, value) pairs where the underlying value was null.
+/// If preserving null values is important, use [`materialize_with_nulls`] instead.
 ///
 /// [`materialize`]: MapItem::materialize
+/// [`materialize_with_nulls`]: MapItem::materialize_with_nulls
 pub struct MapItem<'a> {
     keys: &'a dyn StringArrayAccessor,
     values: &'a dyn StringArrayAccessor,
@@ -205,6 +204,25 @@ impl<'a> MapItem<'a> {
                     self.values.value(idx).to_string(),
                 );
             }
+        }
+        ret
+    }
+
+    /// Materialize this map into a `HashMap<String, Option<String>>`, preserving null values.
+    ///
+    /// Unlike [`materialize`], entries whose value is null are included with a `None` value
+    /// rather than being dropped.
+    ///
+    /// [`materialize`]: MapItem::materialize
+    pub fn materialize_with_nulls(&self) -> HashMap<String, Option<String>> {
+        let mut ret = HashMap::with_capacity(self.offsets.len());
+        for idx in self.offsets.clone() {
+            let key = self.keys.value(idx).to_string();
+            let value = self
+                .values
+                .is_valid(idx)
+                .then(|| self.values.value(idx).to_string());
+            ret.insert(key, value);
         }
         ret
     }
@@ -359,7 +377,8 @@ impl<'a> TypedGetData<'a, Vec<String>> for dyn GetData<'a> + '_ {
 }
 
 /// Provide an impl to get a map field as a `HashMap<String, String>`. Note that this will
-/// allocate the map and allocate for each entry
+/// allocate the map and allocate for each entry. Null map values are dropped; use
+/// `TypedGetData<HashMap<String, Option<String>>>` to preserve them.
 impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     fn get_opt(
         &'a self,
@@ -368,6 +387,20 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     ) -> DeltaResult<Option<HashMap<String, String>>> {
         let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(map_opt.map(|map| map.materialize()))
+    }
+}
+
+/// Provide an impl to get a map field as a `HashMap<String, Option<String>>`, preserving null
+/// values. Use this instead of `TypedGetData<HashMap<String, String>>` when the map may contain
+/// null values that must be retained.
+impl<'a> TypedGetData<'a, HashMap<String, Option<String>>> for dyn GetData<'a> + '_ {
+    fn get_opt(
+        &'a self,
+        row_index: usize,
+        field_name: &str,
+    ) -> DeltaResult<Option<HashMap<String, Option<String>>>> {
+        let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
+        Ok(map_opt.map(|map| map.materialize_with_nulls()))
     }
 }
 

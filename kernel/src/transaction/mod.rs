@@ -4360,19 +4360,24 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to write a normal (non-manifest) add action commit as a JSON file.
-    fn write_add_action_commit(table_root: &Url, version: u64, file_path: &str) -> DeltaResult<()> {
-        let add = json!({
-            "add": {
-                "path": file_path,
-                "partitionValues": {},
-                "size": 1024,
-                "modificationTime": 1677811178336u64,
-                "dataChange": true,
-                "defaultRowCommitVersion": version
-            }
-        });
-
+    /// Helper to write an add action commit as a JSON file, optionally with tags.
+    fn write_add_action_commit(
+        table_root: &Url,
+        version: u64,
+        file_path: &str,
+        tags: Option<serde_json::Value>,
+    ) -> DeltaResult<()> {
+        let mut add_fields = serde_json::Map::new();
+        add_fields.insert("path".into(), json!(file_path));
+        add_fields.insert("partitionValues".into(), json!({}));
+        add_fields.insert("size".into(), json!(1024));
+        add_fields.insert("modificationTime".into(), json!(1677811178336u64));
+        add_fields.insert("dataChange".into(), json!(true));
+        add_fields.insert("defaultRowCommitVersion".into(), json!(version));
+        if let Some(t) = tags {
+            add_fields.insert("tags".into(), t);
+        }
+        let add = json!({ "add": add_fields });
         let delta_log_path = table_root
             .join("_delta_log/")?
             .to_file_path()
@@ -4406,7 +4411,7 @@ mod tests {
         write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // v2: normal add commit
-        write_add_action_commit(&table_root, 2, "data/incremental-file.parquet")?;
+        write_add_action_commit(&table_root, 2, "data/incremental-file.parquet", None)?;
 
         // v3: manifest commit
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -4445,6 +4450,68 @@ mod tests {
         assert_eq!(&ca.protocol, fresh_protocol);
         assert_eq!(ca.meta_data.id(), fresh_metadata.id());
         assert_eq!(ca.version, fresh.version());
+
+        Ok(())
+    }
+
+    /// Verifies that `tags` from Add actions in the Delta log survive the manifest commit
+    /// evaluator chain (JSON log replay -> `ContentRootRebuildProcessor` -> content tree entry).
+    #[test]
+    fn test_manifest_commit_preserves_add_tags() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // v0: create table with metadataTree-experimental + columnMapping (required for
+        // minReaderVersion=3)
+        create_initial_table(&table_root, true)?;
+
+        // v1: add commit with tags (INSERTION_TIME=Some("123"), NULL_TAG=None)
+        write_add_action_commit(
+            &table_root,
+            1,
+            "data/tagged-file.parquet",
+            Some(json!({"INSERTION_TIME": "123", "NULL_TAG": null})),
+        )?;
+
+        // v2: manifest commit -- replays v1's Add action through the evaluator chain
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot.transaction(committer, &engine)?;
+        txn.with_manifest_commit()?;
+        txn.commit(&engine)?.unwrap_committed();
+
+        // Read back: open the root manifest written by the manifest commit and verify tags.
+        let fresh = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let ca = fresh
+            .checkpoint_action()
+            .expect("manifest commit must produce a checkpoint action");
+        let root_url = parse_or_join_url(ca.path(), &table_root)?;
+        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root);
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &root_url,
+            root_path,
+            None,
+            None,
+            None,
+        )?;
+        let data = iter.collect::<crate::DeltaResult<Vec<_>>>()?;
+        let root_node =
+            ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
+
+        let entries = root_node.entries()?;
+        assert_eq!(entries.len(), 1, "expected exactly one content tree entry");
+        let expected_tags = HashMap::from([
+            ("INSERTION_TIME".to_string(), Some("123".to_string())),
+            ("NULL_TAG".to_string(), None),
+        ]);
+        assert_eq!(
+            entries[0].tags,
+            Some(expected_tags),
+            "tags must survive the log-replay evaluator chain into the content tree"
+        );
 
         Ok(())
     }

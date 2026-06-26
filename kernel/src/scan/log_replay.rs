@@ -910,7 +910,7 @@ pub(crate) fn scan_action_iter(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use rstest::rstest;
 
@@ -918,9 +918,11 @@ mod tests {
         scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData as _};
     use crate::expressions::{
-        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
         ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
@@ -935,14 +937,51 @@ mod tests {
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
-        add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
-        add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
+        add_batch_for_row_id, add_batch_simple, add_batch_with_null_tag,
+        add_batch_with_partition_col, add_batch_with_remove, add_batch_with_remove_and_partition,
+        run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
+        StructType,
+    };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+
+    /// Visitor that collects `fileConstantValues.tags` from scan rows as null-preserving maps.
+    struct TagsVisitor(Vec<Option<HashMap<String, Option<String>>>>);
+
+    impl FilteredRowVisitor for TagsVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                (
+                    vec![ColumnName::new(["fileConstantValues", "tags"])],
+                    vec![DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    )))],
+                )
+                    .into()
+            });
+            NAMES_AND_TYPES.as_ref()
+        }
+
+        fn visit_filtered<'a>(
+            &mut self,
+            getters: &[&'a dyn GetData<'a>],
+            rows: RowIndexIterator<'_>,
+        ) -> DeltaResult<()> {
+            for row_index in rows {
+                let tags: Option<HashMap<String, Option<String>>> =
+                    getters[0].get_opt(row_index, "fileConstantValues.tags")?;
+                self.0.push(tags);
+            }
+            Ok(())
+        }
+    }
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -1025,6 +1064,63 @@ mod tests {
             (),
             validate_simple,
         );
+    }
+
+    /// Verifies that `add.tags` from JSON log actions are projected into
+    /// `fileConstantValues.tags` by [`scan_action_iter`], including null-valued tags.
+    #[rstest]
+    #[case::all_string_tags(
+        add_batch_simple(get_commit_schema().clone()),
+        HashMap::from([
+            ("INSERTION_TIME".to_string(), Some("1677811178336000".to_string())),
+            ("MIN_INSERTION_TIME".to_string(), Some("1677811178336000".to_string())),
+            ("MAX_INSERTION_TIME".to_string(), Some("1677811178336000".to_string())),
+            ("OPTIMIZE_TARGET_SIZE".to_string(), Some("268435456".to_string())),
+        ]),
+    )]
+    #[case::null_tag_preserved(
+        add_batch_with_null_tag(get_commit_schema().clone()),
+        HashMap::from([
+            ("MY_TAG".to_string(), Some("value".to_string())),
+            ("NULL_TAG".to_string(), None),
+        ]),
+    )]
+    fn test_scan_action_iter_includes_tags_from_log(
+        #[case] batch: Box<ArrowEngineData>,
+        #[case] expected_tags: HashMap<String, Option<String>>,
+    ) {
+        let state_info = Arc::new(StateInfo {
+            logical_schema: Arc::new(StructType::new_unchecked(vec![])),
+            physical_schema: Arc::new(StructType::new_unchecked(vec![])),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+        });
+        let (iter, _metrics) = scan_action_iter(
+            &SyncEngine::new(),
+            vec![batch]
+                .into_iter()
+                .map(|b| Ok(ActionsBatch::new(b as _, true))),
+            state_info,
+            test_checkpoint_info(),
+            false,
+        )
+        .unwrap();
+
+        let results: Vec<_> = iter.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 1);
+
+        let mut visitor = TagsVisitor(vec![]);
+        visitor.visit_rows_of(&results[0].scan_files).unwrap();
+
+        assert_eq!(visitor.0.len(), 1, "expected one selected add action row");
+        let tags = visitor
+            .0
+            .remove(0)
+            .expect("tags must be Some for an add action with tags");
+        assert_eq!(tags, expected_tags);
     }
 
     #[test]

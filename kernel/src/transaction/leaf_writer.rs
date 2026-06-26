@@ -774,6 +774,14 @@ mod tests {
                     ),
                     StructField::nullable("baseRowId", DataType::LONG),
                     StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                    StructField::nullable(
+                        "tags",
+                        DataType::Map(Box::new(MapType::new(
+                            DataType::STRING,
+                            DataType::STRING,
+                            true,
+                        ))),
+                    ),
                     StructField::nullable("dataManifestPath", DataType::STRING),
                     StructField::nullable("dataManifestPosition", DataType::LONG),
                 ]),

@@ -16,6 +16,7 @@ mod row_tracking_tests;
 
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -26,7 +27,9 @@ use url::Url;
 
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
-use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData, Transform};
+use crate::expressions::{
+    ColumnName, Expression, MapData, PredicateRef, Scalar, StructData, Transform,
+};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, StructField, StructType};
@@ -51,6 +54,7 @@ pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
 pub(crate) const EQUALITY_IDS: &str = "equalityIds";
+pub(crate) const TAGS: &str = "tags";
 
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
@@ -452,7 +456,7 @@ impl ContentTreeNode {
         partition_values_expr: Option<&Expression>,
     ) -> DeltaResult<Expression> {
         use crate::expressions::VariadicExpressionOp;
-        use crate::schema::{DataType, MapType};
+        use crate::schema::DataType;
 
         Ok(match field_name {
             // Common fields for both Add and Remove
@@ -472,11 +476,7 @@ impl ContentTreeNode {
                 None => stats::empty_partition_values_map_expr()?,
             },
             "dataChange" => Expression::literal(true),
-            "tags" => Expression::null_literal(DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::STRING,
-                true,
-            )))),
+            "tags" => Expression::column([TAGS]),
             "deletionVector" => {
                 use crate::actions::deletion_vector::DeletionVectorDescriptor;
                 use crate::schema::ToSchema;
@@ -1816,6 +1816,23 @@ pub(crate) fn metadata_entry_to_scalars(
             KEY_METADATA => Scalar::from(entry.key_metadata.clone()),
             SPLIT_OFFSETS => entry.split_offsets.clone().try_into()?,
             EQUALITY_IDS => entry.equality_ids.clone().try_into()?,
+            TAGS => match &entry.tags {
+                Some(tags) => {
+                    let DataType::Map(map_type) = field.data_type() else {
+                        return Err(Error::generic("tags field should be a Map"));
+                    };
+                    let pairs = tags.iter().map(|(k, v)| {
+                        (
+                            Scalar::String(k.clone()),
+                            v.as_ref().map_or(Scalar::Null(DataType::STRING), |s| {
+                                Scalar::String(s.clone())
+                            }),
+                        )
+                    });
+                    Scalar::Map(MapData::try_new(map_type.as_ref().clone(), pairs)?)
+                }
+                None => Scalar::Null(field.data_type().clone()),
+            },
             _ => Scalar::Null(field.data_type().clone()),
         };
 
@@ -2157,6 +2174,14 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 135]
     #[element_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
+
+    /// Metadata tags for this file, propagated from the Add action. Map values can be null.
+    ///
+    /// Unlike other entry fields, `tags` carries no Parquet field ID. It was added after the
+    /// initial Iceberg AMF schema was fixed, so it is matched by column name when reading.
+    /// TODO: assign a Parquet field ID dynamically based on Iceberg expressions once they are
+    /// supported in the AMF spec.
+    pub(crate) tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl ContentTreeNodeEntry {
@@ -2209,6 +2234,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     key_metadata: Option<Bytes>,
     split_offsets: Option<Vec<i64>>,
     equality_ids: Option<Vec<i32>>,
+    tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl ContentTreeNodeEntryBuilder {
@@ -2239,6 +2265,7 @@ impl ContentTreeNodeEntryBuilder {
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
+            tags: None,
         }
     }
 
@@ -2353,6 +2380,12 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn tags_opt(mut self, tags: Option<HashMap<String, Option<String>>>) -> Self {
+        self.tags = tags;
+        self
+    }
+
     /// Consume the builder and produce a [`ContentTreeNodeEntry`].
     pub(crate) fn build(self) -> ContentTreeNodeEntry {
         ContentTreeNodeEntry {
@@ -2371,6 +2404,7 @@ impl ContentTreeNodeEntryBuilder {
             key_metadata: self.key_metadata,
             split_offsets: self.split_offsets,
             equality_ids: self.equality_ids,
+            tags: self.tags,
         }
     }
 }
@@ -2949,15 +2983,15 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // 13 top-level fields (manifestDv moved into manifest_info.dv)
-        assert_eq!(schema.fields().len(), 13);
+        // 14 top-level fields (manifestDv moved into manifest_info.dv)
+        assert_eq!(schema.fields().len(), 14);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // 31 leaf fields (6 tracking + 4 deletion_vector + 11 manifest_info + 10 other)
-        assert_eq!(leaf_names.len(), 31);
+        // 32 leaf fields (6 tracking + 4 deletion_vector + 11 manifest_info + 11 other)
+        assert_eq!(leaf_names.len(), 32);
     }
 
     #[test]
@@ -2992,9 +3026,9 @@ mod tests {
             None,
         )?;
 
-        // Schema should have 14 top-level fields (13 base + content_stats; partition omitted
+        // Schema should have 15 top-level fields (14 base + 1 for content_stats; partition omitted
         // because partition_type is None)
-        assert_eq!(schema_with_stats.fields().len(), 14);
+        assert_eq!(schema_with_stats.fields().len(), 15);
 
         // Verify content_stats field exists
         let content_stats_field = schema_with_stats
@@ -3103,8 +3137,8 @@ mod tests {
             Some(&partition_type),
         )?;
 
-        // 13 base + partition + content_stats = 15
-        assert_eq!(schema.fields().len(), 15);
+        // 14 base + partition + content_stats = 16
+        assert_eq!(schema.fields().len(), 16);
 
         let partition_field = schema
             .field(PARTITION)
@@ -3170,7 +3204,7 @@ mod tests {
             None,
         )?;
         assert!(schema_none.field(PARTITION).is_none());
-        assert_eq!(schema_none.fields().len(), 14);
+        assert_eq!(schema_none.fields().len(), 15);
 
         // empty partition_type -> partition field omitted
         let empty_pt = StructType::new_unchecked(vec![]);
@@ -3180,7 +3214,7 @@ mod tests {
             Some(&empty_pt),
         )?;
         assert!(schema_empty.field(PARTITION).is_none());
-        assert_eq!(schema_empty.fields().len(), 14);
+        assert_eq!(schema_empty.fields().len(), 15);
 
         Ok(())
     }
@@ -3851,6 +3885,18 @@ mod tests {
             "equalityIds",
             "equalityIds.element",
             136,
+        );
+
+        // Verify keyMetadata has field ID 131 (it carries an explicit Iceberg field ID)
+        assert_field_id(&metadata_entry_schema, "keyMetadata", 131);
+
+        // Verify tags has NO Parquet field ID -- it is resolved by column name, not field ID
+        let tags_field = metadata_entry_schema.field("tags").unwrap();
+        assert!(
+            !tags_field
+                .metadata()
+                .contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            "tags must not have a Parquet field ID -- resolved by column name"
         );
 
         // Verify content_stats and partition field_ids in to_schema_with_content_stats
@@ -4525,6 +4571,132 @@ mod tests {
             .and_then(|mi| mi.dv.as_ref())
             .is_none());
         assert!(actual.manifest_info.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_tags_with_null_values() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let tags = HashMap::from([
+            ("INSERTION_TIME".to_string(), Some("123".to_string())),
+            ("NULL_TAG".to_string(), None),
+        ]);
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/file.parquet")
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(200),
+                first_row_id: Some(1000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .tags_opt(Some(tags.clone()))
+            .build();
+
+        let read_metadata = build_and_roundtrip(vec![entry.clone()], 0, &table_root_url, &engine)?;
+
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tags, Some(tags));
+
+        Ok(())
+    }
+
+    /// Verify tags survive a full two-level hierarchy: leaf manifest (Data entries with tags)
+    /// referenced from a root manifest (DataManifest entry), read back via `entries()`.
+    #[test]
+    fn test_roundtrip_tags_hierarchical() -> DeltaResult<()> {
+        use crate::content_tree::writer::ContentTreeNodeWriter;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let tags = HashMap::from([
+            ("INSERTION_TIME".to_string(), Some("123".to_string())),
+            ("NULL_TAG".to_string(), None),
+        ]);
+
+        // Leaf manifest: one Data entry with tags.
+        let leaf_data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data/file.parquet")
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(10)
+            .file_size_in_bytes(1024)
+            .tags_opt(Some(tags.clone()))
+            .build();
+        let leaf_node = build_node(vec![leaf_data_entry], 0, &table_root_url, &engine)?;
+        let leaf_url = ContentTreeNodeWriter::try_new(leaf_node)?
+            .write(&engine)?
+            .location;
+
+        // Root manifest: one DataManifest entry referencing the leaf.
+        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location(leaf_url.as_str())
+            .tracking(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(10)
+            .file_size_in_bytes(1024)
+            .manifest_info(ManifestInfo {
+                added_files_count: 1,
+                existing_files_count: 0,
+                deleted_files_count: 0,
+                replaced_files_count: 0,
+                added_rows_count: 10,
+                existing_rows_count: 0,
+                deleted_rows_count: 0,
+                replaced_rows_count: 0,
+                min_sequence_number: 1,
+                dv: None,
+                dv_cardinality: None,
+            })
+            .build();
+        let root_node = build_node(vec![manifest_entry], 1, &table_root_url, &engine)?;
+
+        // Read the root node and verify the DataManifest entry has no tags (it points to a
+        // manifest, not a data file; tags only live on Data entries in leaf manifests).
+        let root_entries = root_node.entries()?;
+        assert_eq!(root_entries.len(), 1);
+        assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
+        assert!(root_entries[0].tags.is_none());
+
+        // Open the leaf manifest directly and verify the Data entry's tags are preserved.
+        let leaf_path = absolute_to_relative_path(&leaf_url, &table_root_url);
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &leaf_url,
+            leaf_path,
+            None,
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let leaf_node_read =
+            ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root_url)?;
+        let leaf_entries = leaf_node_read.entries()?;
+        assert_eq!(leaf_entries.len(), 1);
+        assert_eq!(leaf_entries[0].tags, Some(tags));
 
         Ok(())
     }

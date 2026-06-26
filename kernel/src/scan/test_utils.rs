@@ -91,6 +91,21 @@ pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineD
     ArrowEngineData::try_from_engine_data(parsed).unwrap()
 }
 
+// Generates a batch with one add action that has one null-valued tag.
+// The add has `tags: {"MY_TAG": "value", "NULL_TAG": null}`.
+pub(crate) fn add_batch_with_null_tag(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    let handler = SyncJsonHandler {};
+    let json_strings: StringArray = vec![
+        r#"{"add":{"path":"part-00000-null-tag.parquet","partitionValues":{},"size":100,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{},\"maxValues\":{},\"nullCount\":{}}","tags":{"MY_TAG":"value","NULL_TAG":null}}}"#,
+        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#,
+    ]
+    .into();
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), output_schema)
+        .unwrap();
+    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+}
+
 // An add batch with a removed file parsed with the schema provided
 pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler {};

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -68,7 +69,7 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (29 total, excluding array types):
+    // The getters are in order of flattened leaf fields (30 total, excluding array types):
     // 0: content_type
     // 1: location
     // 2: file_format
@@ -83,6 +84,7 @@ fn visit_metadata_entry_at<'a>(
     // 28: key_metadata
     // (split_offsets excluded - array type not supported by GetData)
     // (equality_ids excluded - array type not supported by GetData)
+    // 29: tags (last because it is the final non-array leaf in to_schema())
 
     // Extract content_type
     let content_type_int: i32 = getters[0].get(row_index, "content_type")?;
@@ -210,6 +212,9 @@ fn visit_metadata_entry_at<'a>(
 
     // Note: split_offsets and equality_ids are array types not supported by GetData
 
+    // Extract tags (map with nullable values)
+    let tags: Option<HashMap<String, Option<String>>> = getters[29].get_opt(row_index, "tags")?;
+
     Ok(ContentTreeNodeEntry {
         content_type,
         location,
@@ -226,5 +231,6 @@ fn visit_metadata_entry_at<'a>(
         key_metadata: key_metadata_bytes,
         split_offsets: None, // Array type not supported by GetData
         equality_ids: None,  // Array type not supported by GetData
+        tags,
     })
 }
