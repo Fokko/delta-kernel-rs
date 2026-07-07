@@ -69,22 +69,23 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (30 total, excluding array types):
+    // The getters are in order of flattened leaf fields (32 total, excluding array types):
     // 0: content_type
     // 1: location
     // 2: file_format
-    // 3-8: tracking fields (status, snapshot_id, sequence_number, file_sequence_number,
-    // first_row_id, changes_dv) 9-12: deletion_vector fields (location, offset, size_in_bytes,
-    // cardinality) 13: spec_id
-    // 14: sort_order_id
-    // 15: record_count
-    // 16: file_size_in_bytes
+    // 3-10: tracking fields (status, snapshot_id, dv_snapshot_id, sequence_number,
+    // file_sequence_number, first_row_id, deleted_positions, replaced_positions)
+    // 11-14: deletion_vector fields (location, offset, size_in_bytes, cardinality)
+    // 15: spec_id
+    // 16: sort_order_id
+    // 17: record_count
+    // 18: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 17-27: manifest_info fields (11 fields, including dv and dv_cardinality)
-    // 28: key_metadata
+    // 19-29: manifest_info fields (11 fields, including dv and dv_cardinality)
+    // 30: key_metadata
     // (split_offsets excluded - array type not supported by GetData)
     // (equality_ids excluded - array type not supported by GetData)
-    // 29: tags (last because it is the final non-array leaf in to_schema())
+    // 31: tags (last because it is the final non-array leaf in to_schema())
 
     // Extract content_type
     let content_type_int: i32 = getters[0].get(row_index, "content_type")?;
@@ -116,6 +117,7 @@ fn visit_metadata_entry_at<'a>(
         1 => TrackingStatus::Added,
         2 => TrackingStatus::Deleted,
         3 => TrackingStatus::Replaced,
+        4 => TrackingStatus::Modified,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid tracking status value: {}",
@@ -126,32 +128,37 @@ fn visit_metadata_entry_at<'a>(
 
     let tracking_snapshot_id: Option<i64> =
         getters[4].get_opt(row_index, "tracking.snapshot_id")?;
+    let tracking_dv_snapshot_id: Option<i64> =
+        getters[5].get_opt(row_index, "tracking.dv_snapshot_id")?;
     let tracking_sequence_number: Option<i64> =
-        getters[5].get_opt(row_index, "tracking.sequence_number")?;
+        getters[6].get_opt(row_index, "tracking.sequence_number")?;
     let tracking_file_sequence_number: Option<i64> =
-        getters[6].get_opt(row_index, "tracking.file_sequence_number")?;
+        getters[7].get_opt(row_index, "tracking.file_sequence_number")?;
     let tracking_first_row_id: Option<i64> =
-        getters[7].get_opt(row_index, "tracking.first_row_id")?;
-    let tracking_changes_dv: Option<&[u8]> =
-        getters[8].get_opt(row_index, "tracking.changes_dv")?;
-    let tracking_changes_dv_bytes = tracking_changes_dv.map(Bytes::copy_from_slice);
+        getters[8].get_opt(row_index, "tracking.first_row_id")?;
+    let tracking_deleted_positions: Option<&[u8]> =
+        getters[9].get_opt(row_index, "tracking.deleted_positions")?;
+    let tracking_replaced_positions: Option<&[u8]> =
+        getters[10].get_opt(row_index, "tracking.replaced_positions")?;
 
     let tracking = TrackingInfo {
         status: tracking_status,
         snapshot_id: tracking_snapshot_id,
+        dv_snapshot_id: tracking_dv_snapshot_id,
         sequence_number: tracking_sequence_number,
         file_sequence_number: tracking_file_sequence_number,
         first_row_id: tracking_first_row_id,
-        changes_dv: tracking_changes_dv_bytes,
+        deleted_positions: tracking_deleted_positions.map(Bytes::copy_from_slice),
+        replaced_positions: tracking_replaced_positions.map(Bytes::copy_from_slice),
     };
 
     // Extract deletion_vector fields (location, offset, size_in_bytes, cardinality)
-    let dv_location: Option<String> = getters[9].get_opt(row_index, "deletion_vector.location")?;
+    let dv_location: Option<String> = getters[11].get_opt(row_index, "deletion_vector.location")?;
     let deletion_vector = dv_location
         .map(|location| -> DeltaResult<DeletionVectorInfo> {
-            let offset: i64 = getters[10].get(row_index, "deletion_vector.offset")?;
-            let size_in_bytes: i64 = getters[11].get(row_index, "deletion_vector.size_in_bytes")?;
-            let cardinality: i64 = getters[12].get(row_index, "deletion_vector.cardinality")?;
+            let offset: i64 = getters[12].get(row_index, "deletion_vector.offset")?;
+            let size_in_bytes: i64 = getters[13].get(row_index, "deletion_vector.size_in_bytes")?;
+            let cardinality: i64 = getters[14].get(row_index, "deletion_vector.cardinality")?;
             Ok(DeletionVectorInfo {
                 location,
                 offset,
@@ -162,35 +169,35 @@ fn visit_metadata_entry_at<'a>(
         .transpose()?;
 
     // Extract scalar fields
-    let spec_id: i32 = getters[13].get(row_index, "spec_id")?;
-    let sort_order_id: Option<i32> = getters[14].get_opt(row_index, "sort_order_id")?;
-    let record_count: i64 = getters[15].get(row_index, "record_count")?;
-    let file_size_in_bytes: Option<i64> = getters[16].get_opt(row_index, "file_size_in_bytes")?;
+    let spec_id: i32 = getters[15].get(row_index, "spec_id")?;
+    let sort_order_id: Option<i32> = getters[16].get_opt(row_index, "sort_order_id")?;
+    let record_count: i64 = getters[17].get(row_index, "record_count")?;
+    let file_size_in_bytes: Option<i64> = getters[18].get_opt(row_index, "file_size_in_bytes")?;
 
     // content_stats has no fields, so no getters
 
-    // Extract manifest_info fields (11 fields: 17-27, including dv and dv_cardinality)
+    // Extract manifest_info fields (11 fields: 19-29, including dv and dv_cardinality)
     let ms_added_files_count: Option<i32> =
-        getters[17].get_opt(row_index, "manifest_info.added_files_count")?;
+        getters[19].get_opt(row_index, "manifest_info.added_files_count")?;
     let ms_existing_files_count: Option<i32> =
-        getters[18].get_opt(row_index, "manifest_info.existing_files_count")?;
+        getters[20].get_opt(row_index, "manifest_info.existing_files_count")?;
     let ms_deleted_files_count: Option<i32> =
-        getters[19].get_opt(row_index, "manifest_info.deleted_files_count")?;
+        getters[21].get_opt(row_index, "manifest_info.deleted_files_count")?;
     let ms_replaced_files_count: Option<i32> =
-        getters[20].get_opt(row_index, "manifest_info.replaced_files_count")?;
+        getters[22].get_opt(row_index, "manifest_info.replaced_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_info.added_rows_count")?;
+        getters[23].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[22].get_opt(row_index, "manifest_info.existing_rows_count")?;
+        getters[24].get_opt(row_index, "manifest_info.existing_rows_count")?;
     let ms_deleted_rows_count: Option<i64> =
-        getters[23].get_opt(row_index, "manifest_info.deleted_rows_count")?;
+        getters[25].get_opt(row_index, "manifest_info.deleted_rows_count")?;
     let ms_replaced_rows_count: Option<i64> =
-        getters[24].get_opt(row_index, "manifest_info.replaced_rows_count")?;
+        getters[26].get_opt(row_index, "manifest_info.replaced_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[25].get_opt(row_index, "manifest_info.min_sequence_number")?;
-    let ms_dv: Option<&[u8]> = getters[26].get_opt(row_index, "manifest_info.dv")?;
+        getters[27].get_opt(row_index, "manifest_info.min_sequence_number")?;
+    let ms_dv: Option<&[u8]> = getters[28].get_opt(row_index, "manifest_info.dv")?;
     let ms_dv_cardinality: Option<i64> =
-        getters[27].get_opt(row_index, "manifest_info.dv_cardinality")?;
+        getters[29].get_opt(row_index, "manifest_info.dv_cardinality")?;
 
     let manifest_info = ms_added_files_count.map(|added_files_count| ManifestInfo {
         added_files_count,
@@ -207,13 +214,13 @@ fn visit_metadata_entry_at<'a>(
     });
 
     // Extract key_metadata
-    let key_metadata: Option<&[u8]> = getters[28].get_opt(row_index, "key_metadata")?;
+    let key_metadata: Option<&[u8]> = getters[30].get_opt(row_index, "key_metadata")?;
     let key_metadata_bytes = key_metadata.map(Bytes::copy_from_slice);
 
     // Note: split_offsets and equality_ids are array types not supported by GetData
 
     // Extract tags (map with nullable values)
-    let tags: Option<HashMap<String, Option<String>>> = getters[29].get_opt(row_index, "tags")?;
+    let tags: Option<HashMap<String, Option<String>>> = getters[31].get_opt(row_index, "tags")?;
 
     Ok(ContentTreeNodeEntry {
         content_type,

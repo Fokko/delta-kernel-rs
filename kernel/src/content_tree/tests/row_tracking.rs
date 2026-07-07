@@ -43,7 +43,9 @@ fn make_data_entry(path: &str, record_count: i64, status: TrackingStatus) -> Con
             sequence_number: Some(1),
             file_sequence_number: Some(1),
             first_row_id: None,
-            changes_dv: None,
+            dv_snapshot_id: None,
+            deleted_positions: None,
+            replaced_positions: None,
         })
         .record_count(record_count)
         .file_size_in_bytes(1024)
@@ -162,7 +164,9 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
                 sequence_number: None,
                 file_sequence_number: None,
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(300)
             .file_size_in_bytes(4096)
@@ -192,7 +196,9 @@ fn test_first_row_id_combined_manifest_entries_roundtrip() -> DeltaResult<()> {
                 sequence_number: None,
                 file_sequence_number: None,
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(100)
             .file_size_in_bytes(2048)
