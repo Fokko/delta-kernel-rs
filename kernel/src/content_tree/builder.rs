@@ -187,8 +187,12 @@ struct DvCache {
     /// Lazily deserialized manifest_dv (only populated when modified)
     manifest_dv: Option<roaring::RoaringTreemap>,
 
-    /// Changes DV for current commit (always starts empty)
-    changes_dv: roaring::RoaringTreemap,
+    /// Positions deleted in the current commit (always starts empty).
+    deleted_positions: roaring::RoaringTreemap,
+
+    /// Positions replaced (DV changed) in the current commit (always starts empty).
+    // TODO: never populated until DV-change routing lands in a later change.
+    replaced_positions: roaring::RoaringTreemap,
 
     /// Track if this entry was modified (deserialized)
     dirty: bool,
@@ -203,7 +207,8 @@ impl DvCache {
         Self {
             serialized_manifest_dv,
             manifest_dv: None,
-            changes_dv: roaring::RoaringTreemap::new(),
+            deleted_positions: roaring::RoaringTreemap::new(),
+            replaced_positions: roaring::RoaringTreemap::new(),
             dirty: false,
             total_entry_count,
         }
@@ -236,7 +241,7 @@ impl DvCache {
         let manifest_dv = self.manifest_dv.as_mut().ok_or_else(|| {
             Error::generic("Internal bug: manifest_dv not loaded after ensure_manifest_dv_loaded")
         })?;
-        Ok((manifest_dv, &mut self.changes_dv))
+        Ok((manifest_dv, &mut self.deleted_positions))
     }
 }
 
@@ -260,7 +265,7 @@ pub(crate) struct ContentTreeNodeBuilder {
     values_seen: HashSet<String>,
     /// Cached schema with content_stats. Computed lazily on first use.
     cached_schema: OnceLock<SchemaRef>,
-    /// Combined cache for DV bitmaps (manifest_dv + changes_dv)
+    /// Combined cache for DV bitmaps (manifest_dv + deleted_positions)
     /// Keyed by manifest location. Provides O(1) access and lazy deserialization.
     dv_cache: HashMap<String, DvCache>,
     /// Pre-transformed EngineData batches already in ContentTreeNodeEntry schema.
@@ -471,9 +476,16 @@ impl ContentTreeNodeBuilder {
                 }
             }
 
-            // Serialize changes_dv if non-empty
-            if !cache.changes_dv.is_empty() {
-                entry.tracking.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
+            // Serialize deleted_positions if non-empty
+            if !cache.deleted_positions.is_empty() {
+                entry.tracking.deleted_positions =
+                    Some(serialize_roaring_treemap(&cache.deleted_positions)?);
+            }
+
+            // Serialize replaced_positions if non-empty
+            if !cache.replaced_positions.is_empty() {
+                entry.tracking.replaced_positions =
+                    Some(serialize_roaring_treemap(&cache.replaced_positions)?);
             }
 
             // Update tracking based on status
@@ -814,8 +826,9 @@ impl ContentTreeNodeBuilder {
                 let cache = DvCache::new(dv_bytes, total_entry_count);
                 self.dv_cache.insert(location.clone(), cache);
 
-                // Always clear changes_dv from entries (starts empty for new commit)
-                entry.tracking.changes_dv = None;
+                // Always clear per-commit position tracking (starts empty for new commit)
+                entry.tracking.deleted_positions = None;
+                entry.tracking.replaced_positions = None;
             }
         }
 
@@ -1008,8 +1021,8 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_changes_dv` - If true, sets tracking.changes_dv (for actual deletions). If false,
-    ///   only updates manifest_dv (for leaf reorganization).
+    /// * `set_deleted_positions` - If true, records `indices` in tracking.deleted_positions (for
+    ///   actual deletions). If false, only updates manifest_dv (for leaf reorganization).
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -1019,9 +1032,9 @@ impl ContentTreeNodeBuilder {
         &mut self,
         leaf_file_path: &str,
         indices: &roaring::RoaringTreemap,
-        set_changes_dv: bool,
+        set_deleted_positions: bool,
     ) -> DeltaResult<()> {
-        self.delete_indices_from_leaf(leaf_file_path, indices, set_changes_dv)
+        self.delete_indices_from_leaf(leaf_file_path, indices, set_deleted_positions)
     }
 
     /// Core implementation for marking entries in a leaf manifest as deleted.
@@ -1031,13 +1044,14 @@ impl ContentTreeNodeBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_changes_dv` - If true, sets tracking.changes_dv to track this as an actual deletion.
-    ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
+    /// * `set_deleted_positions` - If true, records `indices` in tracking.deleted_positions to
+    ///   track this as an actual deletion. If false (e.g., when moving entries between leaves),
+    ///   only updates manifest_dv.
     fn delete_indices_from_leaf(
         &mut self,
         leaf_file_path: &str,
         indices: &roaring::RoaringTreemap,
-        set_changes_dv: bool,
+        set_deleted_positions: bool,
     ) -> DeltaResult<()> {
         // leaf_file_path is already relative
         // O(1) cache lookup to get/modify bitmaps
@@ -1063,7 +1077,7 @@ impl ContentTreeNodeBuilder {
 
         // Update bitmaps
         *combined_bitmap |= indices;
-        if set_changes_dv {
+        if set_deleted_positions {
             *delta_bitmap |= indices;
         }
 
@@ -1159,6 +1173,13 @@ impl ContentTreeNodeBuilder {
                     replaced_files_count += 1;
                     replaced_rows_count += entry.record_count;
                 }
+                // A Modified entry is a live file whose deletion vector changed; it contributes
+                // its rows, so it is tallied with Existing entries. Not produced until the
+                // DV-change flow lands in a later change.
+                TrackingStatus::Modified => {
+                    existing_files_count += 1;
+                    existing_rows_count += entry.record_count;
+                }
             }
         }
 
@@ -1212,7 +1233,9 @@ impl ContentTreeNodeBuilder {
                     file_sequence_number: Some(self.version as i64),
                     // Set to the starting row ID used for data entries in this leaf
                     first_row_id: Some(starting_first_row_id),
-                    changes_dv: None,
+                    dv_snapshot_id: None,
+                    deleted_positions: None,
+                    replaced_positions: None,
                 })
                 .record_count(record_count)
                 .file_size_in_bytes(manifest_file_size)
@@ -1936,10 +1959,12 @@ fn build_content_tree_entry_expression(
     let tracking = Expression::struct_from([
         Expression::literal(Scalar::Integer(projections.status as i32)),
         Expression::literal(Scalar::Long(projections.snapshot_id)),
-        projections.sequence_number.clone(), // dataSequenceNumber
-        projections.sequence_number.clone(), // fileSequenceNumber
+        Expression::null_literal(DataType::LONG), // dvSnapshotId
+        projections.sequence_number.clone(),      // dataSequenceNumber
+        projections.sequence_number.clone(),      // fileSequenceNumber
         Expression::null_literal(DataType::LONG), // firstRowId
-        Expression::null_literal(DataType::BINARY), // changesDv
+        Expression::null_literal(DataType::BINARY), // deletedPositions
+        Expression::null_literal(DataType::BINARY), // replacedPositions
     ]);
 
     let field_exprs: Vec<Arc<Expression>> = output_schema
@@ -2575,8 +2600,8 @@ mod tests {
     }
 
     // TODO: Add tests for all tracking columns (status, snapshot_id, sequence_number,
-    // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
-    // build operations for ADDED, DELETED, and EXISTED manifests.
+    // file_sequence_number, first_row_id, deleted_positions, replaced_positions) to verify they
+    // are correctly set during build operations for ADDED, DELETED, and EXISTED manifests.
 
     #[test]
     fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
@@ -3998,7 +4023,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_changes_dv_clearing() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_tracking_deleted_positions_clearing() -> Result<(), Box<dyn std::error::Error>> {
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
@@ -4033,7 +4058,8 @@ mod tests {
         indices_v1.extend([2u64, 5]);
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices_v1, true)?;
 
-        // Step 3: Build, write, and read back the root to verify changes_dv from first commit
+        // Step 3: Build, write, and read back the root to verify deleted_positions from first
+        // commit
         let entries_v1 = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest_v1 = entries_v1
             .iter()
@@ -4049,19 +4075,19 @@ mod tests {
         assert!(cumulative_v1.contains(5));
         assert_eq!(cumulative_v1.len(), 2);
 
-        // Verify changes_dv contains both deletions from this commit (2 and 5)
-        let changes_dv_v1 = manifest_v1
+        // Verify deleted_positions contains both deletions from this commit (2 and 5)
+        let deleted_positions_v1 = manifest_v1
             .tracking
-            .changes_dv
+            .deleted_positions
             .as_ref()
-            .expect("changes_dv should exist");
-        let delta_v1 = RoaringTreemap::deserialize_from(&changes_dv_v1[4..])?;
+            .expect("deleted_positions should exist");
+        let delta_v1 = RoaringTreemap::deserialize_from(&deleted_positions_v1[4..])?;
         assert!(delta_v1.contains(2));
         assert!(delta_v1.contains(5));
         assert_eq!(delta_v1.len(), 2);
 
         // Step 4: Start a new commit (v2) by loading v1 entries
-        // Note: changes_dv is automatically cleared when entries are added
+        // Note: deleted_positions is automatically cleared when entries are added
         let mut root_builder_v2 =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 2, test_table_schema());
         for entry in entries_v1 {
@@ -4073,7 +4099,8 @@ mod tests {
         indices_v2.extend([3u64, 7]);
         root_builder_v2.delete_multiple_from_leaf(&leaf_path, &indices_v2, true)?;
 
-        // Build, write, and read back the root to verify changes_dv only contains NEW deletions
+        // Build, write, and read back the root to verify deleted_positions only contains NEW
+        // deletions
         let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, 2)?;
         let manifest_v2 = entries_v2
             .iter()
@@ -4091,13 +4118,13 @@ mod tests {
         assert!(cumulative_v2.contains(7));
         assert_eq!(cumulative_v2.len(), 4);
 
-        // Verify changes_dv ONLY contains NEW deletions from v2 (3 and 7)
-        let changes_dv_v2 = manifest_v2
+        // Verify deleted_positions ONLY contains NEW deletions from v2 (3 and 7)
+        let deleted_positions_v2 = manifest_v2
             .tracking
-            .changes_dv
+            .deleted_positions
             .as_ref()
-            .expect("changes_dv should exist");
-        let delta_v2 = RoaringTreemap::deserialize_from(&changes_dv_v2[4..])?;
+            .expect("deleted_positions should exist");
+        let delta_v2 = RoaringTreemap::deserialize_from(&deleted_positions_v2[4..])?;
         assert!(
             !delta_v2.contains(2),
             "Old deletion (2) should NOT be in delta"
@@ -4115,7 +4142,7 @@ mod tests {
         );
 
         // Step 8: Start a new commit (v3) by loading v2 entries
-        // Note: changes_dv is automatically cleared when entries are added
+        // Note: deleted_positions is automatically cleared when entries are added
         let mut root_builder_v3 =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 3, test_table_schema());
         for entry in entries_v2 {
@@ -4127,7 +4154,8 @@ mod tests {
         indices_v3.insert(8u64);
         root_builder_v3.delete_multiple_from_leaf(&leaf_path, &indices_v3, true)?;
 
-        // Build, write, and read back the root to verify changes_dv only contains NEW deletion
+        // Build, write, and read back the root to verify deleted_positions only contains NEW
+        // deletion
         let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, 3)?;
         let manifest_v3 = entries_v3
             .iter()
@@ -4146,13 +4174,13 @@ mod tests {
         assert!(cumulative_v3.contains(8));
         assert_eq!(cumulative_v3.len(), 5);
 
-        // Verify changes_dv ONLY contains NEW deletion from v3 (8)
-        let changes_dv_v3 = manifest_v3
+        // Verify deleted_positions ONLY contains NEW deletion from v3 (8)
+        let deleted_positions_v3 = manifest_v3
             .tracking
-            .changes_dv
+            .deleted_positions
             .as_ref()
-            .expect("changes_dv should exist");
-        let delta_v3 = RoaringTreemap::deserialize_from(&changes_dv_v3[4..])?;
+            .expect("deleted_positions should exist");
+        let delta_v3 = RoaringTreemap::deserialize_from(&deleted_positions_v3[4..])?;
         assert!(
             !delta_v3.contains(2),
             "Old deletion (2) should NOT be in delta"
@@ -4177,7 +4205,7 @@ mod tests {
         );
 
         // Step 11: Start a new commit (v4) by loading v3 entries
-        // Note: changes_dv is automatically cleared when entries are added
+        // Note: deleted_positions is automatically cleared when entries are added
         let mut root_builder_v4 =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 4, test_table_schema());
         for entry in entries_v3 {
@@ -4193,7 +4221,7 @@ mod tests {
             .build();
         root_builder_v4.add_entry(new_data_entry);
 
-        // Build, write, and read back the root to verify changes_dv is None (no deletions)
+        // Build, write, and read back the root to verify deleted_positions is None (no deletions)
         let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, 4)?;
         let manifest_v4 = entries_v4
             .iter()
@@ -4211,18 +4239,18 @@ mod tests {
             "manifest_dv should still have 5 deletions"
         );
 
-        // Verify changes_dv is None since no deletions were made in v4
+        // Verify deleted_positions is None since no deletions were made in v4
         assert!(
-            manifest_v4.tracking.changes_dv.is_none(),
-            "changes_dv should be None when no deletions are made"
+            manifest_v4.tracking.deleted_positions.is_none(),
+            "deleted_positions should be None when no deletions are made"
         );
 
         Ok(())
     }
 
     #[test]
-    fn test_leaf_reorganization_does_not_set_changes_dv() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_leaf_reorganization_does_not_set_deleted_positions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
@@ -4250,7 +4278,7 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
-        // with set_changes_dv=false (simulating moving entries to a different leaf)
+        // with set_deleted_positions=false (simulating moving entries to a different leaf)
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
@@ -4259,11 +4287,12 @@ mod tests {
         indices.insert(2);
         indices.insert(3);
 
-        // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
+        // Call delete_multiple_from_leaf with set_deleted_positions=false to simulate leaf
+        // reorganization
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
-        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf
-        // reorganization
+        // Step 3: Build, write, and read back the root to verify deleted_positions is NOT set for
+        // leaf reorganization
         let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()
@@ -4279,10 +4308,11 @@ mod tests {
         assert!(cumulative.contains(3));
         assert_eq!(cumulative.len(), 2);
 
-        // Verify changes_dv is NOT set since this was leaf reorganization, not actual deletion
+        // Verify deleted_positions is NOT set since this was leaf reorganization, not actual
+        // deletion
         assert!(
-            manifest.tracking.changes_dv.is_none(),
-            "changes_dv should NOT be set for leaf reorganization (set_changes_dv=false)"
+            manifest.tracking.deleted_positions.is_none(),
+            "deleted_positions should NOT be set for leaf reorganization (set_deleted_positions=false)"
         );
 
         Ok(())
@@ -4545,7 +4575,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(record_count)
             .file_size_in_bytes(1024)
@@ -4566,7 +4598,9 @@ mod tests {
                 sequence_number: None,
                 file_sequence_number: None,
                 first_row_id,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(added_rows + existing_rows)
             .file_size_in_bytes(2048)
@@ -4816,7 +4850,9 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
-                    changes_dv: None,
+                    dv_snapshot_id: None,
+                    deleted_positions: None,
+                    replaced_positions: None,
                 })
                 .record_count(50)
                 .file_size_in_bytes(512)
@@ -4833,7 +4869,9 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
-                    changes_dv: None,
+                    dv_snapshot_id: None,
+                    deleted_positions: None,
+                    replaced_positions: None,
                 })
                 .record_count(25)
                 .file_size_in_bytes(256)

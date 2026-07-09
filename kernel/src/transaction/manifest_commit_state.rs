@@ -500,7 +500,8 @@ impl ManifestCommitState {
         for dv_path in &self.aggregated_root_dv_actions {
             builder.remove_dv(dv_path.as_str())?;
         }
-        // set_changes_dv=false because this is leaf reorganization, not actual user-facing deletion
+        // set_deleted_positions=false because this is leaf reorganization, not actual user-facing
+        // deletion
         for (manifest_path, entry_indices) in &self.aggregated_manifest_dvs {
             builder.delete_multiple_from_leaf(manifest_path, entry_indices, false)?;
         }

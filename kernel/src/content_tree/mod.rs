@@ -1736,10 +1736,12 @@ pub(crate) fn metadata_entry_to_scalars(
                 let values = vec![
                     Scalar::from(ti.status),
                     Scalar::from(ti.snapshot_id),
+                    Scalar::from(ti.dv_snapshot_id),
                     Scalar::from(ti.sequence_number),
                     Scalar::from(ti.file_sequence_number),
                     Scalar::from(ti.first_row_id),
-                    Scalar::from(ti.changes_dv.clone()),
+                    Scalar::from(ti.deleted_positions.clone()),
+                    Scalar::from(ti.replaced_positions.clone()),
                 ];
                 Scalar::Struct(StructData::new_unchecked(struct_fields, values))
             }
@@ -1917,6 +1919,7 @@ pub enum TrackingStatus {
     Added = 1,
     Deleted = 2,
     Replaced = 3,
+    Modified = 4,
 }
 
 impl ToDataType for TrackingStatus {
@@ -1962,6 +1965,10 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
+    /// Snapshot ID in which this entry's deletion vector last changed. Set on Modified entries.
+    #[field_id = 5]
+    pub(crate) dv_snapshot_id: Option<i64>,
+
     /// Data sequence number of the file. Inherited in when null and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
     /// Must be written in the root file.
@@ -1979,12 +1986,15 @@ pub struct TrackingInfo {
     #[field_id = 142]
     pub(crate) first_row_id: Option<i64>,
 
-    /// Deletion vector tracking changes made in the current commit for manifest entries.
-    /// Only used when content_type is DataManifest or DeleteManifest.
-    /// This field tracks what was added/changed in the current commit and is cleared between
+    /// Positions deleted from this manifest in the current commit. Cleared between commits.
+    #[field_id = 6]
+    pub(crate) deleted_positions: Option<Bytes>,
+
+    /// Positions replaced (DV changed) in this manifest in the current commit. Cleared between
     /// commits.
-    #[field_id = 153]
-    pub(crate) changes_dv: Option<Bytes>,
+    // TODO: always null until DvCache tracks replaced positions in a later change.
+    #[field_id = 7]
+    pub(crate) replaced_positions: Option<Bytes>,
 }
 
 impl TrackingInfo {
@@ -2252,7 +2262,9 @@ impl ContentTreeNodeEntryBuilder {
                 sequence_number: None,
                 file_sequence_number: None,
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             },
             deletion_vector: None,
             spec_id: 0,
@@ -2285,10 +2297,12 @@ impl ContentTreeNodeEntryBuilder {
         self.tracking = TrackingInfo {
             status,
             snapshot_id: Some(snapshot_id),
+            dv_snapshot_id: None,
             sequence_number: Some(entry_version as i64),
             file_sequence_number: Some(entry_version as i64),
             first_row_id: None,
-            changes_dv: None,
+            deleted_positions: None,
+            replaced_positions: None,
         };
         self
     }
@@ -2650,7 +2664,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -2990,8 +3006,8 @@ mod tests {
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // 32 leaf fields (6 tracking + 4 deletion_vector + 11 manifest_info + 11 other)
-        assert_eq!(leaf_names.len(), 32);
+        // 34 leaf fields (8 tracking + 4 deletion_vector + 11 manifest_info + 11 other)
+        assert_eq!(leaf_names.len(), 34);
     }
 
     #[test]
@@ -3330,7 +3346,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -3391,7 +3409,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -3525,7 +3545,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(500)
@@ -3669,10 +3691,14 @@ mod tests {
             "tracking.first_row_id mismatch"
         );
 
-        // Compare changes_dv
+        // Compare per-commit position tracking
         assert_eq!(
-            expected.tracking.changes_dv, actual.tracking.changes_dv,
-            "changes_dv mismatch"
+            expected.tracking.deleted_positions, actual.tracking.deleted_positions,
+            "deleted_positions mismatch"
+        );
+        assert_eq!(
+            expected.tracking.replaced_positions, actual.tracking.replaced_positions,
+            "replaced_positions mismatch"
         );
 
         assert_eq!(expected.spec_id, actual.spec_id, "spec_id mismatch");
@@ -3717,7 +3743,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -3825,6 +3853,9 @@ mod tests {
         // snapshotId: #[field_id = 1]
         assert_field_id(&tracking_schema, "snapshotId", 1);
 
+        // dvSnapshotId: #[field_id = 5]
+        assert_field_id(&tracking_schema, "dvSnapshotId", 5);
+
         // sequenceNumber: #[field_id = 3]
         assert_field_id(&tracking_schema, "sequenceNumber", 3);
 
@@ -3834,8 +3865,11 @@ mod tests {
         // firstRowId: #[field_id = 142]
         assert_field_id(&tracking_schema, "firstRowId", 142);
 
-        // changesDv: #[field_id = 153]
-        assert_field_id(&tracking_schema, "changesDv", 153);
+        // deletedPositions: #[field_id = 6]
+        assert_field_id(&tracking_schema, "deletedPositions", 6);
+
+        // replacedPositions: #[field_id = 7]
+        assert_field_id(&tracking_schema, "replacedPositions", 7);
 
         // Verify ManifestInfo field IDs
         let manifest_info_schema = ManifestInfo::to_schema();
@@ -4004,7 +4038,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -4037,7 +4073,9 @@ mod tests {
                 sequence_number: Some(500),
                 file_sequence_number: Some(600),
                 first_row_id: Some(5000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .spec_id(1)
             .sort_order_id(1)
@@ -4071,7 +4109,9 @@ mod tests {
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .spec_id(2)
             .sort_order_id(2)
@@ -4116,7 +4156,9 @@ mod tests {
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -4169,7 +4211,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -4183,7 +4227,9 @@ mod tests {
                 sequence_number: Some(500),
                 file_sequence_number: Some(600),
                 first_row_id: Some(5000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .spec_id(1)
             .sort_order_id(1)
@@ -4198,7 +4244,9 @@ mod tests {
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .spec_id(2)
             .sort_order_id(2)
@@ -4224,7 +4272,9 @@ mod tests {
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -4283,7 +4333,9 @@ mod tests {
                         sequence_number: Some((i * 100) as i64),
                         file_sequence_number: Some((i * 200) as i64),
                         first_row_id: Some((i * 1000) as i64),
-                        changes_dv: None,
+                        dv_snapshot_id: None,
+                        deleted_positions: None,
+                        replaced_positions: None,
                     })
                     .spec_id(i as i32)
                     .sort_order_id(i as i32)
@@ -4331,7 +4383,9 @@ mod tests {
                         sequence_number: Some((i * 100) as i64),
                         file_sequence_number: Some((i * 200) as i64),
                         first_row_id: Some((i * 1000) as i64),
-                        changes_dv: None,
+                        dv_snapshot_id: None,
+                        deleted_positions: None,
+                        replaced_positions: None,
                     })
                     .sort_order_id(0)
                     .record_count(42)
@@ -4538,7 +4592,9 @@ mod tests {
                 sequence_number: Some(5),
                 file_sequence_number: Some(5),
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -4564,7 +4620,8 @@ mod tests {
         assert_eq!(ti.sequence_number, Some(5));
         assert_eq!(ti.file_sequence_number, Some(5));
         assert_eq!(ti.first_row_id, Some(0));
-        assert!(ti.changes_dv.is_none());
+        assert!(ti.deleted_positions.is_none());
+        assert!(ti.replaced_positions.is_none());
         assert!(actual
             .manifest_info
             .as_ref()
@@ -4593,7 +4650,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -4634,7 +4693,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(10)
             .file_size_in_bytes(1024)
@@ -4654,7 +4715,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(10)
             .file_size_in_bytes(1024)
@@ -4717,7 +4780,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(42)
@@ -4818,7 +4883,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(10)
             .build();
@@ -4890,7 +4957,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -4941,7 +5010,9 @@ mod tests {
                 sequence_number: Some(42),
                 file_sequence_number: Some(42),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -4996,7 +5067,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .deletion_vector(DeletionVectorInfo {
                 location: dv_location.to_string(),
@@ -5054,7 +5127,9 @@ mod tests {
                 sequence_number: Some(50),
                 file_sequence_number: Some(50),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5106,7 +5181,9 @@ mod tests {
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5160,7 +5237,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .deletion_vector(DeletionVectorInfo {
                 location: dv_loc1.to_string(),
@@ -5180,7 +5259,9 @@ mod tests {
                 sequence_number: Some(200),
                 file_sequence_number: Some(200),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .deletion_vector(DeletionVectorInfo {
                 location: dv_loc2.to_string(),
@@ -5261,7 +5342,9 @@ mod tests {
                 sequence_number: Some(50),
                 file_sequence_number: Some(50),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5314,7 +5397,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(10)
             .file_size_in_bytes(512)
@@ -5369,7 +5454,9 @@ mod tests {
                     sequence_number: Some(100),
                     file_sequence_number: Some(100),
                     first_row_id: Some(0),
-                    changes_dv: None,
+                    dv_snapshot_id: None,
+                    deleted_positions: None,
+                    replaced_positions: None,
                 })
                 .record_count(100)
                 .file_size_in_bytes(1024)
@@ -5421,7 +5508,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(100)
             .file_size_in_bytes(1024)
@@ -5461,7 +5550,9 @@ mod tests {
                 sequence_number: Some(50),
                 file_sequence_number: Some(50),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5475,7 +5566,9 @@ mod tests {
                 sequence_number: Some(60),
                 file_sequence_number: Some(60),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5501,7 +5594,9 @@ mod tests {
                 sequence_number: Some(70),
                 file_sequence_number: Some(70),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5515,7 +5610,9 @@ mod tests {
                 sequence_number: Some(80),
                 file_sequence_number: Some(80),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(100)
@@ -5541,7 +5638,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(100)
             .file_size_in_bytes(1024)
@@ -5564,7 +5663,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(100)
             .file_size_in_bytes(1024)
@@ -6155,7 +6256,9 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .sort_order_id(0)
             .record_count(RECORD_COUNT)
@@ -6270,7 +6373,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(10)
             .file_size_in_bytes(512)
@@ -6284,7 +6389,9 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
-                changes_dv: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
             })
             .record_count(5)
             .file_size_in_bytes(256)
