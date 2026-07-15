@@ -102,6 +102,7 @@ pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl AddVisitor {
     #[internal_api]
     fn visit_add<'a>(
@@ -155,6 +156,7 @@ impl AddVisitor {
     }
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl RowVisitor for AddVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
@@ -177,6 +179,7 @@ pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl RemoveVisitor {
     #[internal_api]
     pub(crate) fn visit_remove<'a>(
@@ -238,6 +241,7 @@ impl RemoveVisitor {
     }
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl RowVisitor for RemoveVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
@@ -260,6 +264,7 @@ pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl CdcVisitor {
     #[internal_api]
     pub(crate) fn visit_cdc<'a>(
@@ -277,6 +282,7 @@ impl CdcVisitor {
     }
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 impl RowVisitor for CdcVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =

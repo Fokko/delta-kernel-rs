@@ -538,7 +538,7 @@ impl ContentTreeNodeBuilder {
         let absolute_url = base_url.join(path).map_err(|e| {
             crate::Error::generic(format!(
                 "Failed to join path '{}' with table root '{}': {}",
-                path, &self.table_root, e
+                path, self.table_root, e
             ))
         })?;
 
