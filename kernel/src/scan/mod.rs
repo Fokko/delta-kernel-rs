@@ -16,7 +16,8 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, ADD_NAME, REMOVE_NAME, SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, BackReference, ADD_NAME, REMOVE_NAME,
+    SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -470,8 +471,7 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
             StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
             StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-            StructField::nullable("dataManifestPath", DataType::STRING),
-            StructField::nullable("dataManifestPosition", DataType::LONG),
+            StructField::nullable("backReference", BackReference::nullable_schema()),
         ]),
     )])
     .into()
@@ -731,8 +731,7 @@ impl Scan {
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
                     StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-                    StructField::nullable("dataManifestPath", DataType::STRING),
-                    StructField::nullable("dataManifestPosition", DataType::LONG),
+                    StructField::nullable("backReference", BackReference::nullable_schema()),
                 ]),
             )])
         });
@@ -1180,8 +1179,10 @@ impl Scan {
 ///      defaultRowCommitVersion: long,
 ///      tags: map<string, string>,
 ///      clusteringProvider: string,
-///      dataManifestPath: string,
-///      dataManifestPosition: long,
+///      backReference: {
+///        manifest: string,
+///        pos: long,
+///      },
 ///    },
 ///    numRecords: long,
 /// }

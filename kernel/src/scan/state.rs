@@ -11,6 +11,7 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::actions::BackReference;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
@@ -127,10 +128,8 @@ pub struct ScanFile {
     pub transform: Option<ExpressionRef>,
     /// a `HashMap<String, String>` which map partition names to the value they have in this file
     pub partition_values: HashMap<String, String>,
-    /// Path to the data manifest file containing this entry (if from a leaf manifest)
-    pub data_manifest_path: Option<String>,
-    /// Position of this entry within the data manifest file
-    pub data_manifest_position: Option<i64>,
+    /// Reference to this file's entry in the metadata tree, if present.
+    pub back_reference: Option<BackReference>,
 }
 
 pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
@@ -227,12 +226,12 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                 let partition_values =
                     getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
 
-                // Extract manifest location fields from file constant values
-                let data_manifest_path: Option<String> = getters[14]
-                    .get_opt(row_index, "scanFile.fileConstantValues.dataManifestPath")?;
-                let data_manifest_position: Option<i64> = getters[15].get_opt(
+                // Extract back reference from file constant values
+                let back_reference = crate::actions::visitors::visit_back_reference_at(
                     row_index,
-                    "scanFile.fileConstantValues.dataManifestPosition",
+                    &getters[14..16],
+                    "scanFile.fileConstantValues.backReference.manifest",
+                    "scanFile.fileConstantValues.backReference.pos",
                 )?;
 
                 let scan_file = ScanFile {
@@ -243,8 +242,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                     dv_info,
                     transform: get_transform_for_row(row_index, self.transforms),
                     partition_values,
-                    data_manifest_path,
-                    data_manifest_position,
+                    back_reference,
                 };
                 (self.callback)(&mut self.context, scan_file)
             }

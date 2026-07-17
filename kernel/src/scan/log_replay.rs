@@ -10,6 +10,7 @@ use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::BackReference;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
@@ -567,8 +568,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
             ),
         ),
         StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-        StructField::nullable("dataManifestPath", DataType::STRING),
-        StructField::nullable("dataManifestPosition", DataType::LONG),
+        StructField::nullable("backReference", BackReference::nullable_schema()),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -658,8 +658,10 @@ fn get_add_transform_expr(
             column_expr_ref!("add.defaultRowCommitVersion"),
             column_expr_ref!("add.tags"),
             column_expr_ref!("add.clusteringProvider"),
-            column_expr_ref!("add.dataManifestPath"),
-            column_expr_ref!("add.dataManifestPosition"),
+            Arc::new(Expression::struct_from([
+                column_expr_ref!("add.backReference.manifest"),
+                column_expr_ref!("add.backReference.pos"),
+            ])),
         ])),
         num_records_expr,
     ];
@@ -708,8 +710,10 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("fileConstantValues.baseRowId"),
                 column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
                 column_expr_ref!("fileConstantValues.clusteringProvider"),
-                column_expr_ref!("fileConstantValues.dataManifestPath"),
-                column_expr_ref!("fileConstantValues.dataManifestPosition"),
+                Arc::new(Expression::struct_from([
+                    column_expr_ref!("fileConstantValues.backReference.manifest"),
+                    column_expr_ref!("fileConstantValues.backReference.pos"),
+                ])),
             ]),
         )]))
     });

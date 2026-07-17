@@ -499,10 +499,10 @@ impl ContentTreeNode {
 
             // Add-specific fields
             "modificationTime" if action_name == "add" => Expression::literal(i64::MIN),
-            "dataManifestPath" if action_name == "add" => {
-                Expression::literal(path_in_log.to_string())
-            }
-            "dataManifestPosition" if action_name == "add" => Expression::column(["_pos"]),
+            "backReference" if action_name == "add" => Expression::struct_from([
+                Expression::literal(path_in_log.to_string()),
+                Expression::column(["_pos"]),
+            ]),
             "clusteringProvider" if action_name == "add" => {
                 Expression::null_literal(DataType::STRING)
             }
@@ -1484,7 +1484,7 @@ impl ContentTreeNode {
             let base_schema = ContentTreeNodeEntry::to_schema();
             let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
 
-            // Add _pos metadata column to track row indices (needed for data_manifest_position)
+            // Add _pos metadata column to track row indices (needed for backReference.pos)
             fields.push(StructField::create_metadata_column(
                 "_pos",
                 MetadataColumnSpec::RowIndex,
@@ -1502,7 +1502,7 @@ impl ContentTreeNode {
             let schema_with_stats =
                 ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss, partition_type)?;
             let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
-            // Add _pos metadata column to track row indices (needed for data_manifest_position)
+            // Add _pos metadata column to track row indices (needed for backReference.pos)
             fields.push(StructField::create_metadata_column(
                 "_pos",
                 MetadataColumnSpec::RowIndex,
@@ -1513,7 +1513,7 @@ impl ContentTreeNode {
 
             let base = ContentTreeNodeEntry::to_schema_with_partition(partition_type);
             let mut fields: Vec<StructField> = base.fields().cloned().collect();
-            // Add _pos metadata column to track row indices (needed for data_manifest_position)
+            // Add _pos metadata column to track row indices (needed for backReference.pos)
             fields.push(StructField::create_metadata_column(
                 "_pos",
                 MetadataColumnSpec::RowIndex,
@@ -2443,7 +2443,7 @@ impl ContentTreeNodeEntry {
         };
 
         let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
-        // Add _pos metadata column to track row indices (needed for data_manifest_position)
+        // Add _pos metadata column to track row indices (needed for backReference.pos)
         fields.push(StructField::create_metadata_column(
             "_pos",
             MetadataColumnSpec::RowIndex,
@@ -5948,11 +5948,9 @@ mod tests {
             locations: &mut Vec<(String, String, i64)>,
             scan_file: crate::scan::state::ScanFile,
         ) {
-            if let (Some(manifest_path), Some(index)) = (
-                scan_file.data_manifest_path,
-                scan_file.data_manifest_position,
-            ) {
-                locations.push((scan_file.path, manifest_path, index));
+            if let Some(crate::actions::BackReference { manifest, pos }) = scan_file.back_reference
+            {
+                locations.push((scan_file.path, manifest, pos));
             }
         }
 

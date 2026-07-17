@@ -5,21 +5,23 @@ use std::sync::LazyLock;
 
 use roaring::RoaringTreemap;
 
+use crate::actions::visitors::visit_back_reference_at;
+use crate::actions::BackReference;
 use crate::engine_data::{EngineData, GetData, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::DataType;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{DeltaResult, RowVisitor};
 
 // Columns needed to process scan metadata for remove actions (manifest commit path only).
-// Indices: path=0, dv_path_or_inline=1, data_manifest_path=2, data_manifest_position=3
+// Indices: path=0, dv_path_or_inline=1, back_reference.manifest=2, back_reference.pos=3
 pub(super) static REMOVE_SCAN_COLUMNS: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
     LazyLock::new(|| {
         (
             vec![
                 column_name!("path"),
                 column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
+                column_name!("fileConstantValues.backReference.manifest"),
+                column_name!("fileConstantValues.backReference.pos"),
             ],
             vec![
                 DataType::STRING,
@@ -69,35 +71,31 @@ impl<'a, F: FnMut(&str, Option<&str>) -> DeltaResult<()>> RowVisitor
                 continue;
             };
             let dv_path: Option<String> = getters[1].get_opt(i, "deletionVector.pathOrInlineDv")?;
-            let data_manifest_path: Option<String> =
-                getters[2].get_opt(i, "fileConstantValues.dataManifestPath")?;
-            let data_manifest_position: Option<i64> =
-                getters[3].get_opt(i, "fileConstantValues.dataManifestPosition")?;
+            let back_reference = visit_back_reference_at(
+                i,
+                &getters[2..4],
+                "fileConstantValues.backReference.manifest",
+                "fileConstantValues.backReference.pos",
+            )?;
 
-            // Invariant: path and position must be present together or absent together.
-            if data_manifest_path.is_some() != data_manifest_position.is_some() {
-                return Err(Error::missing_data(format!(
-                    "data_manifest_path and data_manifest_position must both be present or \
-                     absent for entry: {path}"
-                )));
-            }
-
-            // Determine file location from data_manifest_path:
-            //   - data_manifest_path differs from root -> file lives in a leaf manifest
-            //   - data_manifest_path equals root -> file is in the root manifest
-            //   - data_manifest_path is None -> file predates the content tree (no tracking)
-            match (data_manifest_path.as_deref(), data_manifest_position) {
-                (Some(mp), Some(pos)) if self.root_manifest_path != Some(mp) => {
+            // Determine file location from back_reference:
+            //   - manifest differs from root -> file lives in a leaf manifest
+            //   - manifest equals root -> file is in the root manifest
+            //   - back_reference is None -> file predates the content tree (no tracking)
+            match back_reference {
+                Some(BackReference { manifest, pos })
+                    if self.root_manifest_path != Some(&manifest) =>
+                {
                     self.leaf_deletions
-                        .entry(mp.to_owned())
+                        .entry(manifest)
                         .or_default()
                         .insert(pos as u64);
                 }
-                (Some(_), _) => {
+                Some(_) => {
                     (self.on_root_deletion)(&path, dv_path.as_deref())?;
                 }
-                _ => {
-                    // data_manifest_path is absent: either this is the first manifest commit
+                None => {
+                    // back_reference is absent: either this is the first manifest commit
                     // and the file was added then removed in the same transaction, or the
                     // remove cancels a file not yet written to any leaf. Nothing to do.
                 }
@@ -114,8 +112,8 @@ static DV_UPDATE_DECISION_COLUMNS: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
         (
             vec![
                 column_name!("path"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
+                column_name!("fileConstantValues.backReference.manifest"),
+                column_name!("fileConstantValues.backReference.pos"),
             ],
             vec![DataType::STRING, DataType::STRING, DataType::LONG],
         )
@@ -136,8 +134,8 @@ pub(super) struct DvUpdateDecisions {
     pub(super) leaf_only_selection: Vec<bool>,
 }
 
-/// Walks the path + data_manifest_path/position columns of a DV-matched scan batch and
-/// returns the per-batch classification used by the DV-update flow.
+/// Walks the path + back_reference columns of a DV-matched scan batch and returns the per-batch
+/// classification used by the DV-update flow.
 pub(super) fn collect_dv_update_decisions(
     data: &dyn EngineData,
     selection_vector: &[bool],
@@ -181,34 +179,30 @@ impl RowVisitor for DvUpdateDecisionVisitor<'_> {
                 self.decisions.leaf_only_selection[i] = false;
                 continue;
             };
-            let data_manifest_path: Option<String> =
-                getters[1].get_opt(i, "fileConstantValues.dataManifestPath")?;
-            let data_manifest_position: Option<i64> =
-                getters[2].get_opt(i, "fileConstantValues.dataManifestPosition")?;
+            let back_reference = visit_back_reference_at(
+                i,
+                &getters[1..3],
+                "fileConstantValues.backReference.manifest",
+                "fileConstantValues.backReference.pos",
+            )?;
 
-            // Invariant: path and position must be present together or absent together.
-            if data_manifest_path.is_some() != data_manifest_position.is_some() {
-                return Err(Error::missing_data(format!(
-                    "data_manifest_path and data_manifest_position must both be present or \
-                     absent for entry: {path}"
-                )));
-            }
-
-            match (data_manifest_path.as_deref(), data_manifest_position) {
-                (Some(mp), Some(pos)) if self.root_manifest_path != Some(mp) => {
+            match back_reference {
+                Some(BackReference { manifest, pos })
+                    if self.root_manifest_path != Some(&manifest) =>
+                {
                     // Leaf-resident: keep bit set; caller deletes from leaf + re-adds to root.
                     self.decisions
                         .leaf_deletions
-                        .entry(mp.to_owned())
+                        .entry(manifest)
                         .or_default()
                         .insert(pos as u64);
                 }
-                (Some(_), _) => {
+                Some(_) => {
                     // Root-resident: caller mutates DV in place. Drop from leaf selection.
                     self.decisions.root_paths.push(path);
                     self.decisions.leaf_only_selection[i] = false;
                 }
-                _ => {
+                None => {
                     // Predates the content tree -- leave bit set; caller handles via re-add.
                 }
             }

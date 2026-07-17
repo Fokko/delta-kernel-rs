@@ -73,7 +73,7 @@ struct SharedEvaluators {
     remove_evaluator_no_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
 }
 
-/// Per-manifest add evaluators (depend on the manifest path literal for `dataManifestPath`).
+/// Per-manifest add evaluators (depend on the manifest path literal for `backReference.manifest`).
 struct ManifestAddEvaluators {
     /// Add evaluator when DV columns are present.
     with_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,

@@ -699,7 +699,7 @@ impl<S> Transaction<S> {
                 .cloned();
 
             // Removes in manifest commit mode require an existing checkpoint action so that every
-            // file carries a data_manifest_path and data_manifest_position (row ID).
+            // file carries a back_reference (manifest path + row position).
             // Without a checkpoint action the scan metadata lacks those fields and we
             // cannot locate entries. TODO: revisit whether removes should be supported
             // for the first manifest commit (e.g. by treating files with no manifest
@@ -2044,15 +2044,15 @@ fn build_remove_transform(
             Some("deletionVector"),
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
-        // Preserve manifest location fields before dropping FILE_CONSTANT_VALUES_NAME.
-        // These fields tell the transaction whether files are in leaf manifests.
+        // Preserve back reference before dropping FILE_CONSTANT_VALUES_NAME.
+        // This tells the transaction whether files are in leaf manifests.
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPath"]).into(),
-        )
-        .with_inserted_field(
-            Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPosition"]).into(),
+            Expression::struct_from([
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "manifest"]),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "pos"]),
+            ])
+            .into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
         .with_dropped_field("modificationTime")
@@ -3101,12 +3101,11 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         }
     }
 
-    /// Tests that removing files with data_manifest_path uses delete_from_leaf properly
+    /// Tests that removing files with a back reference uses delete_from_leaf properly
     /// by verifying through the Scan API that files are removed
     #[test]
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
@@ -3301,8 +3300,7 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         }
     }
 

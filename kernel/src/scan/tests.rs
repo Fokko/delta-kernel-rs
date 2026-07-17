@@ -728,8 +728,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         };
         builder.add(add, 3, 1)?;
 
@@ -1055,8 +1054,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         };
         builder.add(add, 10, 1)?;
 

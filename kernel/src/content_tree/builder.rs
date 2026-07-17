@@ -8,7 +8,7 @@ use url::Url;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 #[cfg(test)]
 use crate::actions::Add;
-use crate::actions::ADD_NAME;
+use crate::actions::{BackReference, ADD_NAME};
 use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
 #[cfg(test)]
 use crate::content_tree::stats::delta_json_stats_to_content_stats;
@@ -1711,7 +1711,7 @@ impl RowVisitor for RecordCountVisitor {
 /// - `add`: `path`, `size`, `defaultRowCommitVersion`, `stats`, `partitionValues`, `tags`,
 ///   `deletionVector` (all 5 DV sub-fields for z85 decode)
 /// - `remove`: `path`, `deletionVector.{storageType, pathOrInlineDv}` (for key dedup),
-///   `dataManifestPath`, `dataManifestPosition` (for leaf-remove accumulation)
+///   `backReference` (for leaf-remove accumulation)
 pub(crate) fn log_replay_schema() -> SchemaRef {
     let add_dv = DataType::Struct(Box::new(StructType::new_unchecked([
         StructField::nullable("storageType", DataType::STRING),
@@ -1745,8 +1745,7 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
             DataType::Struct(Box::new(StructType::new_unchecked([
                 StructField::nullable("path", DataType::STRING),
                 StructField::nullable("deletionVector", remove_dv),
-                StructField::nullable("dataManifestPath", DataType::STRING),
-                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("backReference", BackReference::nullable_schema()),
             ]))),
         ),
     ]))
@@ -2320,8 +2319,8 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
                 (STRING, column_name!("remove.path")),
                 (STRING, column_name!("remove.deletionVector.storageType")),
                 (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
-                (STRING, column_name!("remove.dataManifestPath")),
-                (LONG, column_name!("remove.dataManifestPosition")),
+                (STRING, column_name!("remove.backReference.manifest")),
+                (LONG, column_name!("remove.backReference.pos")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -2361,9 +2360,9 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
                     .insert(FileActionKey::new(path, dv_loc));
                 // Collect leaf removes for post-replay DV bitmap updates.
                 let leaf_path: Option<String> =
-                    getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.dataManifestPath")?;
+                    getters[Self::REM_MANIFEST_PATH].get_opt(i, "remove.backReference.manifest")?;
                 let position: Option<i64> =
-                    getters[Self::REM_MANIFEST_POS].get_opt(i, "remove.dataManifestPosition")?;
+                    getters[Self::REM_MANIFEST_POS].get_opt(i, "remove.backReference.pos")?;
                 if let (Some(leaf_path), Some(pos)) = (leaf_path, position) {
                     let pos = u64::try_from(pos).map_err(|_| {
                         Error::generic(format!("negative manifest position: {pos}"))
@@ -2397,7 +2396,7 @@ impl RowVisitor for LogBatchDedupVisitor<'_> {
 /// - Content root batches (`is_log_batch = false`): entries whose `(path, dv_location)` key was NOT
 ///   seen in a prior log batch are emitted unchanged; seen entries are suppressed.
 ///
-/// Leaf manifest removes (Remove actions with `data_manifest_path + data_manifest_position`) are
+/// Leaf manifest removes (Remove actions with `back_reference`) are
 /// accumulated for a post-replay pass via [`deleted_leaf_positions_by_location`].
 ///
 /// [`deleted_leaf_positions_by_location`]: ContentRootRebuildProcessor::deleted_leaf_positions_by_location
@@ -2847,8 +2846,7 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         };
 
         builder.add(add, 1, 1)?;
@@ -3005,8 +3003,7 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         };
 
         builder.add(add, 1, 1)?;
@@ -3230,8 +3227,7 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         };
 
         builder.add(add, 1, 1)?;
@@ -4514,8 +4510,7 @@ mod tests {
             base_row_id: None,
             default_row_commit_version: None,
             clustering_provider: None,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference: None,
         }
     }
 

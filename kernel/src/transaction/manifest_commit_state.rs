@@ -205,11 +205,10 @@ impl ManifestCommitState {
     /// # Returns
     ///
     /// A [`Scan`] that will return all Add actions from:
-    /// - The root manifest (if present in the checkpoint) -- entries where `dataManifestPath` is
-    ///   NULL.
-    /// - All delta log files since the checkpoint -- entries where `dataManifestPath` is NULL.
+    /// - The root manifest (if present in the checkpoint) -- entries where `backReference` is NULL.
+    /// - All delta log files since the checkpoint -- entries where `backReference` is NULL.
     ///
-    /// The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is
+    /// The scan explicitly excludes actions from leaf manifests (where `backReference` is
     /// non-NULL) using an internal skip mechanism.
     ///
     /// # Errors

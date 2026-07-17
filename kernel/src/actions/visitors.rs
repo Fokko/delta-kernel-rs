@@ -132,6 +132,12 @@ impl AddVisitor {
             getters[13].get_opt(row_index, "add.default_row_commit")?;
         let clustering_provider: Option<String> =
             getters[14].get_opt(row_index, "add.clustering_provider")?;
+        let back_reference = visit_back_reference_at(
+            row_index,
+            &getters[15..],
+            "add.backReference.manifest",
+            "add.backReference.pos",
+        )?;
 
         Ok(Add {
             path,
@@ -145,8 +151,7 @@ impl AddVisitor {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
-            data_manifest_path: None,
-            data_manifest_position: None,
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -213,10 +218,12 @@ impl RemoveVisitor {
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
-        let data_manifest_path: Option<String> =
-            getters[15].get_opt(row_index, "remove.dataManifestPath")?;
-        let data_manifest_position: Option<i64> =
-            getters[16].get_opt(row_index, "remove.dataManifestPosition")?;
+        let back_reference = visit_back_reference_at(
+            row_index,
+            &getters[15..],
+            "remove.backReference.manifest",
+            "remove.backReference.pos",
+        )?;
 
         Ok(Remove {
             path,
@@ -230,8 +237,7 @@ impl RemoveVisitor {
             deletion_vector,
             base_row_id,
             default_row_commit_version,
-            data_manifest_path,
-            data_manifest_position,
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -555,6 +561,34 @@ pub(crate) fn visit_deletion_vector_at<'a>(
         }))
     } else {
         Ok(None)
+    }
+}
+
+/// Parses an optional [`BackReference`] from engine data.
+///
+/// The caller must slice `getters` so the first two elements correspond to `manifest_path` and
+/// `pos_path`.
+pub(crate) fn visit_back_reference_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+    manifest_path: &str,
+    pos_path: &str,
+) -> DeltaResult<Option<BackReference>> {
+    require!(
+        getters.len() >= 2,
+        Error::InternalError(format!(
+            "Wrong number of BackReference getters: {}",
+            getters.len()
+        ))
+    );
+    let manifest: Option<String> = getters[0].get_opt(row_index, manifest_path)?;
+    let pos: Option<i64> = getters[1].get_opt(row_index, pos_path)?;
+    match (manifest, pos) {
+        (Some(manifest), Some(pos)) => Ok(Some(BackReference { manifest, pos })),
+        (None, None) => Ok(None),
+        _ => Err(Error::missing_data(format!(
+            "{manifest_path} and {pos_path} must both be present or absent"
+        ))),
     }
 }
 
@@ -1010,7 +1044,7 @@ mod tests {
         let json_strings: StringArray = vec![
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
-            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5,"dataManifestPath":"data-manifest.json","dataManifestPosition":42}}"#,
+            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5,"backReference":{"manifest":"data-manifest.json","pos":42}}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -1078,16 +1112,14 @@ mod tests {
             "default_row_commit_version mismatch - check getter index"
         );
 
-        // Verify manifest fields
+        // Verify back reference fields
         assert_eq!(
-            remove.data_manifest_path,
-            Some("data-manifest.json".to_string()),
-            "data_manifest_path mismatch"
-        );
-        assert_eq!(
-            remove.data_manifest_position,
-            Some(42),
-            "data_manifest_position mismatch"
+            remove.back_reference,
+            Some(BackReference {
+                manifest: "data-manifest.json".to_string(),
+                pos: 42,
+            }),
+            "back_reference mismatch"
         );
     }
 

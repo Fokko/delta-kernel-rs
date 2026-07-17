@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 use roaring::RoaringTreemap;
 use url::Url;
 
+use crate::actions::visitors::visit_back_reference_at;
+use crate::actions::BackReference;
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
@@ -87,17 +89,16 @@ struct ManifestRemovalContext<'a> {
     track_root_removals: bool,
 }
 
-/// Helper to track manifest entries for deletion
-/// Updates either data manifest DVs or root removal sets based on manifest location
+/// Helper to track manifest entries for deletion from a [`BackReference`].
+/// Updates either data manifest DVs or root removal sets based on manifest location.
 fn track_manifest_entry_for_removal(
-    manifest_path: Option<String>,
-    manifest_position: Option<i64>,
+    back_reference: Option<BackReference>,
     path: String,
     ctx: &mut ManifestRemovalContext<'_>,
 ) -> DeltaResult<()> {
-    if let (Some(manifest_path_str), Some(position)) = (manifest_path, manifest_position) {
+    if let Some(BackReference { manifest, pos }) = back_reference {
         // Check if this is the root manifest by comparing relative paths
-        let is_from_root = ctx.root_manifest_path.as_deref() == Some(manifest_path_str.as_str());
+        let is_from_root = ctx.root_manifest_path.as_deref() == Some(manifest.as_str());
 
         if is_from_root {
             if ctx.track_root_removals {
@@ -105,8 +106,8 @@ fn track_manifest_entry_for_removal(
             }
         } else {
             // Store the relative path directly
-            let entry = ctx.manifest_dvs.entry(manifest_path_str).or_default();
-            entry.insert(position as u64);
+            let entry = ctx.manifest_dvs.entry(manifest).or_default();
+            entry.insert(pos as u64);
         }
     } else {
         // Files without manifest info are in root
@@ -141,8 +142,8 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         column_name!("fileConstantValues.partitionValues"),
         column_name!("fileConstantValues.baseRowId"),
         column_name!("fileConstantValues.defaultRowCommitVersion"),
-        column_name!("fileConstantValues.dataManifestPath"),
-        column_name!("fileConstantValues.dataManifestPosition"),
+        column_name!("fileConstantValues.backReference.manifest"),
+        column_name!("fileConstantValues.backReference.pos"),
     ];
     let types = vec![
         DataType::STRING,
@@ -175,13 +176,13 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         // Fixed getter indices for all columns (all primitive leaf values):
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
-        //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition
+        //         baseRowId, defaultRowCommitVersion, backReference.manifest, backReference.pos
         // Note: stats_parsed is pre-extracted into self.stats_per_row before visit() is called.
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
-        const DATA_MANIFEST_PATH_IDX: usize = 12;
-        const DATA_MANIFEST_POSITION_IDX: usize = 13;
+        const BACK_REFERENCE_MANIFEST_IDX: usize = 12;
+        const BACK_REFERENCE_POS_IDX: usize = 13;
 
         let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
 
@@ -198,22 +199,19 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
             };
 
             // Track data file manifest entry for removal
-            let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
-                .get_opt(i, "fileConstantValues.dataManifestPath")?;
-            let data_manifest_position: Option<i64> = getters[DATA_MANIFEST_POSITION_IDX]
-                .get_opt(i, "fileConstantValues.dataManifestPosition")?;
+            let back_reference = visit_back_reference_at(
+                i,
+                &getters[BACK_REFERENCE_MANIFEST_IDX..=BACK_REFERENCE_POS_IDX],
+                "fileConstantValues.backReference.manifest",
+                "fileConstantValues.backReference.pos",
+            )?;
             let mut ctx = ManifestRemovalContext {
                 root_manifest_path: root_manifest_path.clone(),
                 manifest_dvs: &mut self.leaf_writer.manifest_dvs,
                 root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
                 track_root_removals: self.leaf_writer.track_root_removals,
             };
-            track_manifest_entry_for_removal(
-                data_manifest_path,
-                data_manifest_position,
-                path.clone(),
-                &mut ctx,
-            )?;
+            track_manifest_entry_for_removal(back_reference, path.clone(), &mut ctx)?;
         }
         Ok(())
     }
@@ -368,6 +366,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::actions::BackReference;
     use crate::content_tree::parse_or_join_url;
     use crate::schema::{
         ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
@@ -782,8 +781,7 @@ mod tests {
                             true,
                         ))),
                     ),
-                    StructField::nullable("dataManifestPath", DataType::STRING),
-                    StructField::nullable("dataManifestPosition", DataType::LONG),
+                    StructField::nullable("backReference", BackReference::nullable_schema()),
                 ]),
             ),
             StructField::nullable("numRecords", DataType::LONG),

@@ -808,6 +808,45 @@ impl CommitInfo {
     }
 }
 
+/// Reference to a file entry's location in the adaptive metadata tree.
+///
+/// Present on `add` and `remove` actions when the `metadataTree-experimental` table feature is
+/// enabled. Identifies the manifest file and row position of an existing tree entry that the action
+/// supersedes or cancels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+pub struct BackReference {
+    /// Path to the leaf manifest containing this file entry, relative to the table root.
+    pub manifest: String,
+    /// Row position (0-indexed) of the file entry within the manifest.
+    pub pos: i64,
+}
+
+impl BackReference {
+    /// Schema for `backReference` on add/remove actions and scan metadata transforms.
+    ///
+    /// TODO: `manifest` and `pos` should be non-nullable when `backReference` is present per the
+    /// protocol; nullable inner fields are likely a bug. We use them as a workaround because the
+    /// Arrow JSON decoder can emit a non-null `backReference` struct with null children when the
+    /// field is absent. [`visit_back_reference_at`] enforces both-or-neither at parse time.
+    pub(crate) fn nullable_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::nullable("manifest", DataType::STRING),
+            StructField::nullable("pos", DataType::LONG),
+        ])
+    }
+}
+
+impl crate::schema::ToSchema for BackReference {
+    fn to_schema() -> StructType {
+        BackReference::nullable_schema()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     test,
@@ -877,17 +916,12 @@ pub(crate) struct Add {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub clustering_provider: Option<String>,
 
-    /// The path to the data manifest this remove action is in.
+    /// Reference to the file's existing entry in the metadata tree, if any.
     ///
-    /// Only present in tables that have metadata tree enabled.
+    /// Only present in tables that have the adaptive metadata tree enabled. Null when the
+    /// file has no manifest entry (it exists only in the Delta log).
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) data_manifest_path: Option<String>,
-
-    /// The index in the data manifest of this remove action
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) data_manifest_position: Option<i64>,
+    pub(crate) back_reference: Option<BackReference>,
 }
 
 impl Add {
@@ -962,17 +996,11 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) default_row_commit_version: Option<i64>,
 
-    /// The path to the data manifest this remove action is in.
+    /// Reference to the file's location in the metadata tree.
     ///
-    /// Only present in tables that have metadata tree enabled.
+    /// Required on `remove` actions when the adaptive metadata tree is enabled.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) data_manifest_path: Option<String>,
-
-    /// The index in the data manifest of this remove action
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) data_manifest_position: Option<i64>,
+    pub(crate) back_reference: Option<BackReference>,
 }
 
 /// Reference to the root of the V4 content metadata tree.
@@ -1469,8 +1497,7 @@ mod tests {
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                 StructField::nullable("clusteringProvider", DataType::STRING),
-                StructField::nullable("dataManifestPath", DataType::STRING),
-                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("backReference", BackReference::nullable_schema()),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1522,8 +1549,7 @@ mod tests {
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                StructField::nullable("dataManifestPath", DataType::STRING),
-                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("backReference", BackReference::nullable_schema()),
             ]),
         )]));
         assert_eq!(schema, expected);
