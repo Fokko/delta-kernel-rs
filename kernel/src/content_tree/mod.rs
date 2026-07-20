@@ -396,8 +396,8 @@ impl ContentTreeNode {
                     let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     let status: i32 = getters[1].get(i, "tracking.status")?;
 
-                    // Skip DELETED entries (status=3) — filtered out at read time
-                    if status == 3 {
+                    // Filter out non-live entries
+                    if !TrackingStatus::try_from_repr(status)?.is_live() {
                         continue;
                     }
 
@@ -802,13 +802,9 @@ impl ContentTreeNode {
         )?))
     }
 
-    /// Builds selection vectors for Add vs Remove entries based on tracking.status.
-    ///
-    /// Returns (add_selection, remove_selection) where:
-    /// - add_selection[i] = true if entry i has status Existing (0) or Added (1)
-    /// - remove_selection[i] = true if entry i has status Deleted (2)
-    ///
-    /// Both exclude manifest entries (contentType 3, 4) and other non-data types.
+    /// Builds (add_selection, remove_selection) for Data entries: a live entry
+    /// ([`TrackingStatus::is_live`]) yields an Add, a not-live entry yields a Remove. Manifest
+    /// and other non-data entries select neither.
     fn build_add_remove_selection_vectors(
         batch: &dyn EngineData,
     ) -> DeltaResult<(Vec<bool>, Vec<bool>)> {
@@ -843,28 +839,12 @@ impl ContentTreeNode {
                     let content_type: i32 = getters[0].get(i, "contentType")?;
                     let status: i32 = getters[1].get(i, "tracking.status")?;
 
-                    // Only process Data entries (contentType=0)
-                    // Skip DVs (1), EqualityDeletes (2), and Manifests (3, 4)
+                    // Only Data entries (contentType=0) become Add/Remove actions.
                     if content_type == 0 {
-                        match status {
-                            0 | 1 => {
-                                // Existing or Added -> Add action
-                                self.add_selection.push(true);
-                                self.remove_selection.push(false);
-                            }
-                            2 => {
-                                // Deleted -> Remove action
-                                self.add_selection.push(false);
-                                self.remove_selection.push(true);
-                            }
-                            _ => {
-                                // Unknown status
-                                self.add_selection.push(false);
-                                self.remove_selection.push(false);
-                            }
-                        }
+                        let is_live = TrackingStatus::try_from_repr(status)?.is_live();
+                        self.add_selection.push(is_live);
+                        self.remove_selection.push(!is_live);
                     } else {
-                        // Not a data entry
                         self.add_selection.push(false);
                         self.remove_selection.push(false);
                     }
@@ -1311,7 +1291,12 @@ impl ContentTreeNode {
 
         for entry in entries {
             match entry.content_type {
-                DataContentType::DataManifest => data_manifest_entries.push(entry),
+                DataContentType::DataManifest => {
+                    // Only read live manifests.
+                    if entry.tracking.status.is_live() {
+                        data_manifest_entries.push(entry);
+                    }
+                }
                 DataContentType::Data => data_file_entries.push(entry),
                 DataContentType::DeleteManifest => {
                     return Err(Error::generic(
@@ -1922,6 +1907,28 @@ pub enum TrackingStatus {
     Modified = 4,
 }
 
+impl TrackingStatus {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> DeltaResult<Self> {
+        match value {
+            0 => Ok(Self::Existing),
+            1 => Ok(Self::Added),
+            2 => Ok(Self::Deleted),
+            3 => Ok(Self::Replaced),
+            4 => Ok(Self::Modified),
+            other => Err(Error::generic(format!(
+                "Invalid tracking status value: {other}"
+            ))),
+        }
+    }
+
+    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`,
+    /// `Modified`) are surfaced; not-live entries (`Deleted`, `Replaced`) are not.
+    pub(crate) fn is_live(self) -> bool {
+        matches!(self, Self::Existing | Self::Added | Self::Modified)
+    }
+}
+
 impl ToDataType for TrackingStatus {
     fn to_data_type() -> DataType {
         DataType::INTEGER
@@ -2001,26 +2008,6 @@ impl TrackingInfo {
     /// Get the tracking status
     pub fn status(&self) -> TrackingStatus {
         self.status
-    }
-}
-
-impl From<TrackingInfo> for Scalar {
-    fn from(value: TrackingInfo) -> Self {
-        use crate::expressions::StructData;
-        use crate::schema::ToSchema;
-
-        let fields = TrackingInfo::to_schema().into_fields().collect();
-        let values = vec![
-            value.status.into(),
-            value.snapshot_id.into(),
-            value.sequence_number.into(),
-            value.file_sequence_number.into(),
-            value.first_row_id.into(),
-        ];
-
-        // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
-        // to match exactly in count, order, type, and nullability.
-        Scalar::Struct(StructData::new_unchecked(fields, values))
     }
 }
 
@@ -5324,65 +5311,6 @@ mod tests {
     }
 
     #[test]
-    fn test_data_entry_with_deleted_status_not_included() -> DeltaResult<()> {
-        use crate::actions::visitors::AddVisitor;
-        use crate::engine_data::RowVisitor;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // A Data entry with Deleted tracking status should not produce any Add action
-        // (it produces a Remove action instead).
-        let mut data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-            .location("memory:///data.parquet")
-            .tracking(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(50),
-                file_sequence_number: Some(50),
-                first_row_id: Some(0),
-                dv_snapshot_id: None,
-                deleted_positions: None,
-                replaced_positions: None,
-            })
-            .sort_order_id(0)
-            .record_count(100)
-            .file_size_in_bytes(1024)
-            .build();
-        data_entry.tracking.status = TrackingStatus::Deleted;
-
-        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
-
-        let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = metadata.root_action_batches_with_handler(
-            engine.evaluation_handler().as_ref(),
-            &schema,
-            None,
-            None,
-            None,
-            None,
-        )?;
-
-        // Collect all adds from all batches
-        let mut total_adds = 0;
-        for batch_result in action_batches {
-            let batch = batch_result?;
-            let mut visitor = AddVisitor::default();
-            visitor.visit_rows_of(batch.actions.as_ref())?;
-            total_adds += visitor.adds.len();
-        }
-
-        // Data entry with Deleted status should not produce any Add actions
-        assert_eq!(
-            total_adds, 0,
-            "Data entry with Deleted status should not produce an Add action"
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn test_delete_manifest_format_returns_error() -> DeltaResult<()> {
         // DeleteManifest format is not supported; manifest_references() should return an error.
         let engine = SyncEngine::new();
@@ -5492,18 +5420,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_manifest_references_data_manifest() -> DeltaResult<()> {
-        // Test that DataManifest entries work correctly with manifest_references()
+    #[rstest]
+    #[case(TrackingStatus::Existing, 1)]
+    #[case(TrackingStatus::Added, 1)]
+    #[case(TrackingStatus::Modified, 1)]
+    #[case(TrackingStatus::Deleted, 0)]
+    #[case(TrackingStatus::Replaced, 0)]
+    fn test_only_read_live_manifests(
+        #[case] status: TrackingStatus,
+        #[case] expected_refs: usize,
+    ) -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // DataManifest entries contain data files + optional inline DVs
         let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("memory:///data-manifest.parquet")
             .tracking(TrackingInfo {
-                status: TrackingStatus::Existing,
+                status,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
@@ -5520,13 +5454,22 @@ mod tests {
 
         let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
-        // DataManifest produces one manifest reference
-        assert_eq!(root_state.manifest_references.len(), 1);
-        let refs = &root_state.manifest_references[0];
         assert_eq!(
-            refs.data_manifest.manifest.location.as_ref().unwrap(),
-            "memory:///data-manifest.parquet"
+            root_state.manifest_references.len(),
+            expected_refs,
+            "status {status:?}"
         );
+        if expected_refs == 1 {
+            assert_eq!(
+                root_state.manifest_references[0]
+                    .data_manifest
+                    .manifest
+                    .location
+                    .as_ref()
+                    .unwrap(),
+                "memory:///data-manifest.parquet"
+            );
+        }
 
         Ok(())
     }
@@ -6438,6 +6381,52 @@ mod tests {
 
         assert_eq!(add_paths, vec!["memory:///add-file.parquet"]);
         assert_eq!(remove_paths, vec!["memory:///remove-file.parquet"]);
+
+        Ok(())
+    }
+
+    /// A live Data entry selects into Add; a not-live entry selects into Remove.
+    #[rstest]
+    #[case(TrackingStatus::Existing, true, false)]
+    #[case(TrackingStatus::Added, true, false)]
+    #[case(TrackingStatus::Modified, true, false)]
+    #[case(TrackingStatus::Deleted, false, true)]
+    #[case(TrackingStatus::Replaced, false, true)]
+    fn test_tracking_status_maps_to_add_or_remove(
+        #[case] status: TrackingStatus,
+        #[case] expect_add: bool,
+        #[case] expect_remove: bool,
+    ) -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking(TrackingInfo {
+                status,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+                dv_snapshot_id: None,
+                deleted_positions: None,
+                replaced_positions: None,
+            })
+            .record_count(10)
+            .file_size_in_bytes(512)
+            .build();
+
+        let metadata = build_node(vec![entry], 1, &table_root_url, &engine)?;
+        let (add, remove) =
+            ContentTreeNode::build_add_remove_selection_vectors(metadata.data[0].as_ref())?;
+
+        assert_eq!(add, vec![expect_add], "add selection for {status:?}");
+        assert_eq!(
+            remove,
+            vec![expect_remove],
+            "remove selection for {status:?}"
+        );
 
         Ok(())
     }

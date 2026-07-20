@@ -112,19 +112,7 @@ fn visit_metadata_entry_at<'a>(
 
     // Extract tracking fields
     let tracking_status_int: i32 = getters[3].get(row_index, "tracking.status")?;
-    let tracking_status = match tracking_status_int {
-        0 => TrackingStatus::Existing,
-        1 => TrackingStatus::Added,
-        2 => TrackingStatus::Deleted,
-        3 => TrackingStatus::Replaced,
-        4 => TrackingStatus::Modified,
-        _ => {
-            return Err(Error::generic(format!(
-                "Invalid tracking status value: {}",
-                tracking_status_int
-            )))
-        }
-    };
+    let tracking_status = TrackingStatus::try_from_repr(tracking_status_int)?;
 
     let tracking_snapshot_id: Option<i64> =
         getters[4].get_opt(row_index, "tracking.snapshot_id")?;
