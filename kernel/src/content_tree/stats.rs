@@ -1801,7 +1801,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         null_count_cols,
         min_vals_cols,
         max_vals_cols,
-        "",
+        &[],
         &column_to_field_id,
         &mut null_count_exprs,
         &mut min_values_exprs,
@@ -1870,9 +1870,16 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     Ok(Arc::new(Expression::struct_from(field_exprs)))
 }
 
-/// Builds a map from physical column names (with "." for nested) to field IDs.
+/// Builds a map from physical column names to field IDs.
 ///
 /// The column names are taken from the provided schema, which should be the physical schema.
+///
+/// Nested fields are keyed by their dot-joined path (e.g. `col-parent.col-child`). This dotted
+/// string is only a flat lookup key for this map -- it is NOT how the field is addressed inside the
+/// nested `content_stats` struct, which mirrors the table's nested struct layout and is addressed
+/// component-by-component (see [`content_stats_column`]). Note: because this key is dot-joined,
+/// physical field names containing a literal `.` could collide; see the TODO in
+/// [`collect_stats_expressions_filtered`].
 fn build_column_to_field_id_map(
     schema: &StructType,
     prefix: &str,
@@ -1898,17 +1905,42 @@ fn build_column_to_field_id_map(
     Ok(())
 }
 
+/// Builds a `content_stats` column reference for a (possibly nested) column and stat name.
+///
+/// `field_path` is the sequence of (physical) field-name components for the column, e.g.
+/// `["col-parent", "col-child"]` for a nested struct leaf. Components are passed through as-is
+/// rather than joined-and-resplit, so physical names are never re-parsed.
+///
+/// The `content_stats` struct is genuinely nested: it mirrors the table's struct layout, so a leaf
+/// column's stats live under their parent (e.g. `content_stats.col-parent.col-child.lower_bound`),
+/// not under a single flat field literally named `col-parent.col-child`. Addressing the column with
+/// its individual components lets `extract_column` walk the nested struct correctly; collapsing
+/// them into one component would fail with "No such field: col-parent.col-child".
+fn content_stats_column(field_path: &[&str], stat: &str) -> ColumnName {
+    // Capacity = CONTENT_STATS prefix + path components + stat suffix.
+    let mut parts: Vec<&str> = Vec::with_capacity(field_path.len() + 2);
+    parts.push(crate::content_tree::CONTENT_STATS_FIELD_NAME);
+    parts.extend_from_slice(field_path);
+    parts.push(stat);
+    ColumnName::new(parts)
+}
+
 /// Collects AMT→Delta stats transformation expressions for each (stat type, column) pair.
 ///
 /// Each stat category (`null_count_cols`, `min_vals_cols`, `max_vals_cols`) independently
 /// controls which columns contribute to its corresponding output expressions/fields.
+//
+// The `'a` lifetime ties the stat-category schemas to `prefix`: each column name is borrowed from
+// those schemas and appended to a copy of `prefix` to form the path threaded into the recursive
+// call, so the borrowed names must outlive that shared path. `table_schema` is unrelated and left
+// elided.
 #[allow(clippy::too_many_arguments)]
-fn collect_stats_expressions_filtered(
+fn collect_stats_expressions_filtered<'a>(
     table_schema: &StructType,
-    null_count_cols: Option<&StructType>,
-    min_vals_cols: Option<&StructType>,
-    max_vals_cols: Option<&StructType>,
-    prefix: &str,
+    null_count_cols: Option<&'a StructType>,
+    min_vals_cols: Option<&'a StructType>,
+    max_vals_cols: Option<&'a StructType>,
+    prefix: &[&'a str],
     column_to_field_id: &HashMap<String, i32>,
     null_count_exprs: &mut Vec<ExpressionRef>,
     min_values_exprs: &mut Vec<ExpressionRef>,
@@ -1930,11 +1962,10 @@ fn collect_stats_expressions_filtered(
     }
 
     for col_name in col_names {
-        let field_path = if prefix.is_empty() {
-            col_name.to_string()
-        } else {
-            format!("{}.{}", prefix, col_name)
-        };
+        // Physical-name components of this column's path, kept split (never joined-then-resplit)
+        // so nested `content_stats` fields are addressed component-by-component.
+        let mut field_path: Vec<&str> = prefix.to_vec();
+        field_path.push(col_name);
 
         let Some(table_field) = table_schema.field(col_name) else {
             continue;
@@ -1986,40 +2017,41 @@ fn collect_stats_expressions_filtered(
                 tight_bounds_exprs.extend(nested_tight_bounds_exprs);
             }
             _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
-                if !column_to_field_id.contains_key(&field_path) {
+                // TODO: `column_to_field_id` is keyed by a dot-joined physical path (see
+                // `build_column_to_field_id_map`). Delta does not forbid `.` in field names, and
+                // physical names are read verbatim from `delta.columnMapping.physicalName`, so a
+                // foreign-written physical name containing a literal `.` could collide with a
+                // different nested path here. Kernel-assigned physical names are `col-<uuid>` (no
+                // dots), so this cannot happen for kernel-created tables; revisit only if dotted
+                // physical names need to be supported. The path components themselves are kept
+                // split (`field_path`) and are unaffected -- this concern is limited to the key.
+                if !column_to_field_id.contains_key(&field_path.join(".")) {
                     continue;
                 }
                 let has_min_values = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
                 let has_max_values = max_vals_cols.is_some_and(|s| s.field(col_name).is_some());
                 if null_count_cols.is_some_and(|s| s.field(col_name).is_some()) {
-                    null_count_exprs.push(Arc::new(Expression::Column(ColumnName::new([
-                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                    null_count_exprs.push(Arc::new(Expression::Column(content_stats_column(
                         &field_path,
                         NULL_VALUE_COUNT,
-                    ]))));
+                    ))));
                 }
                 if has_min_values {
-                    min_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
-                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                    min_values_exprs.push(Arc::new(Expression::Column(content_stats_column(
                         &field_path,
                         LOWER_BOUND,
-                    ]))));
+                    ))));
                 }
                 if has_max_values {
-                    max_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
-                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                    max_values_exprs.push(Arc::new(Expression::Column(content_stats_column(
                         &field_path,
                         UPPER_BOUND,
-                    ]))));
+                    ))));
                 }
                 if has_min_values || has_max_values {
                     // coalesce to true to match delta semantics
                     tight_bounds_exprs.push(Arc::new(Expression::coalesce([
-                        Expression::Column(ColumnName::new([
-                            crate::content_tree::CONTENT_STATS_FIELD_NAME,
-                            &field_path,
-                            TIGHT_BOUNDS,
-                        ])),
+                        Expression::Column(content_stats_column(&field_path, TIGHT_BOUNDS)),
                         Expression::literal(Scalar::Boolean(true)),
                     ])));
                 }
@@ -3749,6 +3781,53 @@ mod tests {
             exprs.len(),
             3,
             "expression field count must match stats_schema when minValues/maxValues are absent"
+        );
+    }
+
+    /// Regression test: nested struct columns must produce content_stats column references whose
+    /// path components are split per-field (`content_stats.col-parent.col-child.lower_bound`),
+    /// not collapsed into a single dotted field name (`content_stats."col-parent.col-child"...`).
+    /// The latter causes "No such field: col-parent.col-child" at read time because the nested
+    /// content_stats struct is looked up by a dotted name that does not exist.
+    #[test]
+    fn test_create_content_stats_to_stats_parsed_expr_nested_struct_splits_path() {
+        // Table schema: parent struct { child: long }, both with field IDs.
+        let child = field_with_id("child", DataType::LONG, true, 2);
+        let parent = field_with_id(
+            "parent",
+            DataType::Struct(Box::new(StructType::new_unchecked([child]))),
+            true,
+            1,
+        );
+        let table_schema = StructType::new_unchecked([parent]);
+        let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
+
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("should build expression for nested struct");
+
+        // Every column reference must have dot-free path components. A dotted component means a
+        // nested path was collapsed into one field name, which fails to resolve on read.
+        for col in expr.references() {
+            for component in col.iter() {
+                assert!(
+                    !component.contains('.'),
+                    "column reference {col} has a dotted path component '{component}'; nested \
+                     content_stats paths must be split into separate components"
+                );
+            }
+        }
+
+        // The nested leaf must be referenced with its full, split path.
+        let expected = ColumnName::new([
+            crate::content_tree::CONTENT_STATS_FIELD_NAME,
+            "parent",
+            "child",
+            LOWER_BOUND,
+        ]);
+        assert!(
+            expr.references().contains(&expected),
+            "expected nested reference {expected} not found in {:?}",
+            expr.references()
         );
     }
 

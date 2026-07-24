@@ -21,11 +21,13 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::{RowVisitor, TypedGetData};
-use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use delta_kernel::expressions::{
+    column_expr, Expression as Expr, MapData, Predicate as Pred, Scalar, StructData,
+};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, StructTypeBuilder,
 };
-use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 use rstest::rstest;
 use test_utils::{create_table, engine_store_setup};
 
@@ -139,26 +141,9 @@ fn build_min_max_values_field(
     Ok(Arc::new(StructArray::from(fields)))
 }
 
-/// Creates add file metadata with stats for testing
-fn create_add_files_with_stats(
-    add_files_schema: &Arc<StructType>,
-    files: Vec<TestFileStats<'_>>,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let num_files = files.len();
-
-    // Build basic arrays
-    let path_array = StringArray::from(files.iter().map(|f| f.path).collect::<Vec<_>>());
-    let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
-    let mod_time_array = Int64Array::from(vec![0i64; num_files]);
-    let num_records_array =
-        Int64Array::from(files.iter().map(|f| f.num_records).collect::<Vec<_>>());
-    let min_id_array = Int64Array::from(files.iter().map(|f| f.min_id).collect::<Vec<_>>());
-    let max_id_array = Int64Array::from(files.iter().map(|f| f.max_id).collect::<Vec<_>>());
-    let min_row_id_array = Int64Array::from(files.iter().map(|f| f.min_row_id).collect::<Vec<_>>());
-    let max_row_id_array = Int64Array::from(files.iter().map(|f| f.max_row_id).collect::<Vec<_>>());
-
-    // Create empty partition values map
-    let partition_values_array = Arc::new(MapArray::new(
+/// Builds an empty `partitionValues` map array (no partition columns) for `num_files` rows.
+fn empty_partition_values(num_files: usize) -> ArrayRef {
+    Arc::new(MapArray::new(
         Arc::new(Field::new(
             "key_value",
             ArrowDataType::Struct(
@@ -183,7 +168,28 @@ fn create_add_files_with_stats(
         ]),
         None,
         false,
-    ));
+    ))
+}
+
+/// Creates add file metadata with stats for testing
+fn create_add_files_with_stats(
+    add_files_schema: &Arc<StructType>,
+    files: Vec<TestFileStats<'_>>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let num_files = files.len();
+
+    // Build basic arrays
+    let path_array = StringArray::from(files.iter().map(|f| f.path).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(vec![0i64; num_files]);
+    let num_records_array =
+        Int64Array::from(files.iter().map(|f| f.num_records).collect::<Vec<_>>());
+    let min_id_array = Int64Array::from(files.iter().map(|f| f.min_id).collect::<Vec<_>>());
+    let max_id_array = Int64Array::from(files.iter().map(|f| f.max_id).collect::<Vec<_>>());
+    let min_row_id_array = Int64Array::from(files.iter().map(|f| f.min_row_id).collect::<Vec<_>>());
+    let max_row_id_array = Int64Array::from(files.iter().map(|f| f.max_row_id).collect::<Vec<_>>());
+
+    let partition_values_array = empty_partition_values(num_files);
 
     // Build stats struct from schema
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -1013,6 +1019,180 @@ async fn test_partition_pruning_multiple_columns(
     let expected: std::collections::HashSet<_> =
         expected_files.iter().map(|s| s.to_string()).collect();
     assert_eq!(scanned, expected);
+
+    Ok(())
+}
+
+/// Recursively builds a stats-category [`Scalar`] mirroring the (possibly nested) `field` shape,
+/// placing `leaf_value` at the `leaf` column and typed nulls everywhere else (the only stat-bearing
+/// column in this test is `nested.leaf`).
+fn nested_leaf_stat_scalar(field: &StructField, leaf_value: i64) -> DeltaResult<Scalar> {
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let values = children
+                .fields()
+                .map(|child| nested_leaf_stat_scalar(child, leaf_value))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            Ok(Scalar::Struct(StructData::try_new(
+                children.fields().cloned().collect(),
+                values,
+            )?))
+        }
+        _ if field.name() == "leaf" => Ok(Scalar::Long(leaf_value)),
+        other => Ok(Scalar::Null(other.clone())),
+    }
+}
+
+/// Creates a single add-file whose stats live under a nested struct leaf (`nested.leaf`), built via
+/// [`EvaluationHandler::create_many`] from structured [`Scalar`]s rather than raw Arrow. The stats
+/// struct mirrors the nested physical schema (`minValues`/`maxValues`/`nullCount` each carry a
+/// `nested { leaf }` sub-struct), exercising nested physical-name resolution in the AMT read path.
+fn create_nested_leaf_add_file(
+    engine: &dyn Engine,
+    add_files_schema: &Arc<StructType>,
+    path: &str,
+    min_leaf: i64,
+    max_leaf: i64,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let mut row: Vec<Scalar> = Vec::with_capacity(add_files_schema.fields().len());
+    for field in add_files_schema.fields() {
+        let scalar = match field.name().as_str() {
+            "path" => Scalar::String(path.to_string()),
+            "size" => Scalar::Long(100),
+            "modificationTime" => Scalar::Long(0),
+            "partitionValues" => {
+                let DataType::Map(map_type) = field.data_type() else {
+                    return Err(delta_kernel::Error::generic(
+                        "partitionValues must be a map",
+                    ));
+                };
+                Scalar::Map(MapData::try_new(
+                    (**map_type).clone(),
+                    std::iter::empty::<(Scalar, Scalar)>(),
+                )?)
+            }
+            "stats" => {
+                let DataType::Struct(stats_schema) = field.data_type() else {
+                    return Err(delta_kernel::Error::generic("stats must be a struct"));
+                };
+                let values = stats_schema
+                    .fields()
+                    .map(|f| match f.name().as_str() {
+                        "numRecords" => Ok(Scalar::Long(100)),
+                        "tightBounds" => Ok(Scalar::Boolean(true)),
+                        "minValues" => nested_leaf_stat_scalar(f, min_leaf),
+                        "maxValues" => nested_leaf_stat_scalar(f, max_leaf),
+                        "nullCount" => nested_leaf_stat_scalar(f, 0),
+                        _ => Ok(Scalar::Null(f.data_type().clone())),
+                    })
+                    .collect::<DeltaResult<Vec<_>>>()?;
+                Scalar::Struct(StructData::try_new(
+                    stats_schema.fields().cloned().collect(),
+                    values,
+                )?)
+            }
+            other => {
+                return Err(delta_kernel::Error::generic(format!(
+                    "unexpected add-file field: {other}"
+                )))
+            }
+        };
+        row.push(scalar);
+    }
+
+    engine
+        .evaluation_handler()
+        .create_many(add_files_schema.clone(), &[row.as_slice()])
+}
+
+/// End-to-end regression test for reading a nested struct column's stats through an AMT table
+/// under `columnMapping=id`. A predicate on the nested leaf (`nested.leaf < 50`) drives manifest-
+/// and file-level data skipping, which requires the AMT read path to build a `content_stats ->
+/// stats_parsed` transform that addresses the nested leaf by its individual physical-name
+/// components. Before the path-splitting fix, this failed at scan time with
+/// "No such field: nested.leaf" because the nested leaf was referenced as a single dotted field.
+#[tokio::test]
+async fn test_manifest_data_skipping_nested_struct_column_e2e(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (store, engine, table_url) = engine_store_setup("nested_struct_data_skipping_e2e", None);
+    let engine = Arc::new(engine);
+
+    // Schema: id LONG, nested STRUCT { leaf LONG }. All fields carry column-mapping metadata.
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            field_with_metadata("id", DataType::LONG, 1),
+            field_with_metadata(
+                "nested",
+                DataType::Struct(Box::new(
+                    StructType::try_new(vec![field_with_metadata("leaf", DataType::LONG, 3)])
+                        .unwrap(),
+                )),
+                2,
+            ),
+        ])
+        .unwrap(),
+    );
+
+    create_table(
+        store,
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec!["columnMapping", "metadataTree-experimental"],
+        vec!["columnMapping", "metadataTree-experimental"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let add_files_schema = build_add_files_schema_with_stats(&txn)?;
+
+    let (file1, file2) = ("part-00001.parquet", "part-00002.parquet");
+
+    // Two leaves so both manifest- and file-level skipping are exercised:
+    //   leaf1: file1 with nested.leaf in [1, 40]
+    //   leaf2: file2 with nested.leaf in [100, 200]
+    {
+        let mc = txn.with_manifest_commit()?;
+
+        let mut leaf1 = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf1.add_files(
+            engine.as_ref(),
+            create_nested_leaf_add_file(engine.as_ref(), &add_files_schema, file1, 1, 40)?,
+        )?;
+        mc.add_leaf(leaf1.finish(engine.as_ref())?)?;
+
+        let mut leaf2 = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf2.add_files(
+            engine.as_ref(),
+            create_nested_leaf_add_file(engine.as_ref(), &add_files_schema, file2, 100, 200)?,
+        )?;
+        mc.add_leaf(leaf2.finish(engine.as_ref())?)?;
+    }
+
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    // Unfiltered scan sees both files.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let unfiltered_scan = snapshot.scan_builder().build()?;
+    let (_, unfiltered_files) = count_scan_metadata_and_files(unfiltered_scan, engine.as_ref())?;
+    assert_eq!(unfiltered_files, 2, "Without filter: both files present");
+
+    // Predicate on the nested leaf: this is the step that previously failed with
+    // "No such field: nested.leaf". file2 (leaf min=100) is skipped; only file1 survives.
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let predicate = Arc::new(Pred::lt(column_expr!("nested.leaf"), Expr::literal(50i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let scanned = collect_scan_file_paths(&scan, engine.as_ref())?;
+
+    let expected: std::collections::HashSet<_> = [file1.to_string()].into_iter().collect();
+    assert_eq!(
+        scanned, expected,
+        "nested.leaf < 50 keeps only file1 (leaf 1-40); file2 (leaf 100-200) is skipped"
+    );
 
     Ok(())
 }
