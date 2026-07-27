@@ -3,6 +3,7 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1773,13 +1774,8 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     table_schema: &StructType,
     stats_schema: &StructType,
 ) -> DeltaResult<ExpressionRef> {
-    // Build a map from physical column names (with "." for nested) to field IDs
-    // These are the physical names as they appear in the provided schema
-    let mut column_to_field_id: HashMap<String, i32> = HashMap::new();
-    build_column_to_field_id_map(table_schema, "", &mut column_to_field_id)?;
-
-    // If no columns have field IDs, return early
-    if column_to_field_id.is_empty() {
+    // The transform requires column mapping (field IDs). Fail fast if the schema has none.
+    if !schema_has_any_field_id(table_schema) {
         return Err(crate::Error::generic(
             "No fields with field IDs found in table schema",
         ));
@@ -1802,7 +1798,6 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         min_vals_cols,
         max_vals_cols,
         &[],
-        &column_to_field_id,
         &mut null_count_exprs,
         &mut min_values_exprs,
         &mut max_values_exprs,
@@ -1870,39 +1865,14 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     Ok(Arc::new(Expression::struct_from(field_exprs)))
 }
 
-/// Builds a map from physical column names to field IDs.
+/// Returns true if any field in `schema` (recursively) carries a column-mapping field ID.
 ///
-/// The column names are taken from the provided schema, which should be the physical schema.
-///
-/// Nested fields are keyed by their dot-joined path (e.g. `col-parent.col-child`). This dotted
-/// string is only a flat lookup key for this map -- it is NOT how the field is addressed inside the
-/// nested `content_stats` struct, which mirrors the table's nested struct layout and is addressed
-/// component-by-component (see [`content_stats_column`]). Note: because this key is dot-joined,
-/// physical field names containing a literal `.` could collide; see the TODO in
-/// [`collect_stats_expressions_filtered`].
-fn build_column_to_field_id_map(
-    schema: &StructType,
-    prefix: &str,
-    map: &mut HashMap<String, i32>,
-) -> DeltaResult<()> {
-    for field in schema.fields() {
-        let field_name = if prefix.is_empty() {
-            field.name().to_string()
-        } else {
-            format!("{}.{}", prefix, field.name())
-        };
-
-        // Get field ID from metadata
-        if let Some(field_id) = get_field_id(field) {
-            map.insert(field_name.clone(), field_id);
-        }
-
-        // Recurse into nested structs
-        if let DataType::Struct(nested_schema) = field.data_type() {
-            build_column_to_field_id_map(nested_schema, &field_name, map)?;
-        }
-    }
-    Ok(())
+/// that lacks column mapping (which the transform requires).
+fn schema_has_any_field_id(schema: &StructType) -> bool {
+    schema.fields().any(|field| {
+        get_field_id(field).is_some()
+            || matches!(field.data_type(), DataType::Struct(nested) if schema_has_any_field_id(nested))
+    })
 }
 
 /// Builds a `content_stats` column reference for a (possibly nested) column and stat name.
@@ -1941,7 +1911,6 @@ fn collect_stats_expressions_filtered<'a>(
     min_vals_cols: Option<&'a StructType>,
     max_vals_cols: Option<&'a StructType>,
     prefix: &[&'a str],
-    column_to_field_id: &HashMap<String, i32>,
     null_count_exprs: &mut Vec<ExpressionRef>,
     min_values_exprs: &mut Vec<ExpressionRef>,
     max_values_exprs: &mut Vec<ExpressionRef>,
@@ -1996,7 +1965,6 @@ fn collect_stats_expressions_filtered<'a>(
                     min_nested,
                     max_nested,
                     &field_path,
-                    column_to_field_id,
                     &mut nested_null_count_exprs,
                     &mut nested_min_values_exprs,
                     &mut nested_max_values_exprs,
@@ -2017,15 +1985,8 @@ fn collect_stats_expressions_filtered<'a>(
                 tight_bounds_exprs.extend(nested_tight_bounds_exprs);
             }
             _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
-                // TODO: `column_to_field_id` is keyed by a dot-joined physical path (see
-                // `build_column_to_field_id_map`). Delta does not forbid `.` in field names, and
-                // physical names are read verbatim from `delta.columnMapping.physicalName`, so a
-                // foreign-written physical name containing a literal `.` could collide with a
-                // different nested path here. Kernel-assigned physical names are `col-<uuid>` (no
-                // dots), so this cannot happen for kernel-created tables; revisit only if dotted
-                // physical names need to be supported. The path components themselves are kept
-                // split (`field_path`) and are unaffected -- this concern is limited to the key.
-                if !column_to_field_id.contains_key(&field_path.join(".")) {
+                // Only columns with a field ID (i.e. mapped columns) contribute stats.
+                if get_field_id(table_field).is_none() {
                     continue;
                 }
                 let has_min_values = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
