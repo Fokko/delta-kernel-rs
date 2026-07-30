@@ -1,8 +1,8 @@
 //! Shared helpers for integration tests that exercise Delta write paths.
 //!
-//! Each integration test file compiles as its own test binary and uses only a subset of these
-//! helpers; the blanket `#![allow(dead_code)]` suppresses the per-binary dead-code warnings that
-//! the unused subset would otherwise generate.
+//! Each integration test binary uses only a subset of these helpers. The `#![allow(dead_code)]`
+//! on such shared test-helper modules is the standard Rust convention for silencing the
+//! dead-code warnings the unused subset triggers per binary.
 
 #![allow(dead_code)]
 
