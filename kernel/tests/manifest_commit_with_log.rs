@@ -12,11 +12,17 @@ use amt_test_utils::{
     collect_root_entries, dv_descriptor, leaf_path, remove_files_by_path, setup_amt_test_tables,
     single_id_column_schema, update_dvs_by_path, DataFile, Entry, ExpectedDv,
 };
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::BackReference;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-use delta_kernel::{DataContentType, Snapshot, TrackingStatus};
-use test_utils::{create_table, engine_store_setup};
+use delta_kernel::{DataContentType, Engine, Snapshot, TrackingStatus};
+use test_utils::{create_table, engine_store_setup, read_actions_from_commit};
+use url::Url;
 use uuid::Uuid;
 
 /// Test Scenario: Files Added in log commits after an initial manifest commit are
@@ -205,6 +211,345 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             Entry::leaf_ref(leaf2.path.clone(), TrackingStatus::Added).sequence_number(5)
         );
     }
+    Ok(())
+}
+
+// === RFC-compliant AMT log-commit remove / DV re-add action format ===
+
+/// Common RFC checks for AMT log-commit remove actions.
+fn assert_amt_log_commit_remove_common(remove: &serde_json::Value, expected_path: &str) {
+    assert_eq!(
+        remove.get("path").and_then(|v| v.as_str()),
+        Some(expected_path),
+        "unexpected remove path"
+    );
+    assert!(
+        remove.get("deletionTimestamp").is_none_or(|v| v.is_null()),
+        "AMT remove must have null deletionTimestamp, got: {remove:?}"
+    );
+    assert_eq!(
+        remove.get("extendedFileMetadata").and_then(|v| v.as_bool()),
+        Some(true),
+        "AMT remove must set extendedFileMetadata"
+    );
+    assert!(
+        remove.get("stats").is_some_and(|v| !v.is_null()),
+        "AMT remove must carry stats"
+    );
+}
+
+/// Asserts an AMT log-commit remove for a tree-resident file.
+fn assert_amt_log_commit_remove(
+    remove: &serde_json::Value,
+    expected_path: &str,
+    expected_back_reference: &BackReference,
+) {
+    assert_amt_log_commit_remove_common(remove, expected_path);
+    let back_reference = remove
+        .get("backReference")
+        .expect("AMT remove for tree-resident files must include backReference");
+    assert_eq!(
+        back_reference.get("manifest").and_then(|v| v.as_str()),
+        Some(expected_back_reference.manifest.as_str()),
+        "backReference.manifest mismatch"
+    );
+    assert_eq!(
+        back_reference.get("pos").and_then(|v| v.as_i64()),
+        Some(expected_back_reference.pos),
+        "backReference.pos mismatch"
+    );
+}
+
+/// Asserts an AMT log-commit remove for a log-only file (no manifest entry yet).
+fn assert_amt_log_commit_remove_log_only(remove: &serde_json::Value, expected_path: &str) {
+    assert_amt_log_commit_remove_common(remove, expected_path);
+    assert!(
+        back_reference_is_absent(remove.get("backReference")),
+        "log-only AMT remove must have null backReference, got: {remove:?}"
+    );
+}
+
+fn back_reference_is_absent(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => true,
+        Some(v) if v.is_null() => true,
+        Some(serde_json::Value::Object(obj)) if obj.is_empty() => true,
+        Some(serde_json::Value::Object(obj)) => {
+            obj.get("manifest").is_none_or(|v| v.is_null())
+                && obj.get("pos").is_none_or(|v| v.is_null())
+        }
+        _ => false,
+    }
+}
+
+/// Asserts an AMT log-commit re-add (`add` half of a DV update) carries `backReference`.
+fn assert_amt_log_commit_read_with_back_reference(
+    add: &serde_json::Value,
+    expected_path: &str,
+    expected_back_reference: &BackReference,
+) {
+    assert_eq!(
+        add.get("path").and_then(|v| v.as_str()),
+        Some(expected_path),
+        "unexpected add path"
+    );
+    let back_reference = add
+        .get("backReference")
+        .expect("AMT DV re-add must include backReference");
+    assert_eq!(
+        back_reference.get("manifest").and_then(|v| v.as_str()),
+        Some(expected_back_reference.manifest.as_str()),
+        "add.backReference.manifest mismatch"
+    );
+    assert_eq!(
+        back_reference.get("pos").and_then(|v| v.as_i64()),
+        Some(expected_back_reference.pos),
+        "add.backReference.pos mismatch"
+    );
+    assert!(
+        add.get("deletionVector").is_some_and(|v| !v.is_null()),
+        "DV re-add must carry deletionVector"
+    );
+}
+
+/// Creates an AMT test table backed by a temp directory so commit JSON can be read.
+async fn setup_amt_file_backed_table(
+    table_name: &str,
+) -> Result<
+    (
+        tempfile::TempDir,
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let schema = single_id_column_schema()?;
+    let temp_dir = tempfile::tempdir()?;
+    let dir_url = Url::from_directory_path(temp_dir.path())
+        .map_err(|()| std::io::Error::other("invalid temp directory path"))?;
+    let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));
+    create_table(
+        store,
+        table_url.clone(),
+        schema,
+        &[],
+        true,
+        vec![
+            "columnMapping",
+            "metadataTree-experimental",
+            "deletionVectors",
+        ],
+        vec![
+            "columnMapping",
+            "metadataTree-experimental",
+            "deletionVectors",
+            "domainMetadata",
+            "rowTracking",
+        ],
+    )
+    .await?;
+    Ok((temp_dir, table_url, engine))
+}
+
+/// Captures `backReference` for a file path from scan metadata.
+fn back_reference_from_scan(
+    scan: &delta_kernel::scan::Scan,
+    engine: &dyn Engine,
+    path: &str,
+) -> Result<BackReference, Box<dyn std::error::Error>> {
+    fn visit(collector: &mut (String, Option<BackReference>), scan_file: ScanFile) {
+        if scan_file.path == collector.0 {
+            collector.1 = scan_file.back_reference.clone();
+        }
+    }
+
+    let mut collector = (path.to_string(), None);
+    for scan_metadata_result in scan.scan_metadata(engine)? {
+        let scan_metadata = scan_metadata_result?;
+        collector = scan_metadata.visit_scan_files(collector, visit)?;
+    }
+    collector
+        .1
+        .ok_or_else(|| format!("{path} should have a backReference from scan").into())
+}
+
+/// Test Scenario: AMT log-commit remove action format for a leaf-resident file
+#[tokio::test]
+async fn test_amt_log_commit_remove_action_format() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_url, engine) =
+        setup_amt_file_backed_table("amt_log_remove_format").await?;
+
+    // v1: Manifest commit with files in a leaf manifest (non-null backReference on scan).
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let add_files_schema = txn.add_files_schema();
+        add_leaf(
+            &mut txn,
+            &engine,
+            add_files_schema,
+            &[
+                DataFile {
+                    location: "file1.parquet",
+                    size: 2048,
+                    mod_time: 1000000,
+                    num_records: Some(100),
+                },
+                DataFile {
+                    location: "file2.parquet",
+                    size: 1024,
+                    mod_time: 1000001,
+                    num_records: Some(50),
+                },
+            ],
+        )?;
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 1);
+    }
+
+    // v2: Log commit removes file2
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let expected_back_reference = back_reference_from_scan(&scan, &engine, "file2.parquet")?;
+
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let removed_count = remove_files_by_path(&mut txn, scan, &engine, &["file2.parquet"])?;
+        assert_eq!(removed_count, 1);
+
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 2);
+
+        let removes = read_actions_from_commit(&table_url, 2, "remove")?;
+        assert_eq!(removes.len(), 1);
+        assert_amt_log_commit_remove(&removes[0], "file2.parquet", &expected_back_reference);
+    }
+    Ok(())
+}
+
+/// Test Scenario: AMT log-commit remove of a log-only file allows null `backReference`
+#[tokio::test]
+async fn test_amt_log_commit_remove_log_only_file() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_url, engine) =
+        setup_amt_file_backed_table("amt_log_remove_log_only").await?;
+
+    // v1: Root manifest with one file
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        txn.with_manifest_commit()?;
+        let add_files_schema = txn.add_files_schema();
+        add_files(
+            &mut txn,
+            add_files_schema,
+            &[DataFile {
+                location: "file1.parquet",
+                size: 2048,
+                mod_time: 1000000,
+                num_records: Some(100),
+            }],
+        )?;
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 1);
+    }
+
+    // v2: Log commit adds file2 (log-only, no manifest entry)
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let add_files_schema = txn.add_files_schema();
+        add_files(
+            &mut txn,
+            add_files_schema,
+            &[DataFile {
+                location: "file2.parquet",
+                size: 1024,
+                mod_time: 1000001,
+                num_records: Some(50),
+            }],
+        )?;
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 2);
+    }
+
+    // v3: Log commit removes log-only file2
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let removed_count = remove_files_by_path(&mut txn, scan, &engine, &["file2.parquet"])?;
+        assert_eq!(removed_count, 1);
+
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 3);
+
+        let removes = read_actions_from_commit(&table_url, 3, "remove")?;
+        assert_eq!(removes.len(), 1);
+        assert_amt_log_commit_remove_log_only(&removes[0], "file2.parquet");
+    }
+
+    Ok(())
+}
+
+/// Test Scenario: AMT log-commit DV update emits RFC-compliant remove + re-add actions
+#[tokio::test]
+async fn test_amt_log_commit_dv_update_action_format() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_url, engine) = setup_amt_file_backed_table("amt_log_dv_format").await?;
+
+    // v1: Leaf manifest with file1
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let add_files_schema = txn.add_files_schema();
+        add_leaf(
+            &mut txn,
+            &engine,
+            add_files_schema,
+            &[DataFile {
+                location: "file1.parquet",
+                size: 2048,
+                mod_time: 1000000,
+                num_records: Some(100),
+            }],
+        )?;
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 1);
+    }
+
+    // v2: Log commit DV update on leaf-resident file1
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let expected_back_reference = back_reference_from_scan(&scan, &engine, "file1.parquet")?;
+
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let mut dv_map = std::collections::HashMap::new();
+        dv_map.insert(
+            "file1.parquet".to_string(),
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                offset: Some(0),
+                size_in_bytes: 10,
+                cardinality: 5,
+            },
+        );
+        update_dvs_by_path(&mut txn, scan, &engine, dv_map)?;
+        assert_eq!(txn.commit(&engine)?.unwrap_committed().commit_version(), 2);
+
+        let removes = read_actions_from_commit(&table_url, 2, "remove")?;
+        assert_eq!(removes.len(), 1);
+        assert_amt_log_commit_remove(&removes[0], "file1.parquet", &expected_back_reference);
+
+        let adds = read_actions_from_commit(&table_url, 2, "add")?;
+        assert_eq!(adds.len(), 1);
+        assert_amt_log_commit_read_with_back_reference(
+            &adds[0],
+            "file1.parquet",
+            &expected_back_reference,
+        );
+    }
+
     Ok(())
 }
 

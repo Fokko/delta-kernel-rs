@@ -379,7 +379,7 @@ impl Transaction {
 /// Column name for temporary column used during deletion vector updates.
 /// This column holds new DV descriptors appended to scan file metadata before transforming to final
 /// add actions.
-static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
+pub(crate) static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// Schema for scan row data with an additional column for new deletion vector descriptors.
 /// This is an intermediate schema used during deletion vector updates before transforming to final
@@ -397,8 +397,15 @@ static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
-fn intermediate_dv_schema() -> &'static SchemaRef {
+pub(crate) fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
+}
+
+/// True when a remove-generation pass operates on the remove halves of DV updates rather than on
+/// plain scan rows, i.e. its batches follow [`intermediate_dv_schema`] and drop the temporary
+/// [`NEW_DELETION_VECTOR_NAME`] column.
+pub(crate) fn is_deletion_vector_update(columns_to_drop: &[&str]) -> bool {
+    columns_to_drop.contains(&NEW_DELETION_VECTOR_NAME)
 }
 
 /// Schema for scan row data with nullable statistics fields.

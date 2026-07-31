@@ -29,7 +29,9 @@ use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{CursorRowIdAllocator, RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
+use crate::scan::data_skipping::stats_schema::{
+    schema_with_all_fields_nullable, STATS_NUM_RECORDS,
+};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
@@ -71,6 +73,7 @@ pub(crate) mod data_layout;
 
 pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
+mod amt_log_commit;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
@@ -441,6 +444,8 @@ impl<S> Transaction<S> {
 
         // Validate clustering column stats if ClusteredTable feature is enabled
         self.validate_add_files_stats(&self.add_files_metadata)?;
+        // Validate remove/DV-update metadata (RFC-compliance for AMT log commits)
+        self.validate_remove_files_metadata()?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -1368,6 +1373,19 @@ impl<S> Transaction<S> {
         can_manifest_commit && has_work_to_do
     }
 
+    /// Returns true when remove/DV-update actions written to the Delta log should use the adaptive
+    /// metadata tree format: null `deletionTimestamp` on removes and `backReference` preservation
+    /// from scan metadata (re-add adds from DV updates included).
+    ///
+    /// `extendedFileMetadata: true` is always set on removes by [`build_remove_transform`], not
+    /// only for AMT tables. Manifest commits record removals in the content tree instead and are
+    /// excluded.
+    fn uses_amt_log_commit_actions(&self) -> bool {
+        self.effective_table_config
+            .protocol()
+            .has_writer_feature(&TableFeature::MetadataTreeExperimental)
+    }
+
     /// Builds the manifest root node with row tracking, returning the root node and the
     /// row tracking high water mark domain metadata action.
     ///
@@ -1689,6 +1707,23 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Validates the transaction's remove and DV-update metadata prior to commit.
+    ///
+    /// When the table uses adaptive metadata tree (AMT) log commits, remove actions (including the
+    /// remove half of DV updates) must be RFC-compliant: they must carry extended file metadata
+    /// (stats and size), and any `backReference` they carry must be structurally well-formed. For
+    /// all other tables this is a no-op.
+    fn validate_remove_files_metadata(&self) -> DeltaResult<()> {
+        if !self.uses_amt_log_commit_actions() {
+            return Ok(());
+        }
+        amt_log_commit::validate_remove_metadata_for_amt_log_commit(
+            self.remove_files_metadata
+                .iter()
+                .chain(self.dv_matched_files.iter()),
+        )
+    }
+
     /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
@@ -1943,9 +1978,17 @@ impl<S> Transaction<S> {
         let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
+        let uses_amt_log_commit = self.uses_amt_log_commit_actions();
+        let amt_prep_eval = amt_log_commit::build_remove_stats_prep_evaluator(
+            engine,
+            uses_amt_log_commit,
+            columns_to_drop,
+        )?;
+
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
             let transform = build_remove_transform(
                 self.commit_timestamp,
+                uses_amt_log_commit,
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
@@ -1968,7 +2011,18 @@ impl<S> Transaction<S> {
         let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
-            let data = file_metadata_batch.data();
+            // AMT removes must carry stats, but scan rows resolved from the content tree have a
+            // null `stats` JSON string and expose the row count only in the top-level
+            // `numRecords` column. Synthesizing a minimal `stats_parsed` from it routes those
+            // batches through the coalescing evaluator below, which rebuilds the `stats` JSON.
+            // `prepared` owns the buffer so it stays alive for the `data` borrow below.
+            let prepared = amt_log_commit::prepare_remove_scan_batch_for_amt(
+                amt_prep_eval.as_deref(),
+                file_metadata_batch.data(),
+            )?;
+            let data = prepared
+                .as_deref()
+                .unwrap_or_else(|| file_metadata_batch.data());
             let evaluator = if data.has_field(&stats_parsed_col) {
                 &stats_parsed_eval
             } else {
@@ -1994,15 +2048,24 @@ impl<S> Transaction<S> {
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
+/// - `deletionTimestamp`: adaptive metadata tree (AMT) log commits require a null
+///   `deletionTimestamp` (see the `amt_log_commit` module), so when `uses_amt_log_commit` is true
+///   the field is null; otherwise `commit_timestamp` is written.
 fn build_remove_transform(
     commit_timestamp: i64,
+    uses_amt_log_commit: bool,
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
 ) -> Transform {
+    let deletion_timestamp_expr = if uses_amt_log_commit {
+        Expression::null_literal(DataType::LONG)
+    } else {
+        Expression::literal(commit_timestamp)
+    };
     let mut transform = Transform::new_top_level()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .with_inserted_field(Some("path"), deletion_timestamp_expr.into())
         // dataChange
         .with_inserted_field(Some("path"), Expression::literal(data_change).into())
         // extended_file_metadata
@@ -2056,7 +2119,7 @@ fn build_remove_transform(
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
         .with_dropped_field("modificationTime")
-        .with_dropped_field("numRecords")
+        .with_dropped_field(STATS_NUM_RECORDS)
         // Drop partitionValues_parsed if present (added by partition-predicate scans).
         .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
 

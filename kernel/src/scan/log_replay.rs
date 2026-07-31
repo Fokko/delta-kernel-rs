@@ -21,6 +21,7 @@ pub(crate) use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
+use crate::scan::data_skipping::stats_schema::STATS_NUM_RECORDS;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
@@ -577,7 +578,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
         StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
     ]))
 });
 
