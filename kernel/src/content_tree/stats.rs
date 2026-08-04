@@ -2017,7 +2017,20 @@ fn collect_stats_expressions_filtered<'a>(
                     ])));
                 }
             }
-            _ => {}
+            _ => {
+                // For Array/Map leaf columns Delta includes these in `nullCount` as a single LONG
+                // but excludes them from min/max. AMT content_stats do not track
+                // per-column statistics for these complex types so there is no
+                // content_stats leaf to reference. Emit a NULL LONG literal so the
+                // reconstructed nullCount struct keeps the same field count as the
+                // Delta stats schema; without this the struct expression evaluator
+                // fails with "Struct expression field count mismatch". A NULL null
+                // count simply disables null-count-based data skipping for the
+                // column (safe: it never over-skips).
+                if null_count_cols.is_some_and(|s| s.field(col_name).is_some()) {
+                    null_count_exprs.push(Arc::new(Expression::null_literal(DataType::LONG)));
+                }
+            }
         }
     }
     Ok(())
@@ -2116,6 +2129,92 @@ mod tests {
                 field_id
             );
         }
+    }
+
+    /// Regression test for AMT reads of tables containing array/map columns.
+    ///
+    /// Delta's data-skipping stats schema includes array and map columns in `nullCount` (as a
+    /// single LONG) but excludes them from `minValues`/`maxValues`. A prior bug dropped these
+    /// complex columns from the reconstruction expression entirely, so the generated `nullCount`
+    /// struct had fewer fields than the stats schema. At evaluation time the struct expression
+    /// evaluator then failed with "Struct expression field count mismatch: N fields in expression
+    /// but M in schema" (the fuzz suite saw "15 fields ... but 17 in schema"). The reconstruction
+    /// must emit a NULL LONG for each complex column's null count so the counts line up.
+    #[test]
+    fn test_content_stats_expr_array_map_nullcount_field_count_matches() {
+        use crate::schema::{ArrayType, MapType};
+        // Table: { id: long, arr: array<int>, m: map<string,int> }
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, true, 1),
+            field_with_id(
+                "arr",
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                true,
+                2,
+            ),
+            field_with_id(
+                "m",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    true,
+                ))),
+                true,
+                3,
+            ),
+        ]);
+
+        // Stats schema mirroring the real data-skipping schema: array/map appear in nullCount
+        // (LONG) but not in minValues/maxValues (only the min/max-eligible `id` column does).
+        let null_count = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("arr", DataType::LONG),
+            StructField::nullable("m", DataType::LONG),
+        ]);
+        let min_max = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+        let stats_schema = StructType::new_unchecked(vec![
+            StructField::nullable(DELTA_STATS_NUM_RECORDS, DataType::LONG),
+            StructField::nullable(
+                DELTA_STATS_NULL_COUNT,
+                DataType::Struct(Box::new(null_count)),
+            ),
+            StructField::nullable(
+                DELTA_STATS_MIN_VALUES,
+                DataType::Struct(Box::new(min_max.clone())),
+            ),
+            StructField::nullable(DELTA_STATS_MAX_VALUES, DataType::Struct(Box::new(min_max))),
+            StructField::nullable(DELTA_STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("should build expression for array/map table");
+
+        // Top-level layout: [numRecords, nullCount, minValues, maxValues, tightBounds].
+        let top = match expr.as_ref() {
+            Expression::Struct(inner, _) => inner,
+            other => panic!("expected Struct expression, got {other:?}"),
+        };
+        assert_eq!(
+            top.len(),
+            stats_schema.num_fields(),
+            "top-level stats_parsed field count must match the stats schema"
+        );
+
+        // The nullCount sub-struct must have one field per nullCount column -- including the array
+        // and map columns -- or evaluation would fail.
+        let null_count_schema = get_struct_sub_schema(&stats_schema, DELTA_STATS_NULL_COUNT)
+            .expect("nullCount present");
+        let null_count_fields = match top[1].as_ref() {
+            Expression::Struct(inner, _) => inner.len(),
+            other => panic!("expected nullCount Struct expression, got {other:?}"),
+        };
+        assert_eq!(
+            null_count_fields,
+            null_count_schema.num_fields(),
+            "nullCount expression field count must match the nullCount schema field count so the \
+         struct evaluator does not fail with a field-count mismatch"
+        );
+        assert_eq!(null_count_fields, 3);
     }
 
     #[test]
