@@ -284,6 +284,17 @@ impl SchemaVisitor for StatsSchemaVisitor {
             _ => StructType::new_unchecked(type_result),
         };
 
+        // Columns with no leaf statistics -- array/map (their element/key/value nodes have no
+        // field-id context) or a struct whose fields are all array/map -- reduce to an empty
+        // stats struct. Emitting one would make the AMT stats-projection build an
+        // `Expression::struct_from([])`, i.e. a zero-field Arrow StructArray, which Arrow
+        // rejects ("create a struct array with no fields"). Skip such columns entirely; this
+        // matches `filtered_stats_schema_fields` (read schema) and the read-side reconstruction
+        // (which emits a NULL null count for these columns).
+        if stats_struct.fields().next().is_none() {
+            return Ok(Vec::new());
+        }
+
         // Build metadata with the base_stats_id as the field ID instead of the original field ID.
         // The stats group struct should use the base stats field ID (e.g., 10200 for field_id=1),
         // not the original column field ID.
@@ -1728,6 +1739,15 @@ fn filtered_stats_schema_fields(
             _ => continue,
         };
 
+        // A struct whose fields are all array/map reduces to an empty stats struct. Emitting it
+        // would build a zero-field Arrow StructArray at read time (the AMT stats projection
+        // recurses into it with `Expression::struct_from([])`), which Arrow rejects. Omit the
+        // column -- consistent with `stats_schema` (write) and the reconstruction, which skips
+        // empty nested structs.
+        if stats_struct.fields().next().is_none() {
+            continue;
+        }
+
         let metadata: Vec<(&str, MetadataValue)> = table_field
             .metadata
             .iter()
@@ -2461,7 +2481,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_array() {
-        // TODO: This should produce statistics
         // Test array: { items: array<int> }
         let schema = StructType::new_unchecked([field_with_id(
             "items",
@@ -2471,22 +2490,15 @@ mod tests {
         )]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        assert_eq!(stats.fields().count(), 1);
-
-        let items_stats = stats.field("items").expect("items field should exist");
-        let items_stats_struct = match items_stats.data_type() {
-            DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected struct type for 'items'"),
-        };
-
-        // Lists are visited by DataType (not StructField), so primitive list elements have no
-        // field-id context and therefore produce empty stats.
-        assert_eq!(items_stats_struct.fields().count(), 0);
+        // Array elements are visited by DataType (not StructField), so they have no field-id
+        // context and produce no leaf stats. Rather than emit an empty stats struct (which
+        // cannot be built as a zero-field Arrow StructArray), the column is omitted entirely.
+        assert_eq!(stats.fields().count(), 0);
+        assert!(stats.field("items").is_none());
     }
 
     #[test]
     fn test_stats_schema_map() {
-        // TODO: This should produce statistics
         // Test map: { mapping: map<string, int> }
         let schema = StructType::new_unchecked([field_with_id(
             "mapping",
@@ -2500,17 +2512,66 @@ mod tests {
         )]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        // Map key/value nodes are visited by DataType (not StructField), so they have no
+        // field-id context and produce no leaf stats. The column is omitted rather than emitting
+        // an empty stats struct (which cannot be built as a zero-field Arrow StructArray).
+        assert_eq!(stats.fields().count(), 0);
+        assert!(stats.field("mapping").is_none());
+    }
+
+    #[test]
+    fn test_stats_schema_struct_of_only_complex_is_omitted() {
+        // A struct whose only field is an array reduces to an empty stats struct; it must be
+        // omitted rather than emitted (an empty StructArray cannot be materialized).
+        let inner = StructType::new_unchecked([field_with_id(
+            "f0",
+            DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+            true,
+            2,
+        )]);
+        let schema = StructType::new_unchecked([field_with_id(
+            "s",
+            DataType::Struct(Box::new(inner)),
+            true,
+            1,
+        )]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert_eq!(stats.fields().count(), 0);
+        assert!(stats.field("s").is_none());
+    }
+
+    #[test]
+    fn test_stats_schema_struct_with_primitive_and_complex_keeps_primitive() {
+        // A struct with a mix of primitive and complex fields keeps only the primitive leaf's
+        // stats; the complex field contributes nothing but must not make the struct empty.
+        let inner = StructType::new_unchecked([
+            field_with_id("p", DataType::INTEGER, true, 2),
+            field_with_id(
+                "a",
+                DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+                true,
+                3,
+            ),
+        ]);
+        let schema = StructType::new_unchecked([field_with_id(
+            "s",
+            DataType::Struct(Box::new(inner)),
+            true,
+            1,
+        )]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
         assert_eq!(stats.fields().count(), 1);
-
-        let mapping_stats = stats.field("mapping").expect("mapping field should exist");
-        let mapping_stats_struct = match mapping_stats.data_type() {
+        let s_stats = stats.field("s").expect("struct column should be present");
+        let s_stats_struct = match s_stats.data_type() {
             DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected struct type for 'mapping'"),
+            _ => panic!("Expected struct type for 's'"),
         };
-
-        // Maps are visited by DataType (not StructField), so primitive map key/value nodes have no
-        // field-id context and therefore produce empty stats.
-        assert_eq!(mapping_stats_struct.fields().count(), 0);
+        // Only the primitive leaf 'p' survives; the array field 'a' is omitted.
+        assert_eq!(s_stats_struct.fields().count(), 1);
+        assert!(s_stats_struct.field("p").is_some());
+        assert!(s_stats_struct.field("a").is_none());
     }
 
     #[test]

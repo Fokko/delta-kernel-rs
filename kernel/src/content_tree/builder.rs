@@ -1799,17 +1799,25 @@ pub(crate) fn build_delta_stats_schema(
 /// format) to `content_stats: {col: {lower_bound, upper_bound, tight_bounds, value_count,
 /// [null_value_count], ...}}` (AMT format) using struct expressions.
 ///
-/// Column names used for field access come from `table_schema` field names (physical names when
-/// column mapping is enabled, which must match the JSON keys in the Delta stats).
+/// Column names used for field access come from `amt_schema` field names, which are the
+/// `table_schema` field names (physical names when column mapping is enabled, which must match the
+/// JSON keys in the Delta stats). `amt_schema` drives the iteration and columns are matched by
+/// name: it omits table columns that carry no leaf statistics (array/map, and structs made up
+/// solely of them), so pairing the two schemas positionally would shift every column after the
+/// first omission onto the wrong statistics.
 fn build_content_stats_from_delta_stats_parsed(
     table_schema: &crate::schema::StructType,
     amt_schema: &crate::schema::StructType,
 ) -> DeltaResult<crate::expressions::Expression> {
-    let col_exprs: Vec<Arc<Expression>> = table_schema
+    let col_exprs: Vec<Arc<Expression>> = amt_schema
         .fields()
-        .zip(amt_schema.fields())
-        .map(|(table_field, amt_field)| {
-            let col_name = table_field.name();
+        .map(|amt_field| {
+            let col_name = amt_field.name();
+            if table_schema.field(col_name).is_none() {
+                return Err(crate::Error::generic(format!(
+                    "AMT stats field '{col_name}' has no matching column in the table schema"
+                )));
+            }
             let col_stats_type = match amt_field.data_type() {
                 DataType::Struct(s) => s.as_ref().clone(),
                 _ => {
@@ -4896,5 +4904,65 @@ mod tests {
         // Next data entry picks up where the first left off (deletes don't consume IDs)
         assert_eq!(builder.pending_entries[3].tracking.first_row_id, Some(100));
         assert_eq!(allocator.current(), 175);
+    }
+
+    #[test]
+    fn test_content_stats_from_delta_stats_parsed_skips_array_without_shifting_later_columns() {
+        fn field_with_id(name: &str, data_type: DataType, field_id: i64) -> StructField {
+            StructField::nullable(name, data_type).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(field_id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(field_id),
+                ),
+            ])
+        }
+
+        // The array column sits between two primitives: it is absent from the AMT stats schema,
+        // so 'b' must still resolve to its own Delta stats rather than the array's.
+        let table_schema = StructType::new_unchecked([
+            field_with_id("a", DataType::INTEGER, 1),
+            field_with_id(
+                "l",
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                2,
+            ),
+            field_with_id("b", DataType::STRING, 3),
+        ]);
+        let amt_schema = stats::stats_schema(&table_schema).unwrap();
+        assert_eq!(
+            amt_schema
+                .fields()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        let expr = build_content_stats_from_delta_stats_parsed(&table_schema, &amt_schema).unwrap();
+        let Expression::Struct(col_exprs, _) = expr else {
+            panic!("expected a struct expression");
+        };
+        assert_eq!(col_exprs.len(), 2);
+
+        // Every column reference in a column's stats sub-expression must name that same column.
+        for (col_expr, expected_col) in col_exprs.iter().zip(["a", "b"]) {
+            let Expression::Struct(field_exprs, _) = col_expr.as_ref() else {
+                panic!("expected a struct expression per column");
+            };
+            for field_expr in field_exprs {
+                let Expression::Column(name) = field_expr.as_ref() else {
+                    continue;
+                };
+                // Only per-column stats are nested under minValues/maxValues/nullCount;
+                // numRecords and tightBounds are table-wide and carry no column component.
+                let parts: Vec<&str> = name.iter().map(String::as_str).collect();
+                if parts.len() == 3 && parts[0] == STATS_PARSED_NAME {
+                    assert_eq!(parts[2], expected_col);
+                }
+            }
+        }
     }
 }
