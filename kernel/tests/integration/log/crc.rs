@@ -1,20 +1,28 @@
 //! Integration tests for CRC (version checksum) file-based APIs on Snapshot.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, FileStatsValidity};
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Engine, FileStats};
+use delta_kernel::transaction::CommittedTransaction;
+use delta_kernel::{DeltaResult, Engine, FileMeta, FileStats};
 use rstest::rstest;
-use test_utils::{add_commit, insert_data, test_table_setup};
+use test_utils::{add_commit, insert_data, read_scan, test_table_setup};
+
+use crate::common::amt_test_utils::{collect_scanned_files, remove_files_by_path};
 
 // ============================================================================
 // File stats from CRC on disk
@@ -1205,6 +1213,402 @@ async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> Delt
     assert_eq!(disk_sizes.len(), 2);
     assert!(disk_sizes.iter().sum::<i64>() > v1_bytes);
     assert_histogram_totals(&crc_v2.file_stats().unwrap(), 2, disk_sizes.iter().sum());
+
+    Ok(())
+}
+
+// ============================================================================
+// Content tree (metadataTree-experimental) tables
+// ============================================================================
+
+/// Creates a table at v0, putting its file inventory in a content tree when `metadata_tree`
+/// is set.
+///
+/// Column mapping is enabled either way, since the metadata tree requires it. That leaves
+/// where the inventory lives as the only difference between the two configurations.
+fn create_tree_test_table(
+    table_path: &str,
+    engine: &dyn Engine,
+    metadata_tree: bool,
+) -> DeltaResult<CommittedTransaction> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let mut properties = vec![("delta.columnMapping.mode", "id")];
+    if metadata_tree {
+        properties.push(("delta.feature.metadataTree-experimental", "supported"));
+    }
+    Ok(create_table(table_path, schema, "test_engine")
+        .with_table_properties(properties)
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?
+        .unwrap_committed())
+}
+
+/// Where the next transaction's base snapshot comes from.
+///
+/// Both leave a CRC on the resulting snapshot, which the tests below need, but they reach it
+/// differently: one inherits the in-memory CRC, the other reads back the one on disk.
+#[derive(Clone, Copy, Debug)]
+enum Chain {
+    /// Reuse the previous commit's post-commit snapshot, which carries the in-memory CRC.
+    PostCommit,
+    /// Persist the CRC and reload the table, so the next commit starts from a snapshot that
+    /// read its CRC back from disk.
+    WriteCrcAndReload,
+}
+
+/// Appends one parquet file per entry in `inserts` and returns the resulting snapshot.
+async fn build_tree_table(
+    table_path: &str,
+    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    inserts: impl IntoIterator<Item = Vec<i32>>,
+    manifest_commit: bool,
+    chain: Chain,
+) -> DeltaResult<SnapshotRef> {
+    let committed = create_tree_test_table(table_path, engine.as_ref(), manifest_commit)?;
+    let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
+    for values in inserts {
+        let committed = insert_into_tree_table(snapshot, engine, values, manifest_commit).await?;
+        let post_commit = committed.post_commit_snapshot().unwrap();
+        snapshot = match chain {
+            Chain::PostCommit => post_commit.clone(),
+            Chain::WriteCrcAndReload => {
+                post_commit.write_checksum(engine.as_ref())?;
+                Snapshot::builder_for(table_path).build(engine.as_ref())?
+            }
+        };
+    }
+    Ok(snapshot)
+}
+
+/// Appends one parquet file, folding it into the content tree when `manifest_commit` is set.
+async fn insert_into_tree_table(
+    snapshot: SnapshotRef,
+    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    values: Vec<i32>,
+    manifest_commit: bool,
+) -> DeltaResult<CommittedTransaction> {
+    let arrow_schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow()?;
+    let column: ArrayRef = Arc::new(Int32Array::from(values));
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![column])
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+    if manifest_commit {
+        txn.with_manifest_commit()?;
+    }
+
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_files_metadata = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
+        .await?;
+    txn.add_files(add_files_metadata);
+    Ok(txn.commit(engine.as_ref())?.unwrap_committed())
+}
+
+/// Sizes of the table's data files, keyed by file name.
+///
+/// Unlike [`parquet_file_sizes_on_disk`] this recurses, because column mapping puts data files
+/// under randomized prefix directories. It skips `_delta_log` so that the content tree's own
+/// manifest parquet files are never counted as data.
+fn data_file_sizes_by_name(table_path: &str) -> HashMap<String, i64> {
+    fn walk(dir: &std::path::Path, sizes: &mut HashMap<String, i64>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path.ends_with("_delta_log") {
+                    walk(&path, sizes);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                sizes.insert(name, std::fs::metadata(&path).unwrap().len() as i64);
+            }
+        }
+    }
+
+    let url = delta_kernel::try_parse_uri(table_path).unwrap();
+    let mut sizes = HashMap::new();
+    walk(&url.to_file_path().unwrap(), &mut sizes);
+    sizes
+}
+
+/// The final segment of a file path as recorded in the log, which is how
+/// [`data_file_sizes_by_name`] keys its entries.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap()
+}
+
+/// Reads a table through a scan and returns the total row count.
+fn count_rows(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> DeltaResult<usize> {
+    let scan = snapshot.scan_builder().build()?;
+    Ok(read_scan(&scan, engine)?
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum())
+}
+
+/// Asserts that two appends of three rows each leave six readable rows.
+///
+/// This is the precondition for everything else in this section: the CRC counts files from
+/// each commit's own delta, so comparing it against the table only means something if the
+/// table itself still has every file.
+async fn assert_two_appends_are_readable(manifest_commit: bool, chain: Chain) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    build_tree_table(
+        &table_path,
+        &engine,
+        [vec![1, 2, 3], vec![4, 5, 6]],
+        manifest_commit,
+        chain,
+    )
+    .await?;
+    assert_eq!(data_file_sizes_by_name(&table_path).len(), 2);
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        count_rows(fresh, engine.clone() as Arc<dyn Engine>)?,
+        6,
+        "both appends should be readable"
+    );
+
+    Ok(())
+}
+
+#[rstest]
+#[case::log_inventory_post_commit(false, Chain::PostCommit)]
+#[case::log_inventory_reload(false, Chain::WriteCrcAndReload)]
+#[case::content_tree_reload(true, Chain::WriteCrcAndReload)]
+#[tokio::test]
+async fn test_repeated_appends_keep_every_file(
+    #[case] manifest_commit: bool,
+    #[case] chain: Chain,
+) -> DeltaResult<()> {
+    assert_two_appends_are_readable(manifest_commit, chain).await
+}
+
+/// The one combination the case above leaves out, and the only one that loses data.
+///
+/// Both parquet files are written, but the second manifest commit builds a root holding only
+/// its own leaf, so half the table becomes unreadable. The cause is visible on the snapshot
+/// the second commit starts from: a post-commit snapshot reports no checkpoint action, so the
+/// commit cannot see that a content root already exists and starts a new tree instead of
+/// extending the old one. Reloading from disk repopulates the checkpoint action, which is why
+/// only this pairing fails.
+///
+/// This blocks incremental CRC on metadata tree tables, since chaining post-commit snapshots
+/// is the only way to carry an in-memory CRC forward.
+#[tokio::test]
+#[ignore = "chaining manifest commits through post-commit snapshots drops the files already \
+            in the content root"]
+async fn test_repeated_appends_through_post_commit_snapshots_keep_every_file() -> DeltaResult<()> {
+    assert_two_appends_are_readable(true, Chain::PostCommit).await
+}
+
+/// Pins down the mechanism behind the ignored test above: a manifest commit leaves its
+/// content root off the post-commit snapshot, even though reloading the same version finds it.
+#[tokio::test]
+async fn test_manifest_commit_omits_content_root_from_post_commit_snapshot() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_tree_test_table(&table_path, engine.as_ref(), true)?;
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+    let committed = insert_into_tree_table(snapshot, &engine, vec![1, 2, 3], true).await?;
+
+    let post_commit = committed.post_commit_snapshot().unwrap();
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(post_commit.version(), reloaded.version());
+    assert!(
+        reloaded.checkpoint_action().is_some(),
+        "the manifest commit did write a content root"
+    );
+    assert!(
+        post_commit.checkpoint_action().is_none(),
+        "post-commit snapshots are expected to omit it; if this now holds the content root, \
+         un-ignore test_repeated_appends_through_post_commit_snapshots_keep_every_file"
+    );
+
+    Ok(())
+}
+
+/// CRC file stats must count the data files and their bytes whether the inventory lives in
+/// the delta log or in a content tree.
+///
+/// The expected byte total comes from the parquet files on disk rather than from the CRC, so
+/// a miscount cannot agree with itself. It would also catch the tree's own manifest parquet
+/// files being counted as data.
+#[rstest]
+#[case::log_inventory(false)]
+#[case::content_tree_inventory(true)]
+#[tokio::test]
+async fn test_crc_file_stats_match_disk_for_tree_and_log_tables(
+    #[case] metadata_tree: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = build_tree_table(
+        &table_path,
+        &engine,
+        [vec![1, 2, 3], vec![4, 5, 6]],
+        metadata_tree,
+        Chain::WriteCrcAndReload,
+    )
+    .await?;
+
+    let disk_sizes = data_file_sizes_by_name(&table_path);
+    assert_eq!(
+        disk_sizes.len(),
+        2,
+        "each insert should write one data file"
+    );
+    let total_bytes: i64 = disk_sizes.values().sum();
+
+    let crc = write_and_verify_crc(&snapshot, &table_path, engine.as_ref());
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 2);
+    assert_eq!(stats.table_size_bytes(), total_bytes);
+    assert_histogram_totals(&stats, 2, total_bytes);
+
+    Ok(())
+}
+
+/// Removing a tree-resident file through a plain log commit must drop exactly that file's
+/// contribution from the CRC, leaving the other file's bytes behind.
+#[tokio::test]
+async fn test_crc_file_stats_after_log_remove_of_tree_resident_file(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = build_tree_table(
+        &table_path,
+        &engine,
+        [vec![1, 2, 3], vec![4, 5, 6]],
+        true,
+        Chain::WriteCrcAndReload,
+    )
+    .await?;
+
+    // Both files are in the tree by now. Remove one of them through the log.
+    let sizes_by_name = data_file_sizes_by_name(&table_path);
+    assert_eq!(sizes_by_name.len(), 2);
+    let live = collect_scanned_files(snapshot.clone(), engine.as_ref())?;
+    let mut paths: Vec<String> = live.file_paths.into_iter().collect();
+    paths.sort();
+    let (removed, kept) = (&paths[0], &paths[1]);
+    let kept_bytes = sizes_by_name[file_name_of(kept)];
+
+    let scan = snapshot.clone().scan_builder().build()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("DELETE".to_string())
+        .with_data_change(true);
+    let count = remove_files_by_path(&mut txn, scan, engine.as_ref(), &[removed.as_str()])?;
+    assert_eq!(count, 1);
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let snapshot = committed.post_commit_snapshot().unwrap();
+    let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 1);
+    assert_eq!(stats.table_size_bytes(), kept_bytes);
+    assert_histogram_totals(&stats, 1, kept_bytes);
+
+    Ok(())
+}
+
+/// A CRC lets a fresh snapshot serve protocol and metadata without replaying the log. The
+/// content root still has to be discovered, so a table whose files live in the tree must stay
+/// fully readable through a CRC-backed snapshot.
+///
+/// Having a CRC must not change what a scan returns, so the same table is read with and
+/// without one.
+#[tokio::test]
+async fn test_crc_backed_snapshot_still_reads_through_content_root() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = build_tree_table(
+        &table_path,
+        &engine,
+        [vec![1, 2, 3], vec![4, 5, 6]],
+        true,
+        Chain::WriteCrcAndReload,
+    )
+    .await?;
+    let any_engine = engine.clone() as Arc<dyn Engine>;
+
+    assert!(
+        snapshot.get_current_crc_if_loaded_for_testing().is_some(),
+        "the CRC written for the last commit should be loaded"
+    );
+    assert!(
+        snapshot.checkpoint_action().is_some(),
+        "a CRC-backed snapshot must still resolve the content root"
+    );
+    assert_eq!(count_rows(snapshot, any_engine.clone())?, 6);
+
+    // Same table, same version, but with the CRC removed.
+    let crc_path = delta_kernel::try_parse_uri(&table_path)?
+        .to_file_path()
+        .unwrap()
+        .join("_delta_log/00000000000000000002.crc");
+    std::fs::remove_file(&crc_path).unwrap();
+
+    let without_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(without_crc
+        .get_current_crc_if_loaded_for_testing()
+        .is_none());
+    assert_eq!(count_rows(without_crc, any_engine)?, 6);
+
+    Ok(())
+}
+
+/// Re-pointing a table at the root manifest it already uses changes no files, so the CRC
+/// must not start reporting different file stats.
+///
+/// An explicit-root commit cannot carry `add_files`, so kernel has no per-file delta to apply
+/// and can only carry the previous stats forward or give up on them. Carrying them forward is
+/// right here; declaring them indeterminate would be defensible in general, since a caller
+/// supplying an arbitrary root can change the file set without kernel seeing it.
+#[tokio::test]
+async fn test_crc_file_stats_after_explicit_root_manifest() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = build_tree_table(
+        &table_path,
+        &engine,
+        [vec![1, 2, 3], vec![4, 5, 6]],
+        true,
+        Chain::WriteCrcAndReload,
+    )
+    .await?;
+    let stats_before = snapshot
+        .get_current_crc_if_loaded_for_testing()
+        .unwrap()
+        .file_stats()
+        .unwrap();
+
+    // Hand kernel back the root it is already using.
+    let checkpoint_action = snapshot
+        .checkpoint_action()
+        .expect("manifest commits should have produced a content root");
+    let root_url = snapshot.table_root().join(checkpoint_action.path())?;
+    let root_meta = FileMeta::new(root_url, 0, checkpoint_action.content_root_size_in_bytes());
+
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string());
+    txn.with_explicit_root_manifest(root_meta)?;
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let snapshot = committed.post_commit_snapshot().unwrap();
+    let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let stats_after = crc
+        .file_stats()
+        .expect("re-pointing at the same root leaves the file set unchanged");
+    assert_eq!(stats_after.num_files(), stats_before.num_files());
+    assert_eq!(
+        stats_after.table_size_bytes(),
+        stats_before.table_size_bytes()
+    );
 
     Ok(())
 }
