@@ -1259,17 +1259,22 @@ enum Chain {
     WriteCrcAndReload,
 }
 
-/// Appends one parquet file per entry in `inserts` and returns the resulting snapshot.
+/// Appends one three-row parquet file per entry in `chains`, taking the base snapshot for the
+/// next append the way that entry says.
+///
+/// Row values are distinct per append, so [`ROWS_PER_APPEND`] times `chains.len()` rows should
+/// be readable afterwards.
 async fn build_tree_table(
     table_path: &str,
     engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    inserts: impl IntoIterator<Item = Vec<i32>>,
+    chains: &[Chain],
     manifest_commit: bool,
-    chain: Chain,
 ) -> DeltaResult<SnapshotRef> {
     let committed = create_tree_test_table(table_path, engine.as_ref(), manifest_commit)?;
     let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
-    for values in inserts {
+    for (i, chain) in chains.iter().enumerate() {
+        let base = (i as i32) * ROWS_PER_APPEND + 1;
+        let values = (base..base + ROWS_PER_APPEND).collect();
         let committed = insert_into_tree_table(snapshot, engine, values, manifest_commit).await?;
         let post_commit = committed.post_commit_snapshot().unwrap();
         snapshot = match chain {
@@ -1282,6 +1287,13 @@ async fn build_tree_table(
     }
     Ok(snapshot)
 }
+
+/// Rows written by each append in [`build_tree_table`].
+const ROWS_PER_APPEND: i32 = 3;
+
+/// Two appends, each reloading afterwards. The chaining the CRC tests below build on, since
+/// it is the only one that keeps a metadata tree intact (see the ignored test).
+const TWO_RELOADS: &[Chain] = &[Chain::WriteCrcAndReload, Chain::WriteCrcAndReload];
 
 /// Appends one parquet file, folding it into the content tree when `manifest_commit` is set.
 async fn insert_into_tree_table(
@@ -1352,71 +1364,88 @@ fn count_rows(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> DeltaResult<usi
         .sum())
 }
 
-/// Asserts that two appends of three rows each leave six readable rows.
+/// Asserts that every append is still readable after the table is built.
 ///
 /// This is the precondition for everything else in this section: the CRC counts files from
 /// each commit's own delta, so comparing it against the table only means something if the
 /// table itself still has every file.
-async fn assert_two_appends_are_readable(manifest_commit: bool, chain: Chain) -> DeltaResult<()> {
+async fn assert_all_appends_are_readable(
+    manifest_commit: bool,
+    chains: &[Chain],
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    build_tree_table(
-        &table_path,
-        &engine,
-        [vec![1, 2, 3], vec![4, 5, 6]],
-        manifest_commit,
-        chain,
-    )
-    .await?;
-    assert_eq!(data_file_sizes_by_name(&table_path).len(), 2);
+    build_tree_table(&table_path, &engine, chains, manifest_commit).await?;
+    assert_eq!(data_file_sizes_by_name(&table_path).len(), chains.len());
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
         count_rows(fresh, engine.clone() as Arc<dyn Engine>)?,
-        6,
-        "both appends should be readable"
+        chains.len() * ROWS_PER_APPEND as usize,
+        "every append should be readable"
     );
 
     Ok(())
 }
 
 #[rstest]
-#[case::log_inventory_post_commit(false, Chain::PostCommit)]
-#[case::log_inventory_reload(false, Chain::WriteCrcAndReload)]
-#[case::content_tree_reload(true, Chain::WriteCrcAndReload)]
+#[case::log_inventory_post_commit(false, &[Chain::PostCommit, Chain::PostCommit])]
+#[case::log_inventory_reload(false, &[Chain::WriteCrcAndReload, Chain::WriteCrcAndReload])]
+#[case::content_tree_reload(true, &[Chain::WriteCrcAndReload, Chain::WriteCrcAndReload])]
 #[tokio::test]
 async fn test_repeated_appends_keep_every_file(
     #[case] manifest_commit: bool,
-    #[case] chain: Chain,
+    #[case] chains: &[Chain],
 ) -> DeltaResult<()> {
-    assert_two_appends_are_readable(manifest_commit, chain).await
+    assert_all_appends_are_readable(manifest_commit, chains).await
 }
 
-/// The one combination the case above leaves out, and the only one that loses data.
+/// Manifest commits lose files as soon as one of them starts from a post-commit snapshot.
 ///
-/// Both parquet files are written, but the second manifest commit builds a root holding only
-/// its own leaf, so half the table becomes unreadable. The cause is visible on the snapshot
-/// the second commit starts from: a post-commit snapshot reports no checkpoint action, so the
-/// commit cannot see that a content root already exists and starts a new tree instead of
-/// extending the old one. Reloading from disk repopulates the checkpoint action, which is why
-/// only this pairing fails.
+/// A post-commit snapshot never records the content root its own commit just wrote; it only
+/// carries forward whatever the read snapshot had. The next manifest commit therefore either
+/// sees no root at all and replays the delta log from version 0, which cannot find files that
+/// live in the tree rather than the log, or sees a stale root and rebuilds from that. Either
+/// way the files added by the commit in between are dropped, silently: every commit succeeds
+/// and every parquet file is on disk.
 ///
-/// This blocks incremental CRC on metadata tree tables, since chaining post-commit snapshots
-/// is the only way to carry an in-memory CRC forward.
+/// The two cases separate those flavors. In the first, the second commit sees no root. In the
+/// second, a reload gives the second commit a real root, so it is the third commit that
+/// inherits a stale one pointing at the first root and loses the second append.
+///
+/// This is what blocks incremental CRC on metadata tree tables, since chaining post-commit
+/// snapshots is the only way to carry an in-memory CRC forward.
+#[rstest]
+#[case::second_commit_sees_no_root(&[Chain::PostCommit, Chain::PostCommit])]
+#[case::third_commit_sees_a_stale_root(
+    &[Chain::WriteCrcAndReload, Chain::PostCommit, Chain::PostCommit]
+)]
 #[tokio::test]
-#[ignore = "chaining manifest commits through post-commit snapshots drops the files already \
-            in the content root"]
-async fn test_repeated_appends_through_post_commit_snapshots_keep_every_file() -> DeltaResult<()> {
-    assert_two_appends_are_readable(true, Chain::PostCommit).await
+#[ignore = "a manifest commit based on a post-commit snapshot cannot see the content root \
+            written by the commit that produced it, so it drops the files already in the tree"]
+async fn test_manifest_commits_keep_every_file_when_chained_through_post_commit_snapshots(
+    #[case] chains: &[Chain],
+) -> DeltaResult<()> {
+    assert_all_appends_are_readable(true, chains).await
 }
 
-/// Pins down the mechanism behind the ignored test above: a manifest commit leaves its
-/// content root off the post-commit snapshot, even though reloading the same version finds it.
+/// Pins down the mechanism behind the ignored test above, and records what it costs.
+///
+/// A manifest commit leaves its content root off the post-commit snapshot even though
+/// reloading the same version finds it. Without the root that snapshot has no inventory to
+/// read, so scanning it returns nothing -- the same blindness that makes the next manifest
+/// commit rebuild the tree from scratch.
+///
+/// Both assertions describe current behavior rather than desired behavior. If either starts
+/// failing the bug is fixed, and
+/// `test_manifest_commits_keep_every_file_when_chained_through_post_commit_snapshots` should
+/// be un-ignored.
 #[tokio::test]
 async fn test_manifest_commit_omits_content_root_from_post_commit_snapshot() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_tree_test_table(&table_path, engine.as_ref(), true)?;
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
     let committed = insert_into_tree_table(snapshot, &engine, vec![1, 2, 3], true).await?;
+    let any_engine = engine.clone() as Arc<dyn Engine>;
 
     let post_commit = committed.post_commit_snapshot().unwrap();
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1425,10 +1454,13 @@ async fn test_manifest_commit_omits_content_root_from_post_commit_snapshot() -> 
         reloaded.checkpoint_action().is_some(),
         "the manifest commit did write a content root"
     );
-    assert!(
-        post_commit.checkpoint_action().is_none(),
-        "post-commit snapshots are expected to omit it; if this now holds the content root, \
-         un-ignore test_repeated_appends_through_post_commit_snapshots_keep_every_file"
+    assert_eq!(count_rows(reloaded, any_engine.clone())?, 3);
+
+    assert!(post_commit.checkpoint_action().is_none());
+    assert_eq!(
+        count_rows(post_commit.clone(), any_engine)?,
+        0,
+        "with no content root the post-commit snapshot has no files to scan"
     );
 
     Ok(())
@@ -1448,14 +1480,7 @@ async fn test_crc_file_stats_match_disk_for_tree_and_log_tables(
     #[case] metadata_tree: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = build_tree_table(
-        &table_path,
-        &engine,
-        [vec![1, 2, 3], vec![4, 5, 6]],
-        metadata_tree,
-        Chain::WriteCrcAndReload,
-    )
-    .await?;
+    let snapshot = build_tree_table(&table_path, &engine, TWO_RELOADS, metadata_tree).await?;
 
     let disk_sizes = data_file_sizes_by_name(&table_path);
     assert_eq!(
@@ -1480,14 +1505,7 @@ async fn test_crc_file_stats_match_disk_for_tree_and_log_tables(
 async fn test_crc_file_stats_after_log_remove_of_tree_resident_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = build_tree_table(
-        &table_path,
-        &engine,
-        [vec![1, 2, 3], vec![4, 5, 6]],
-        true,
-        Chain::WriteCrcAndReload,
-    )
-    .await?;
+    let snapshot = build_tree_table(&table_path, &engine, TWO_RELOADS, true).await?;
 
     // Both files are in the tree by now. Remove one of them through the log.
     let sizes_by_name = data_file_sizes_by_name(&table_path);
@@ -1526,14 +1544,7 @@ async fn test_crc_file_stats_after_log_remove_of_tree_resident_file(
 #[tokio::test]
 async fn test_crc_backed_snapshot_still_reads_through_content_root() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = build_tree_table(
-        &table_path,
-        &engine,
-        [vec![1, 2, 3], vec![4, 5, 6]],
-        true,
-        Chain::WriteCrcAndReload,
-    )
-    .await?;
+    let snapshot = build_tree_table(&table_path, &engine, TWO_RELOADS, true).await?;
     let any_engine = engine.clone() as Arc<dyn Engine>;
 
     assert!(
@@ -1572,14 +1583,7 @@ async fn test_crc_backed_snapshot_still_reads_through_content_root() -> DeltaRes
 #[tokio::test]
 async fn test_crc_file_stats_after_explicit_root_manifest() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = build_tree_table(
-        &table_path,
-        &engine,
-        [vec![1, 2, 3], vec![4, 5, 6]],
-        true,
-        Chain::WriteCrcAndReload,
-    )
-    .await?;
+    let snapshot = build_tree_table(&table_path, &engine, TWO_RELOADS, true).await?;
     let stats_before = snapshot
         .get_current_crc_if_loaded_for_testing()
         .unwrap()
