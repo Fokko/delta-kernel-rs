@@ -23,7 +23,9 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::manifest_commit_setup::create_manifest_commit_table;
+use crate::common::manifest_commit_setup::{
+    create_manifest_commit_table, create_manifest_commit_table_with_schema,
+};
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -1380,6 +1382,135 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
     assert_eq!(base_row_ids.len(), 5, "Should have 5 data files total");
     let row_ids: Vec<i64> = base_row_ids.iter().map(|(_, id)| *id).collect();
     assert_eq!(row_ids, vec![0, 10, 30, 45, 50]);
+
+    Ok(())
+}
+
+/// Every column nullable, so the content tree's stats carry `null_value_count`.
+///
+/// The tests below scan with [`ScanBuilder::include_all_stats_columns`], which reads that field
+/// back; see `test_batch_commit_scan_with_stats_columns_supports_non_nullable_columns` for what
+/// happens without it.
+fn all_nullable_schema() -> DeltaResult<SchemaRef> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?))
+}
+
+/// Moving a file between leaves must leave its row IDs alone.
+///
+/// A row ID names a row, so an OPTIMIZE that only reshuffles which leaf manifest describes a
+/// file -- same parquet file, same path, same rows, same order -- has to carry `baseRowId`
+/// across. Reassigning changes the identity of every row in the moved file, and nothing about
+/// the commit says it happened: it succeeds, scans fine, and returns the same data.
+///
+/// The high water mark shows the same thing from the writer's side. A move allocates no rows,
+/// so it should still be 29.
+#[tokio::test]
+#[ignore = "the scan-row ingest path writes a null firstRowId for files it re-adds, so the \
+            allocator hands moved files fresh row IDs instead of preserving their own"]
+async fn test_batch_commit_preserves_base_row_ids_when_moving_files_between_leaves(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    // Commit 0: two files, 10 + 20 records, in one leaf.
+    let mut txn = create_manifest_commit_table_with_schema(
+        &table_path,
+        engine.as_ref(),
+        all_nullable_schema()?,
+    )?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![
+            ("file1.parquet", 1024, 1_000_000, 10),
+            ("file2.parquet", 2048, 1_000_001, 20),
+        ],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let before = collect_base_row_ids(snapshot.clone(), engine.as_ref())?;
+    assert_eq!(
+        before.iter().map(|(_, id)| *id).collect_vec(),
+        vec![0, 10],
+        "the two files should start at the front of the row ID space"
+    );
+
+    // Commit 1: move both files into a new leaf, changing nothing else.
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("OPTIMIZE".to_string());
+    let scan_metadata = scan
+        .scan_metadata(engine.as_ref())?
+        .next()
+        .expect("scan should produce metadata")?;
+    {
+        let mc = txn.with_manifest_commit()?;
+        let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
+        leaf.add_existing_actions(engine.as_ref(), scan_metadata.scan_files)?;
+        mc.add_leaf(leaf.finish(engine.as_ref())?)?;
+    }
+    commit_at(txn, engine.as_ref(), 1)?;
+
+    let moved = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    assert_eq!(
+        collect_base_row_ids(moved, engine.as_ref())?,
+        before,
+        "moving a file between leaves should not renumber its rows"
+    );
+    verify_batch_commit_hwm(&table_url, 1, 29).await?;
+
+    Ok(())
+}
+
+/// A non-nullable column should not stop a metadata tree table from scanning its stats.
+///
+/// The content tree omits `null_value_count` for a column that cannot be null, but the read
+/// side projects that field for every column, so the scan fails to resolve it. Nothing here is
+/// specific to row tracking; this is the cheapest place to pin it down, because the failure is
+/// what stands between the test above and the behavior it wants to check.
+///
+/// The error surfaces at `scan_metadata`, which is where any caller reorganizing a table has to
+/// start, so OPTIMIZE is unreachable on such a table rather than merely degraded.
+#[tokio::test]
+#[ignore = "the content tree omits null_value_count for non-nullable columns but the scan \
+            projects it unconditionally, so resolving the column fails"]
+async fn test_batch_commit_scan_with_stats_columns_supports_non_nullable_columns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    // `create_manifest_commit_table` declares `id` NOT NULL; everything else matches the
+    // passing tests above.
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("file1.parquet", 1024, 1_000_000, 10)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?;
+    let batches: Vec<_> = scan.scan_metadata(engine.as_ref())?.try_collect()?;
+    assert_eq!(batches.len(), 1);
 
     Ok(())
 }

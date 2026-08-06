@@ -149,10 +149,21 @@ pub fn create_manifest_commit_table(
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<Transaction<CreateTable>> {
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("value", DataType::STRING, true),
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
     ])?);
+    create_manifest_commit_table_with_schema(table_path, engine, schema)
+}
 
+/// [`create_manifest_commit_table`] over a caller-supplied schema.
+///
+/// Column nullability is not inert here: it decides which fields the content tree's stats
+/// carry, so tests that scan stats need to choose it deliberately.
+pub fn create_manifest_commit_table_with_schema(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+    schema: SchemaRef,
+) -> DeltaResult<Transaction<CreateTable>> {
     let txn = kernel_create_table(table_path, schema, "TestEngine/1.0")
         .with_table_properties([
             ("delta.columnMapping.mode", "id"),
