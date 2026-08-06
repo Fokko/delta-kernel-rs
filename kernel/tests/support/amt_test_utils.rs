@@ -827,7 +827,7 @@ pub fn assert_scan_dv(
 }
 
 /// Collects each scanned file's DV, keyed by path.
-fn collect_scan_dvs(
+pub fn collect_scan_dvs(
     scan: Scan,
     engine: &dyn Engine,
 ) -> DeltaResult<HashMap<String, Option<ExpectedDv>>> {

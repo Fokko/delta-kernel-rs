@@ -15,6 +15,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
@@ -23,17 +24,22 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
-};
+use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Engine, Snapshot, Version};
+use delta_kernel::{
+    Engine, Expression as Expr, Predicate as Pred, PredicateRef, Snapshot, Version,
+};
 use rstest::rstest;
-use test_utils::{create_table, engine_store_setup, read_scan};
+use test_utils::{engine_store_setup, read_scan};
 use url::Url;
+use uuid::Uuid;
 
-use crate::common::amt_test_utils::{collect_scanned_files, remove_files_by_path};
+use crate::common::amt_test_utils::{
+    collect_scan_dvs, collect_scanned_files, dv_descriptor, remove_files_by_path,
+};
 
 type TestEngine = Arc<DefaultEngine<TokioBackgroundExecutor>>;
 
@@ -57,15 +63,6 @@ enum TreeMode {
 }
 
 impl TreeMode {
-    /// Reader and writer features to create the table with.
-    fn table_features(self) -> (Vec<&'static str>, Vec<&'static str>) {
-        let mut features = vec!["columnMapping", "deletionVectors"];
-        if self == TreeMode::Amt {
-            features.push("metadataTree-experimental");
-        }
-        (features.clone(), features)
-    }
-
     /// A suffix making each mode's table name unique within a scenario.
     fn table_suffix(self) -> &'static str {
         match self {
@@ -95,6 +92,12 @@ enum Op {
     /// RFC-shaped log removal, which handles files the content tree owns and files only the
     /// log knows about alike.
     RemoveFilesFrom { origin: usize },
+    /// Attaches a deletion vector of `cardinality` rows to every file the [`Op::Append`] at
+    /// `origin` produced.
+    ///
+    /// The vector's backing file is never written, so a workload containing this op compares
+    /// scan metadata only -- see [`Workload::reads_data`].
+    AddDvTo { origin: usize, cardinality: i64 },
 }
 
 impl Op {
@@ -133,28 +136,58 @@ impl Op {
     }
 }
 
+/// A scenario: what table to build, what to do to it, and how to look at it.
+struct Workload<'a> {
+    /// Names the pair of tables this scenario creates.
+    scenario: &'a str,
+    schema: SchemaRef,
+    layout: DataLayout,
+    ops: &'a [Op],
+}
+
+impl<'a> Workload<'a> {
+    fn new(scenario: &'a str, schema: SchemaRef, ops: &'a [Op]) -> Self {
+        Self {
+            scenario,
+            schema,
+            layout: DataLayout::None,
+            ops,
+        }
+    }
+
+    fn with_layout(mut self, layout: DataLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Whether scans may read data files. Deletion vectors are recorded as descriptors
+    /// pointing at bitmap files the harness never writes, so any workload using them is
+    /// limited to comparing scan metadata.
+    fn reads_data(&self) -> bool {
+        !self.ops.iter().any(|op| matches!(op, Op::AddDvTo { .. }))
+    }
+}
+
 /// Everything a scan can observe about a table at one version, normalized so that two runs
 /// of the same workload are directly comparable.
 #[derive(Debug, PartialEq, Eq)]
 struct TableState {
     version: Version,
-    /// Pretty-printed scan output, with data rows sorted.
-    data: Vec<String>,
-    /// Live files identified by the op that produced them. Parquet file names contain a
-    /// fresh UUID per write, so the raw paths never match across runs.
-    files: BTreeSet<usize>,
+    /// Pretty-printed scan output with data rows sorted, or `None` when the workload cannot
+    /// read data files.
+    data: Option<Vec<String>>,
+    /// Live files, each identified by the op that produced it and by the cardinality of its
+    /// deletion vector. Parquet file names contain a fresh UUID per write, so the raw paths
+    /// never match across runs.
+    files: BTreeSet<(usize, Option<i64>)>,
 }
 
-/// Runs `ops` under both tree modes and asserts the two tables look the same at every
+/// Runs `workload` under both tree modes and asserts the two tables look the same at every
 /// version.
-async fn assert_modes_agree(
-    scenario: &str,
-    schema: &SchemaRef,
-    partition_cols: &[&str],
-    ops: &[Op],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let amt = run_workload(scenario, TreeMode::Amt, schema, partition_cols, ops).await?;
-    let log = run_workload(scenario, TreeMode::Log, schema, partition_cols, ops).await?;
+async fn assert_modes_agree(workload: Workload<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let scenario = workload.scenario;
+    let amt = run_workload(&workload, TreeMode::Amt).await?;
+    let log = run_workload(&workload, TreeMode::Log).await?;
 
     assert_eq!(
         amt.len(),
@@ -171,37 +204,60 @@ async fn assert_modes_agree(
     Ok(())
 }
 
-/// Builds a table in `mode`, applies `ops` in order, and captures a [`TableState`] after
-/// each one (plus the initial empty state at version 0).
+/// Replays `workload` in `mode`, returning the [`TableState`] observed after each op.
+///
+/// Also asserts those states are reproducible from cold snapshot loads, so a mode that only
+/// reads correctly while a table is growing in place does not pass unnoticed.
 async fn run_workload(
-    scenario: &str,
+    workload: &Workload<'_>,
     mode: TreeMode,
-    schema: &SchemaRef,
-    partition_cols: &[&str],
-    ops: &[Op],
 ) -> Result<Vec<TableState>, Box<dyn std::error::Error>> {
-    let table_name = format!("{scenario}_{}", mode.table_suffix());
-    let (store, engine, location) = engine_store_setup(&table_name, None);
-    let engine: TestEngine = Arc::new(engine);
+    let table_name = format!("{}_{}", workload.scenario, mode.table_suffix());
+    let (url, engine, file_origin, states) = build_table(workload, mode).await?;
 
-    let (reader_features, writer_features) = mode.table_features();
-    let url = create_table(
-        store,
-        location,
-        schema.clone(),
-        partition_cols,
-        true,
-        reader_features,
-        writer_features,
-    )
-    .await?;
+    // Re-read every version from scratch. The states above came from a table that grew in
+    // place; these come from cold snapshot loads, which is the path time travel takes.
+    let latest = states.last().expect("at least the initial state").version;
+    let mut time_traveled = Vec::with_capacity(states.len());
+    for version in 0..=latest {
+        time_traveled.push(capture_state(
+            &url,
+            &engine,
+            workload,
+            Some(version),
+            &file_origin,
+        )?);
+    }
+    assert_eq!(
+        states, time_traveled,
+        "{table_name}: time travel disagrees with the incrementally observed states"
+    );
+
+    Ok(states)
+}
+
+/// Creates the table in `mode` and applies the workload's ops, capturing a [`TableState`]
+/// after each one (plus the initial empty state at version 0).
+///
+/// Returns the table, its engine, the map from file path to the op that produced it, and the
+/// captured states.
+#[allow(clippy::type_complexity)]
+async fn build_table(
+    workload: &Workload<'_>,
+    mode: TreeMode,
+) -> Result<(Url, TestEngine, HashMap<String, usize>, Vec<TableState>), Box<dyn std::error::Error>>
+{
+    let table_name = format!("{}_{}", workload.scenario, mode.table_suffix());
+    let (_store, engine, url) = engine_store_setup(&table_name, None);
+    let engine: TestEngine = Arc::new(engine);
+    create_table_for_mode(&url, &engine, workload, mode)?;
 
     // Records which op produced each file, so states compare independently of the random
     // parquet names every run generates.
     let mut file_origin: HashMap<String, usize> = HashMap::new();
-    let mut states = vec![capture_state(&url, &engine, None, &file_origin)?];
+    let mut states = vec![capture_state(&url, &engine, workload, None, &file_origin)?];
 
-    for (op_index, op) in ops.iter().enumerate() {
+    for (op_index, op) in workload.ops.iter().enumerate() {
         match op {
             Op::Append {
                 values,
@@ -211,7 +267,7 @@ async fn run_workload(
                 append(
                     &url,
                     &engine,
-                    schema,
+                    &workload.schema,
                     mode,
                     values,
                     *partition,
@@ -222,28 +278,48 @@ async fn run_workload(
             Op::RemoveFilesFrom { origin } => {
                 remove_files_from(&url, &engine, &file_origin, *origin)?;
             }
+            Op::AddDvTo {
+                origin,
+                cardinality,
+            } => {
+                add_dv_to(&url, &engine, &file_origin, *origin, *cardinality)?;
+            }
         }
 
         // Any path not seen before belongs to the op that just ran.
         for path in live_paths(&url, &engine)? {
             file_origin.entry(path).or_insert(op_index);
         }
-        states.push(capture_state(&url, &engine, None, &file_origin)?);
+        states.push(capture_state(&url, &engine, workload, None, &file_origin)?);
     }
 
-    // Re-read every version from scratch. The states above came from a table that grew in
-    // place; these come from cold snapshot loads, which is the path time travel takes.
-    let latest = states.last().expect("at least the initial state").version;
-    let mut time_traveled = Vec::with_capacity(states.len());
-    for version in 0..=latest {
-        time_traveled.push(capture_state(&url, &engine, Some(version), &file_origin)?);
-    }
-    assert_eq!(
-        states, time_traveled,
-        "{table_name}: time travel disagrees with the incrementally observed states"
-    );
+    Ok((url, engine, file_origin, states))
+}
 
-    Ok(states)
+/// Creates the table, enabling the metadata tree only for [`TreeMode::Amt`].
+fn create_table_for_mode(
+    url: &Url,
+    engine: &TestEngine,
+    workload: &Workload<'_>,
+    mode: TreeMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Column mapping is on in both modes because AMT requires it, and deletion vectors are
+    // on so a DV workload does not also change the protocol between modes.
+    let mut properties = vec![
+        ("delta.columnMapping.mode", "id"),
+        ("delta.feature.deletionVectors", "supported"),
+    ];
+    if mode == TreeMode::Amt {
+        properties.push(("delta.feature.metadataTree-experimental", "supported"));
+    }
+
+    create_table(url.as_str(), workload.schema.clone(), "amt equivalence")
+        .with_data_layout(workload.layout.clone())
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    Ok(())
 }
 
 /// Appends one parquet file holding `values`.
@@ -288,10 +364,7 @@ async fn append(
         .await?;
     txn.add_files(add_files_metadata);
 
-    match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(_) => Ok(()),
-        other => Err(format!("expected a committed transaction, got {other:?}").into()),
-    }
+    commit(txn, engine)
 }
 
 /// Removes every live file produced by the op at `origin`.
@@ -301,15 +374,8 @@ fn remove_files_from(
     file_origin: &HashMap<String, usize>,
     origin: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let targets: Vec<&str> = file_origin
-        .iter()
-        .filter(|(_, op_index)| **op_index == origin)
-        .map(|(path, _)| path.as_str())
-        .collect();
-    assert!(
-        !targets.is_empty(),
-        "op {origin} produced no files to remove"
-    );
+    let targets = paths_from_op(file_origin, origin);
+    let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
 
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
@@ -319,7 +385,7 @@ fn remove_files_from(
         .with_data_change(true);
 
     let scan = snapshot.scan_builder().build()?;
-    let removed = remove_files_by_path(&mut txn, scan, engine.as_ref(), &targets)?;
+    let removed = remove_files_by_path(&mut txn, scan, engine.as_ref(), &target_refs)?;
     assert_eq!(
         removed,
         targets.len(),
@@ -327,13 +393,73 @@ fn remove_files_from(
         targets.len()
     );
 
+    commit(txn, engine)
+}
+
+/// Attaches a deletion vector to every live file produced by the op at `origin`.
+fn add_dv_to(
+    url: &Url,
+    engine: &TestEngine,
+    file_origin: &HashMap<String, usize>,
+    origin: usize,
+    cardinality: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("amt equivalence")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    // The UUID is derived from the target op so both runs produce byte-identical
+    // descriptors; a random one would make the two tables trivially unequal.
+    let new_dvs: HashMap<String, DeletionVectorDescriptor> = paths_from_op(file_origin, origin)
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let uuid = Uuid::from_u128((origin * 1000 + index) as u128);
+            let (descriptor, _location) = dv_descriptor(uuid, 1, 40, cardinality);
+            (path, descriptor)
+        })
+        .collect();
+
+    let current_files: Vec<_> = snapshot
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|metadata| metadata.scan_files)
+        .collect();
+    txn.update_deletion_vectors(new_dvs, current_files.into_iter().map(Ok))?;
+
+    commit(txn, engine)
+}
+
+/// Commits `txn`, requiring it to succeed.
+fn commit(
+    txn: delta_kernel::transaction::Transaction,
+    engine: &TestEngine,
+) -> Result<(), Box<dyn std::error::Error>> {
     match txn.commit(engine.as_ref())? {
         CommitResult::CommittedTransaction(_) => Ok(()),
         other => Err(format!("expected a committed transaction, got {other:?}").into()),
     }
 }
 
-/// The paths of every file a scan currently sees.
+/// The paths of every live file produced by the op at `origin`.
+fn paths_from_op(file_origin: &HashMap<String, usize>, origin: usize) -> Vec<String> {
+    let paths: Vec<String> = file_origin
+        .iter()
+        .filter(|(_, op_index)| **op_index == origin)
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert!(!paths.is_empty(), "op {origin} produced no files");
+    paths
+}
+
+/// The paths of every file an unfiltered scan currently sees.
 fn live_paths(url: &Url, engine: &TestEngine) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     Ok(collect_scanned_files(snapshot, engine.as_ref())?
@@ -346,6 +472,7 @@ fn live_paths(url: &Url, engine: &TestEngine) -> Result<Vec<String>, Box<dyn std
 fn capture_state(
     url: &Url,
     engine: &TestEngine,
+    workload: &Workload<'_>,
     version: Option<Version>,
     file_origin: &HashMap<String, usize>,
 ) -> Result<TableState, Box<dyn std::error::Error>> {
@@ -354,24 +481,34 @@ fn capture_state(
         builder = builder.at_version(version);
     }
     let snapshot = builder.build(engine.as_ref())?;
+    let snapshot_version = snapshot.version();
 
-    let files = collect_scanned_files(snapshot.clone(), engine.as_ref())?
-        .file_paths
+    // Rejects a file surfacing twice, which a content root fused with the log could
+    // otherwise do unnoticed.
+    collect_scanned_files(snapshot.clone(), engine.as_ref())?;
+
+    let files = collect_scan_dvs(snapshot.clone().scan_builder().build()?, engine.as_ref())?
         .iter()
-        .map(|path| {
-            *file_origin
+        .map(|(path, dv)| {
+            let origin = *file_origin
                 .get(path)
-                .unwrap_or_else(|| panic!("file {path} has no recorded origin"))
+                .unwrap_or_else(|| panic!("file {path} has no recorded origin"));
+            (origin, dv.as_ref().map(|dv| dv.cardinality))
         })
         .collect();
 
-    let version = snapshot.version();
-    let scan = snapshot.scan_builder().build()?;
-    let batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?;
+    let data = workload
+        .reads_data()
+        .then(|| {
+            let scan = snapshot.scan_builder().build()?;
+            read_scan(&scan, engine.clone() as Arc<dyn Engine>)
+        })
+        .transpose()?
+        .map(|batches| sorted_rows(&batches));
 
     Ok(TableState {
-        version,
-        data: sorted_rows(&batches),
+        version: snapshot_version,
+        data,
         files,
     })
 }
@@ -394,34 +531,19 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
 // Schemas
 // ==============================================================================
 
-/// A field carrying the column-mapping metadata that AMT tables require.
-fn mapped_field(name: &str, data_type: DataType, id: i64) -> StructField {
-    StructField::nullable(name, data_type).with_metadata([
-        (
-            ColumnMetadataKey::ColumnMappingId.as_ref(),
-            MetadataValue::Number(id),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String(format!("col-{id}")),
-        ),
-    ])
-}
-
-/// Single `id` column.
+/// Single `id` column. Column mapping metadata is assigned by `create_table`.
 fn id_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![mapped_field(
+    Ok(Arc::new(StructType::try_new(vec![StructField::nullable(
         "id",
         DataType::INTEGER,
-        1,
     )])?))
 }
 
 /// An `id` column plus a `category` column to partition on.
 fn partitioned_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
     Ok(Arc::new(StructType::try_new(vec![
-        mapped_field("id", DataType::INTEGER, 1),
-        mapped_field(PARTITION_COL, DataType::STRING, 2),
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(PARTITION_COL, DataType::STRING),
     ])?))
 }
 
@@ -451,12 +573,11 @@ async fn test_amt_matches_log_for_appends(
         })
         .collect();
 
-    assert_modes_agree(
+    assert_modes_agree(Workload::new(
         &format!("appends_root_at_{manifest_commit_at}"),
-        &id_schema()?,
-        &[],
+        id_schema()?,
         &ops,
-    )
+    ))
     .await
 }
 
@@ -471,7 +592,12 @@ async fn test_amt_matches_log_for_consecutive_manifest_commits(
         Op::manifest_append([7, 8, 9]),
     ];
 
-    assert_modes_agree("consecutive_manifest_commits", &id_schema()?, &[], &ops).await
+    assert_modes_agree(Workload::new(
+        "consecutive_manifest_commits",
+        id_schema()?,
+        &ops,
+    ))
+    .await
 }
 
 /// Removes a file that the content root owns and a file that only the log knows about, so
@@ -491,11 +617,199 @@ async fn test_amt_matches_log_for_removes(
         Op::RemoveFilesFrom { origin },
     ];
 
-    assert_modes_agree(
+    assert_modes_agree(Workload::new(
         &format!("removes_origin_{origin}"),
-        &id_schema()?,
-        &[],
+        id_schema()?,
         &ops,
+    ))
+    .await
+}
+
+/// Attaches a deletion vector to a file the content root owns and to a file only the log
+/// knows about. Compares scan metadata only, since the vectors' backing files do not exist.
+#[rstest]
+#[case::dv_on_file_in_content_root(0)]
+#[case::dv_on_file_added_after_root(2)]
+#[tokio::test]
+async fn test_amt_matches_log_for_deletion_vectors(
+    #[case] origin: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ops = [
+        Op::append([1, 2, 3]),
+        Op::manifest_append([4, 5, 6]),
+        Op::append([7, 8, 9]),
+        Op::AddDvTo {
+            origin,
+            cardinality: 2,
+        },
+    ];
+
+    assert_modes_agree(Workload::new(
+        &format!("dvs_origin_{origin}"),
+        id_schema()?,
+        &ops,
+    ))
+    .await
+}
+
+/// Data skipping over a table holding a non-matching file in the content tree, a non-matching
+/// file in the log, and two matching files. Both ways a file can reach the tree are covered:
+/// folded in from a prior log commit, or written straight there through `add_files`.
+///
+/// Exact file-set equality would be the wrong bar for a filtered scan, because skipping is
+/// best-effort and AMT is meant to prune *more* than the log, not the same. So the comparison
+/// asserts the two properties that should hold either way: no matching row is lost, and AMT
+/// prunes at least as much as the log.
+///
+/// Both arrangements pass, and each holds the table to exactly one manifest commit. That is
+/// what makes the failure in [`test_amt_skipping_after_a_second_manifest_commit`] specific --
+/// bounds arrive in the tree correctly, and are lost later.
+#[rstest]
+#[case::file_folded_into_tree(
+    [
+        Op::append([1, 2, 3]),
+        Op::manifest_append([40, 50, 60]),
+        Op::append([7, 8, 9]),
+        Op::append([70, 80, 90]),
+    ]
+)]
+#[case::file_written_into_tree(
+    [
+        Op::manifest_append([1, 2, 3]),
+        Op::append([40, 50, 60]),
+        Op::append([7, 8, 9]),
+        Op::append([70, 80, 90]),
+    ]
+)]
+#[tokio::test]
+async fn test_amt_skips_tree_resident_file_after_one_manifest_commit(
+    #[case] ops: [Op; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_skipping_at_least_as_good("skip_one_commit", &ops).await
+}
+
+/// The same two arrangements, each given a second manifest commit at op 3.
+///
+/// Nothing else changes: op 0's file is already in the tree with usable bounds, as
+/// [`test_amt_skips_tree_resident_file_after_one_manifest_commit`] shows. The second manifest
+/// commit reloads the root the first one wrote, and afterwards op 0 is no longer skippable,
+/// while the log-backed run still prunes it. Whichever way op 0 first reached the tree makes
+/// no difference, so the loss is in reloading a root rather than in populating it.
+#[rstest]
+#[case::root_built_from_folded_add(
+    [
+        Op::append([1, 2, 3]),
+        Op::manifest_append([40, 50, 60]),
+        Op::append([7, 8, 9]),
+        Op::manifest_append([70, 80, 90]),
+    ]
+)]
+#[case::root_built_from_written_add(
+    [
+        Op::manifest_append([1, 2, 3]),
+        Op::manifest_append([40, 50, 60]),
+        Op::append([7, 8, 9]),
+        Op::append([70, 80, 90]),
+    ]
+)]
+#[tokio::test]
+#[ignore = "a manifest commit that reloads an existing content root drops the stats bounds of \
+            the entries already in it, so those files stop being skippable"]
+async fn test_amt_skipping_after_a_second_manifest_commit(
+    #[case] ops: [Op; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_skipping_at_least_as_good("skip_second_commit", &ops).await
+}
+
+/// Asserts a filtered scan loses no matching row under either mode, and that AMT prunes at
+/// least as many files as the log.
+///
+/// `ops` must put the non-matching values below `THRESHOLD` and the matching ones above it.
+async fn assert_skipping_at_least_as_good(
+    scenario: &str,
+    ops: &[Op],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const THRESHOLD: i32 = 30;
+    let workload = Workload::new(scenario, id_schema()?, ops);
+    let predicate: PredicateRef = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(THRESHOLD)));
+
+    let mut outcomes = Vec::new();
+    for mode in [TreeMode::Amt, TreeMode::Log] {
+        let (url, engine, file_origin, _) = build_table(&workload, mode).await?;
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate.clone())
+            .build()?;
+        // Naming survivors by the op that wrote them keeps the failure readable, since the
+        // parquet names are random.
+        let mut survivors: Vec<usize> = collect_scan_dvs(scan, engine.as_ref())?
+            .keys()
+            .map(|path| file_origin[path])
+            .collect();
+        survivors.sort_unstable();
+
+        let scan = snapshot
+            .scan_builder()
+            .with_predicate(predicate.clone())
+            .build()?;
+        let batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?;
+        outcomes.push((survivors, matching_ids(&batches, THRESHOLD)));
+    }
+    let (amt_survivors, amt_ids) = &outcomes[0];
+    let (log_survivors, log_ids) = &outcomes[1];
+
+    assert_eq!(
+        amt_ids, log_ids,
+        "data skipping dropped rows matching the predicate"
+    );
+    assert!(
+        amt_survivors.len() <= log_survivors.len(),
+        "AMT kept files from ops {amt_survivors:?} where the log kept only {log_survivors:?}; \
+         a metadata tree should prune at least as much as the log"
+    );
+    Ok(())
+}
+
+/// The sorted `id` values above `threshold` across `batches`.
+///
+/// A predicate only tells kernel which files it may skip, so surviving files still carry
+/// non-matching rows; filtering here isolates the rows the scan was actually asked for.
+fn matching_ids(batches: &[RecordBatch], threshold: i32) -> Vec<i32> {
+    let mut ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .expect("scan output has an id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id is an int column")
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .filter(|id| *id > threshold)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Appends to a table clustered on `id`, which puts clustering domain metadata and
+/// clustering-driven stats alongside the content tree.
+#[tokio::test]
+async fn test_amt_matches_log_for_clustered_appends() -> Result<(), Box<dyn std::error::Error>> {
+    let ops = [
+        Op::append([1, 2, 3]),
+        Op::manifest_append([4, 5, 6]),
+        Op::append([7, 8, 9]),
+    ];
+
+    assert_modes_agree(
+        Workload::new("clustered_appends", id_schema()?, &ops)
+            .with_layout(DataLayout::clustered(["id"])),
     )
     .await
 }
@@ -544,10 +858,12 @@ async fn test_amt_matches_log_for_partitioned_appends(
         .count();
 
     assert_modes_agree(
-        &format!("partitioned_appends_{manifest_commits}"),
-        &partitioned_schema()?,
-        &[PARTITION_COL],
-        &ops,
+        Workload::new(
+            &format!("partitioned_appends_{manifest_commits}"),
+            partitioned_schema()?,
+            &ops,
+        )
+        .with_layout(DataLayout::partitioned([PARTITION_COL])),
     )
     .await
 }
