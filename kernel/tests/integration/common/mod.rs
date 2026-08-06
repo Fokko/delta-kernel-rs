@@ -1,3 +1,5 @@
+#[path = "../../support/amt_test_utils.rs"]
+pub mod amt_test_utils;
 #[path = "../../support/manifest_commit_setup.rs"]
 pub mod manifest_commit_setup;
 pub mod write_utils;
