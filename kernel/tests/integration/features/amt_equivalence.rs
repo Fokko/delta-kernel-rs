@@ -25,6 +25,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -466,6 +467,82 @@ fn live_paths(url: &Url, engine: &TestEngine) -> Result<Vec<String>, Box<dyn std
         .file_paths
         .into_iter()
         .collect())
+}
+
+/// The paths [`Scan::parallel_scan_metadata`] reports, driving both of its phases.
+///
+/// The second phase only has work when the table has sidecars or a multi-part checkpoint;
+/// otherwise the first phase finishes `Done` and this is just the sequential result.
+fn parallel_paths(
+    url: &Url,
+    engine: &TestEngine,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let engine = engine.clone() as Arc<dyn Engine>;
+    let mut sequential = snapshot
+        .scan_builder()
+        .build()?
+        .parallel_scan_metadata(engine.clone())?;
+
+    let mut paths = sequential.try_fold(Vec::new(), |acc, metadata| {
+        metadata?.visit_scan_files(acc, |paths: &mut Vec<String>, file| paths.push(file.path))
+    })?;
+
+    if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
+        let mut parallel = ParallelScanMetadata::try_new(engine, Arc::new(*state), files)?;
+        paths = parallel.try_fold(paths, |acc, metadata| {
+            metadata?.visit_scan_files(acc, |paths: &mut Vec<String>, file| paths.push(file.path))
+        })?;
+    }
+
+    paths.sort();
+    Ok(paths)
+}
+
+/// Asserts the two ways of listing a table's files agree in `mode`.
+async fn assert_parallel_matches_scan(mode: TreeMode) -> Result<(), Box<dyn std::error::Error>> {
+    // A content root with log commits on either side, so a mode that only reads the log still
+    // finds the files from the appends that did not fold into the tree.
+    let ops = [
+        Op::append([1, 2, 3]),
+        Op::manifest_append([4, 5, 6]),
+        Op::append([7, 8, 9]),
+    ];
+    let workload = Workload::new("parallel_scan_metadata", id_schema()?, &ops);
+    let (url, engine, _, _) = build_table(&workload, mode).await?;
+
+    let mut expected = live_paths(&url, &engine)?;
+    expected.sort();
+    assert_eq!(expected.len(), ops.len(), "every append should be live");
+    assert_eq!(parallel_paths(&url, &engine)?, expected);
+
+    Ok(())
+}
+
+/// The control: on a log table the two agree, so the comparison itself is sound.
+#[tokio::test]
+async fn test_parallel_scan_metadata_matches_scan_metadata_for_log_tables(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_parallel_matches_scan(TreeMode::Log).await
+}
+
+/// `parallel_scan_metadata` should list the same files as `scan_metadata`.
+///
+/// They are two implementations of one question, and the parallel one is a separate pipeline
+/// rather than a wrapper: it reads commits and classic checkpoint parts and never looks at the
+/// content root. On a metadata tree table the files living in the tree are therefore invisible
+/// to it, and since nothing rejects such a table the caller gets a short list rather than an
+/// error -- the worst shape for a distributed read, where the missing rows only show up as a
+/// wrong answer much later.
+///
+/// The appends that stayed in the log are still found, so what this asserts is that the tree
+/// residents come back too.
+#[tokio::test]
+#[ignore = "parallel_scan_metadata replays only commits and classic checkpoints, so files that \
+            live in the content tree are missing from its result"]
+async fn test_parallel_scan_metadata_matches_scan_metadata_for_metadata_tree_tables(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_parallel_matches_scan(TreeMode::Amt).await
 }
 
 /// Captures the table at `version` (latest when `None`).
