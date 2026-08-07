@@ -191,7 +191,6 @@ struct DvCache {
     deleted_positions: roaring::RoaringTreemap,
 
     /// Positions replaced (DV changed) in the current commit (always starts empty).
-    // TODO: never populated until DV-change routing lands in a later change.
     replaced_positions: roaring::RoaringTreemap,
 
     /// Track if this entry was modified (deserialized)
@@ -231,18 +230,40 @@ impl DvCache {
         Ok(())
     }
 
-    /// Get mutable references to both bitmaps at once (avoids borrow checker issues)
-    /// Ensures manifest_dv is loaded first
-    fn get_both_dvs_mut(
+    /// Unions `indices` into the cumulative `manifest_dv` and, per `update_kind`, into the
+    /// matching per-commit bitmap.
+    fn apply_position_update(
         &mut self,
-    ) -> DeltaResult<(&mut roaring::RoaringTreemap, &mut roaring::RoaringTreemap)> {
+        indices: &roaring::RoaringTreemap,
+        update_kind: LeafPositionUpdate,
+    ) -> DeltaResult<()> {
         self.ensure_manifest_dv_loaded()?;
         self.dirty = true;
         let manifest_dv = self.manifest_dv.as_mut().ok_or_else(|| {
             Error::generic("Internal bug: manifest_dv not loaded after ensure_manifest_dv_loaded")
         })?;
-        Ok((manifest_dv, &mut self.deleted_positions))
+        *manifest_dv |= indices;
+        match update_kind {
+            LeafPositionUpdate::Delete => self.deleted_positions |= indices,
+            LeafPositionUpdate::Replace => self.replaced_positions |= indices,
+            LeafPositionUpdate::Carryover => {}
+        }
+        Ok(())
     }
+}
+
+/// How leaf manifest positions changed in the current commit. All variants mask the cumulative
+/// `manifest_info.dv`; they differ only in which per-commit bitmap records the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafPositionUpdate {
+    /// Files removed this commit, no replacement. Recorded in `tracking.deleted_positions`.
+    Delete,
+    /// Files superseded by a re-add this commit (DV change, stats backfill). Recorded in
+    /// `tracking.replaced_positions`.
+    Replace,
+    /// The entry carries over unchanged -- its live version is represented elsewhere (rolled up
+    /// into the root, or moved to another leaf by reorganization). No per-commit bitmap is set.
+    Carryover,
 }
 
 /// Builder for creating [`ContentTreeNode`] instances based on V4 ContentTreeNode
@@ -844,7 +865,7 @@ impl ContentTreeNodeBuilder {
     /// Returns `true` if the builder has a leaf manifest entry registered at `path`.
     ///
     /// Used to distinguish leaf removes that target the current content root (and must be applied
-    /// via [`delete_multiple_from_leaf`](Self::delete_multiple_from_leaf)) from removes that
+    /// via [`update_leaf_positions`](Self::update_leaf_positions)) from removes that
     /// reference an older content root (which are already handled by file-key deduplication).
     pub(crate) fn has_leaf_manifest(&self, path: &str) -> bool {
         self.dv_cache.contains_key(path)
@@ -1014,44 +1035,24 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
+    /// Invalidates positions in a leaf manifest by masking them in the leaf's ManifestDV.
     ///
     /// Used by the transaction layer when processing manifest DVs from leaf writers.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
-    /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_deleted_positions` - If true, records `indices` in tracking.deleted_positions (for
-    ///   actual deletions). If false, only updates manifest_dv (for leaf reorganization).
+    /// * `indices` - Roaring bitmap containing the positions to update
+    /// * `update_kind` - How to classify `indices` for this commit; see [`LeafPositionUpdate`]
     ///
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if the leaf manifest is not found, missing manifest_info, any index is out of
     ///   bounds, or serialization fails
-    pub(crate) fn delete_multiple_from_leaf(
+    pub(crate) fn update_leaf_positions(
         &mut self,
         leaf_file_path: &str,
         indices: &roaring::RoaringTreemap,
-        set_deleted_positions: bool,
-    ) -> DeltaResult<()> {
-        self.delete_indices_from_leaf(leaf_file_path, indices, set_deleted_positions)
-    }
-
-    /// Core implementation for marking entries in a leaf manifest as deleted.
-    ///
-    /// Updates the manifest entry's DV fields to mark entries as deleted.
-    ///
-    /// # Arguments
-    /// * `leaf_file_path` - Path to the leaf manifest file
-    /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `set_deleted_positions` - If true, records `indices` in tracking.deleted_positions to
-    ///   track this as an actual deletion. If false (e.g., when moving entries between leaves),
-    ///   only updates manifest_dv.
-    fn delete_indices_from_leaf(
-        &mut self,
-        leaf_file_path: &str,
-        indices: &roaring::RoaringTreemap,
-        set_deleted_positions: bool,
+        update_kind: LeafPositionUpdate,
     ) -> DeltaResult<()> {
         // leaf_file_path is already relative
         // O(1) cache lookup to get/modify bitmaps
@@ -1073,17 +1074,8 @@ impl ContentTreeNodeBuilder {
             }
         }
 
-        let (combined_bitmap, delta_bitmap) = cache.get_both_dvs_mut()?;
-
-        // Update bitmaps
-        *combined_bitmap |= indices;
-        if set_deleted_positions {
-            *delta_bitmap |= indices;
-        }
-
         // tracking will be updated during write_leaf/build when we're already iterating
-
-        Ok(())
+        cache.apply_position_update(indices, update_kind)
     }
 
     /// Writes the pending entries as a leaf manifest and returns a ContentTreeNodeEntry referencing
@@ -3633,7 +3625,7 @@ mod tests {
 
         let mut indices = RoaringTreemap::new();
         indices.insert(5u64);
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Delete)?;
 
         // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
@@ -3722,7 +3714,7 @@ mod tests {
 
         let mut indices = RoaringTreemap::new();
         indices.extend([2u64, 5, 7]);
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Delete)?;
 
         // Build, write, and read back the root to verify
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
@@ -3797,7 +3789,7 @@ mod tests {
         // Deleting all entries should automatically mark the manifest as deleted
         let mut indices = RoaringTreemap::new();
         indices.extend([0u64, 1, 2]);
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Delete)?;
 
         // Build, write, and read back the root to verify the manifest is marked as deleted
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
@@ -3850,7 +3842,8 @@ mod tests {
 
         let mut indices = RoaringTreemap::new();
         indices.insert(10u64);
-        let result = root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true);
+        let result =
+            root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Delete);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of bounds"));
 
@@ -3871,7 +3864,11 @@ mod tests {
         // Try to delete from a non-existent leaf
         let mut indices = RoaringTreemap::new();
         indices.insert(5u64);
-        let result = root_builder.delete_multiple_from_leaf("nonexistent.parquet", &indices, true);
+        let result = root_builder.update_leaf_positions(
+            "nonexistent.parquet",
+            &indices,
+            LeafPositionUpdate::Delete,
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -3920,7 +3917,7 @@ mod tests {
         root_builder.add_entry(leaf_manifest_entry);
         let mut indices = RoaringTreemap::new();
         indices.insert(3u64);
-        root_builder.delete_multiple_from_leaf(relative_path, &indices, true)?;
+        root_builder.update_leaf_positions(relative_path, &indices, LeafPositionUpdate::Delete)?;
 
         // Build, write, and read back the root to verify manifest DV is stored inline
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
@@ -3988,7 +3985,7 @@ mod tests {
         // manifest IS marked deleted
         let mut indices = RoaringTreemap::new();
         indices.extend([0u64, 1, 2]);
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Delete)?;
 
         // Build, write, and read back the root to verify the manifest is marked as deleted
         let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
@@ -4060,7 +4057,7 @@ mod tests {
         root_builder.add_entry(leaf_manifest_entry.clone());
         let mut indices_v1 = RoaringTreemap::new();
         indices_v1.extend([2u64, 5]);
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices_v1, true)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices_v1, LeafPositionUpdate::Delete)?;
 
         // Step 3: Build, write, and read back the root to verify deleted_positions from first
         // commit
@@ -4101,7 +4098,11 @@ mod tests {
         // Step 5: Add new deletions (entries 3 and 7) in the second commit
         let mut indices_v2 = RoaringTreemap::new();
         indices_v2.extend([3u64, 7]);
-        root_builder_v2.delete_multiple_from_leaf(&leaf_path, &indices_v2, true)?;
+        root_builder_v2.update_leaf_positions(
+            &leaf_path,
+            &indices_v2,
+            LeafPositionUpdate::Delete,
+        )?;
 
         // Build, write, and read back the root to verify deleted_positions only contains NEW
         // deletions
@@ -4156,7 +4157,11 @@ mod tests {
         // Step 9: Delete one additional record (entry 8) in the third commit
         let mut indices_v3 = RoaringTreemap::new();
         indices_v3.insert(8u64);
-        root_builder_v3.delete_multiple_from_leaf(&leaf_path, &indices_v3, true)?;
+        root_builder_v3.update_leaf_positions(
+            &leaf_path,
+            &indices_v3,
+            LeafPositionUpdate::Delete,
+        )?;
 
         // Build, write, and read back the root to verify deleted_positions only contains NEW
         // deletion
@@ -4253,6 +4258,72 @@ mod tests {
     }
 
     #[test]
+    fn test_tracking_replaced_positions() -> Result<(), Box<dyn std::error::Error>> {
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        use crate::engine::sync::SyncEngine;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        for i in 0..10 {
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("{}data/part-{:05}.parquet", table_root, i))
+                .with_tracking(TrackingStatus::Added, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry =
+            leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+        let mut indices = RoaringTreemap::new();
+        indices.extend([1u64, 4]);
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Replace)?;
+
+        let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
+        let manifest = entries
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        let manifest_dv = manifest
+            .manifest_dv_bytes()
+            .expect("manifest_dv should exist");
+        let cumulative = RoaringTreemap::deserialize_from(&manifest_dv[4..])?;
+        assert!(cumulative.contains(1));
+        assert!(cumulative.contains(4));
+        assert_eq!(cumulative.len(), 2);
+
+        assert!(
+            manifest.tracking.deleted_positions.is_none(),
+            "deleted_positions should not be set for replacements"
+        );
+
+        let replaced_positions = manifest
+            .tracking
+            .replaced_positions
+            .as_ref()
+            .expect("replaced_positions should exist");
+        let delta = RoaringTreemap::deserialize_from(&replaced_positions[4..])?;
+        assert!(delta.contains(1));
+        assert!(delta.contains(4));
+        assert_eq!(delta.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_leaf_reorganization_does_not_set_deleted_positions(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use roaring::RoaringTreemap;
@@ -4281,8 +4352,8 @@ mod tests {
             leaf_builder.write_leaf(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
-        // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
-        // with set_deleted_positions=false (simulating moving entries to a different leaf)
+        // Step 2: Create root and simulate leaf reorganization (entries moved to a different
+        // leaf), which carries entries over rather than deleting them.
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
@@ -4291,9 +4362,7 @@ mod tests {
         indices.insert(2);
         indices.insert(3);
 
-        // Call delete_multiple_from_leaf with set_deleted_positions=false to simulate leaf
-        // reorganization
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
+        root_builder.update_leaf_positions(&leaf_path, &indices, LeafPositionUpdate::Carryover)?;
 
         // Step 3: Build, write, and read back the root to verify deleted_positions is NOT set for
         // leaf reorganization
@@ -4316,7 +4385,11 @@ mod tests {
         // deletion
         assert!(
             manifest.tracking.deleted_positions.is_none(),
-            "deleted_positions should NOT be set for leaf reorganization (set_deleted_positions=false)"
+            "deleted_positions should NOT be set for leaf reorganization"
+        );
+        assert!(
+            manifest.tracking.replaced_positions.is_none(),
+            "replaced_positions should NOT be set for leaf reorganization"
         );
 
         Ok(())

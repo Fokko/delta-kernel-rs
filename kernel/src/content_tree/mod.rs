@@ -1999,7 +1999,6 @@ pub struct TrackingInfo {
 
     /// Positions replaced (DV changed) in this manifest in the current commit. Cleared between
     /// commits.
-    // TODO: always null until DvCache tracks replaced positions in a later change.
     #[field_id = 7]
     pub(crate) replaced_positions: Option<Bytes>,
 }
@@ -6048,6 +6047,51 @@ mod tests {
             found_position_deletes_count > 0,
             "Should have Data entries with inline dv_info"
         );
+
+        // Leaf-resident DV updates supersede tree entries via replaced_positions on the leaf
+        // DataManifest (not deleted_positions).
+        let mut replaced_by_manifest: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        for (_path, manifest, pos) in &file_locations {
+            replaced_by_manifest
+                .entry(manifest.clone())
+                .or_default()
+                .insert(*pos as u64);
+        }
+
+        for entry in &root_entries {
+            if !matches!(entry.content_type, DataContentType::DataManifest) {
+                continue;
+            }
+            let Some(manifest_path) = entry.location.as_deref() else {
+                continue;
+            };
+            let Some(expected_positions) = replaced_by_manifest.get(manifest_path) else {
+                continue;
+            };
+            assert!(
+                entry.tracking.deleted_positions.is_none(),
+                "DV replacement should not populate deleted_positions on {manifest_path}"
+            );
+            let replaced_bytes = entry
+                .tracking
+                .replaced_positions
+                .as_ref()
+                .unwrap_or_else(|| {
+                    panic!("replaced_positions should be set on leaf manifest {manifest_path}")
+                });
+            let replaced = roaring::RoaringTreemap::deserialize_from(&replaced_bytes[4..])?;
+            for pos in expected_positions.iter() {
+                assert!(
+                    replaced.contains(pos),
+                    "replaced_positions on {manifest_path} should contain position {pos}"
+                );
+            }
+            assert_eq!(
+                replaced.len(),
+                expected_positions.len(),
+                "replaced_positions on {manifest_path} should match DV-updated file count"
+            );
+        }
 
         // The test successfully proves:
         // 1. Persisted manifests have Data entries with inline deletion_vector using Iceberg sizes

@@ -39,7 +39,7 @@ pub(super) struct ScanMetadataRemoveVisitor<'a, F: FnMut(&str, Option<&str>) -> 
     root_manifest_path: Option<&'a str>,
     /// Called for each root entry: (file_path, dv_path_or_inline)
     on_root_deletion: F,
-    /// Leaf manifest path → row indices to delete (batched for delete_multiple_from_leaf)
+    /// Leaf manifest path -> row indices to invalidate (batched for [`update_leaf_positions`])
     pub(super) leaf_deletions: HashMap<String, RoaringTreemap>,
 }
 

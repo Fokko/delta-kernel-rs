@@ -7,6 +7,7 @@ use url::Url;
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 use crate::content_tree::builder::{
     build_partition_type, log_replay_schema, ContentRootRebuildProcessor, ContentTreeNodeBuilder,
+    LeafPositionUpdate,
 };
 use crate::content_tree::{ContentTreeNode, ContentTreeNodeEntry};
 use crate::error::Error;
@@ -476,9 +477,16 @@ impl ManifestCommitState {
             for entry in replay_content_root(engine, &mut processor, root_path, &table_root)? {
                 builder.add_entry(entry);
             }
+            // These removes happened in the log commits being rolled up, not in this commit, so
+            // the entries carry over: mask manifest_dv, leave the per-commit bitmaps empty.
             for (leaf_path, bitmap) in processor.deleted_leaf_positions_by_location() {
+                // Removes referencing the root manifest, not a leaf, have nothing to invalidate.
                 if builder.has_leaf_manifest(&leaf_path) {
-                    builder.delete_multiple_from_leaf(&leaf_path, &bitmap, true)?;
+                    builder.update_leaf_positions(
+                        &leaf_path,
+                        &bitmap,
+                        LeafPositionUpdate::Carryover,
+                    )?;
                 }
             }
         }
@@ -499,10 +507,14 @@ impl ManifestCommitState {
         for dv_path in &self.aggregated_root_dv_actions {
             builder.remove_dv(dv_path.as_str())?;
         }
-        // set_deleted_positions=false because this is leaf reorganization, not actual user-facing
-        // deletion
+        // Leaf reorganization, not actual user-facing deletion: the entries carry over to another
+        // leaf, so no per-commit bitmap is set.
         for (manifest_path, entry_indices) in &self.aggregated_manifest_dvs {
-            builder.delete_multiple_from_leaf(manifest_path, entry_indices, false)?;
+            builder.update_leaf_positions(
+                manifest_path,
+                entry_indices,
+                LeafPositionUpdate::Carryover,
+            )?;
         }
         Ok(())
     }

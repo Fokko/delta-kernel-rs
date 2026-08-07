@@ -527,6 +527,23 @@ pub fn collect_root_entries(snapshot: &Snapshot, engine: &dyn Engine) -> DeltaRe
     collect_manifest_entries(&root_url, engine)
 }
 
+/// Reads the root manifest's leaf-reference entry for the leaf at `location`. Use this to inspect
+/// tracking state that [`assert_root_entries`] does not compare, such as
+/// [`Entry::has_replaced_positions`].
+///
+/// Panics if the root has no leaf reference for `location`.
+pub fn leaf_ref_entry(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    location: &str,
+) -> DeltaResult<Entry> {
+    let entry = collect_root_entries(snapshot, engine)?
+        .into_iter()
+        .find(|entry| entry.path == location)
+        .unwrap_or_else(|| panic!("root manifest has no leaf reference for {location}"));
+    Ok(entry)
+}
+
 /// Reads every entry currently persisted in the leaf manifest at `location` (relative to
 /// `table_root`), live and dead.
 pub fn collect_leaf_entries(

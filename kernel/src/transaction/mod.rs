@@ -805,7 +805,11 @@ impl<S> Transaction<S> {
                     visitor.leaf_deletions
                 };
                 for (manifest_path, indices) in &leaf_deletions {
-                    metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                    metadata_builder.update_leaf_positions(
+                        manifest_path,
+                        indices,
+                        crate::content_tree::builder::LeafPositionUpdate::Delete,
+                    )?;
                 }
             }
 
@@ -867,7 +871,11 @@ impl<S> Transaction<S> {
                 }
 
                 for (manifest_path, indices) in &combined_leaf_deletions {
-                    metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
+                    metadata_builder.update_leaf_positions(
+                        manifest_path,
+                        indices,
+                        crate::content_tree::builder::LeafPositionUpdate::Replace,
+                    )?;
                 }
 
                 // Re-add leaf-resident rows to the root with the new DV. Root rows were

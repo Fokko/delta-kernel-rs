@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use amt_test_utils::{
     add_files, add_leaf, assert_entries, assert_leaf_entries, assert_root_entries, assert_scan_dv,
-    collect_root_entries, dv_descriptor, leaf_path, remove_files_by_path, setup_amt_test_tables,
-    single_id_column_schema, update_dvs_by_path, DataFile, Entry, ExpectedDv,
+    collect_root_entries, dv_descriptor, leaf_path, leaf_ref_entry, remove_files_by_path,
+    setup_amt_test_tables, single_id_column_schema, update_dvs_by_path, DataFile, Entry,
+    ExpectedDv,
 };
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::BackReference;
@@ -816,6 +817,12 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                 .sequence_number(1)
                 .manifest_dv_cardinality(1)
         );
+        // The remove happened in the v2 log commit, not in this manifest commit, so file2's leaf
+        // position carries over: masked in manifest_dv, absent from the per-commit bitmaps.
+        assert!(
+            leaf1.has_deleted_positions([]) && leaf1.has_replaced_positions([]),
+            "rolled-up remove should not set per-commit position bitmaps: {leaf1:?}"
+        );
         let leaf2 = leaf_refs
             .iter()
             .find(|e| e.path != leaf1_path)
@@ -979,6 +986,14 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
             &engine,
             &[Entry::new("file1.parquet", TrackingStatus::Added).sequence_number(1)],
         )?;
+
+        // The DV update happened in the v2 log commit, not in this manifest commit, so file1's
+        // leaf position carries over: masked in manifest_dv, absent from the per-commit bitmaps.
+        let leaf_ref = leaf_ref_entry(&snapshot, &engine, &leaf1_path)?;
+        assert!(
+            leaf_ref.has_deleted_positions([]) && leaf_ref.has_replaced_positions([]),
+            "rolled-up DV update should not set per-commit position bitmaps: {leaf_ref:?}"
+        );
     }
 
     // v4: Regular commit replaces DV via delta log
