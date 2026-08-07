@@ -29,6 +29,7 @@ use test_utils::{
 };
 use url::Url;
 
+mod metadata_tree;
 mod scan;
 mod snapshot_load;
 

@@ -18,7 +18,7 @@ use delta_kernel::schema::{
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{CommitResult, CreateTable, Transaction};
 use delta_kernel::{DeltaResult, Snapshot, Version};
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{create_add_files_metadata, create_table, engine_store_setup};
 use url::Url;
 
 /// Create a simple schema with column mapping enabled (required for manifest_commit mode).
@@ -137,6 +137,37 @@ pub async fn generate_and_add_data_file(
         .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(file_meta);
+    Ok(())
+}
+
+/// Writes `files` into a single leaf manifest and adds it to `txn`.
+///
+/// Each file is `(path, size, modification_time, record_count)`.
+pub fn write_leaf<S>(
+    txn: &mut Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let files = files
+        .into_iter()
+        .map(|(path, size, mod_time, count)| (path, size, mod_time, Some(count)))
+        .collect();
+    let mc = txn.with_manifest_commit()?;
+    let mut leaf = mc.new_leaf_node_writer(engine)?;
+    leaf.add_files(engine, create_add_files_metadata(schema, files)?)?;
+    mc.add_leaf(leaf.finish(engine)?)?;
+    Ok(())
+}
+
+/// Commits `txn` and asserts it landed at `expected_version`.
+pub fn commit_at<S: std::fmt::Debug>(
+    txn: Transaction<S>,
+    engine: &dyn delta_kernel::Engine,
+    expected_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let committed = txn.commit(engine)?.unwrap_committed();
+    assert_eq!(committed.commit_version(), expected_version);
     Ok(())
 }
 

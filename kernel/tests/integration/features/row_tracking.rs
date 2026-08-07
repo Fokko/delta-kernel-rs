@@ -24,7 +24,7 @@ use test_utils::{
 use url::Url;
 
 use crate::common::manifest_commit_setup::{
-    create_manifest_commit_table, create_manifest_commit_table_with_schema,
+    commit_at, create_manifest_commit_table, create_manifest_commit_table_with_schema, write_leaf,
 };
 
 /// Helper function to create a simple table with row tracking enabled.
@@ -820,35 +820,6 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
 }
 
 // --- Batch commit (content tree / V4 metadata tree) row tracking tests ---
-
-/// Write files into a single leaf manifest and add it to the transaction.
-fn write_leaf<S>(
-    txn: &mut delta_kernel::transaction::Transaction<S>,
-    engine: &dyn delta_kernel::Engine,
-    schema: &SchemaRef,
-    files: Vec<(&str, i64, i64, i64)>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let files = files
-        .into_iter()
-        .map(|(path, size, mod_time, count)| (path, size, mod_time, Some(count)))
-        .collect();
-    let mc = txn.with_manifest_commit()?;
-    let mut leaf = mc.new_leaf_node_writer(engine)?;
-    leaf.add_files(engine, create_add_files_metadata(schema, files)?)?;
-    mc.add_leaf(leaf.finish(engine)?)?;
-    Ok(())
-}
-
-/// Commit a transaction and assert it succeeds at the expected version.
-fn commit_at<S: std::fmt::Debug>(
-    txn: delta_kernel::transaction::Transaction<S>,
-    engine: &dyn delta_kernel::Engine,
-    expected_version: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let committed = txn.commit(engine)?.unwrap_committed();
-    assert_eq!(committed.commit_version(), expected_version);
-    Ok(())
-}
 
 /// Collect `(path, baseRowId)` pairs from scan metadata, sorted by baseRowId.
 ///
