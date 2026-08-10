@@ -1421,7 +1421,8 @@ async fn test_repeated_appends_keep_every_file(
 )]
 #[tokio::test]
 #[ignore = "a manifest commit based on a post-commit snapshot cannot see the content root \
-            written by the commit that produced it, so it drops the files already in the tree"]
+            written by the commit that produced it, so it drops the files already in the \
+            tree (#250)"]
 async fn test_manifest_commits_keep_every_file_when_chained_through_post_commit_snapshots(
     #[case] chains: &[Chain],
 ) -> DeltaResult<()> {
@@ -1435,10 +1436,11 @@ async fn test_manifest_commits_keep_every_file_when_chained_through_post_commit_
 /// read, so scanning it returns nothing -- the same blindness that makes the next manifest
 /// commit rebuild the tree from scratch.
 ///
-/// Both assertions describe current behavior rather than desired behavior. If either starts
-/// failing the bug is fixed, and
-/// `test_manifest_commits_keep_every_file_when_chained_through_post_commit_snapshots` should
-/// be un-ignored.
+/// Both assertions describe current behavior rather than desired behavior, which is what earns
+/// this test its place beside the ignored one: an ignored test never runs, so nothing in CI
+/// would otherwise notice #250 being fixed. When either assertion starts failing, delete this
+/// test and un-ignore
+/// `test_manifest_commits_keep_every_file_when_chained_through_post_commit_snapshots`.
 #[tokio::test]
 async fn test_manifest_commit_omits_content_root_from_post_commit_snapshot() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;

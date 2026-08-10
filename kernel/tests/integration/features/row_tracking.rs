@@ -1359,9 +1359,9 @@ async fn test_batch_commit_hwm_is_next_row_id_minus_one() -> Result<(), Box<dyn 
 
 /// Every column nullable, so the content tree's stats carry `null_value_count`.
 ///
-/// The tests below scan with [`ScanBuilder::include_all_stats_columns`], which reads that field
-/// back; see `test_batch_commit_scan_with_stats_columns_supports_non_nullable_columns` for what
-/// happens without it.
+/// The test below scans with [`ScanBuilder::include_all_stats_columns`], which reads that field
+/// back; see `test_manifest_stats_scan_supports_non_nullable_columns` in
+/// `tests/manifest_data_skipping.rs` for what happens without it.
 fn all_nullable_schema() -> DeltaResult<SchemaRef> {
     Ok(Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
@@ -1380,7 +1380,7 @@ fn all_nullable_schema() -> DeltaResult<SchemaRef> {
 /// so it should still be 29.
 #[tokio::test]
 #[ignore = "the scan-row ingest path writes a null firstRowId for files it re-adds, so the \
-            allocator hands moved files fresh row IDs instead of preserving their own"]
+            allocator hands moved files fresh row IDs instead of preserving their own (#254)"]
 async fn test_batch_commit_preserves_base_row_ids_when_moving_files_between_leaves(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -1441,47 +1441,6 @@ async fn test_batch_commit_preserves_base_row_ids_when_moving_files_between_leav
         "moving a file between leaves should not renumber its rows"
     );
     verify_batch_commit_hwm(&table_url, 1, 29).await?;
-
-    Ok(())
-}
-
-/// A non-nullable column should not stop a metadata tree table from scanning its stats.
-///
-/// The content tree omits `null_value_count` for a column that cannot be null, but the read
-/// side projects that field for every column, so the scan fails to resolve it. Nothing here is
-/// specific to row tracking; this is the cheapest place to pin it down, because the failure is
-/// what stands between the test above and the behavior it wants to check.
-///
-/// The error surfaces at `scan_metadata`, which is where any caller reorganizing a table has to
-/// start, so OPTIMIZE is unreachable on such a table rather than merely degraded.
-#[tokio::test]
-#[ignore = "the content tree omits null_value_count for non-nullable columns but the scan \
-            projects it unconditionally, so resolving the column fails"]
-async fn test_batch_commit_scan_with_stats_columns_supports_non_nullable_columns(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-
-    // `create_manifest_commit_table` declares `id` NOT NULL; everything else matches the
-    // passing tests above.
-    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
-    let schema = txn.add_files_schema();
-    txn.with_manifest_commit()?;
-    write_leaf(
-        &mut txn,
-        engine.as_ref(),
-        schema,
-        vec![("file1.parquet", 1024, 1_000_000, 10)],
-    )?;
-    commit_at(txn, engine.as_ref(), 0)?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let scan = snapshot
-        .scan_builder()
-        .include_all_stats_columns()
-        .build()?;
-    let batches: Vec<_> = scan.scan_metadata(engine.as_ref())?.try_collect()?;
-    assert_eq!(batches.len(), 1);
 
     Ok(())
 }

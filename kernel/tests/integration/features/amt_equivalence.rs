@@ -12,35 +12,32 @@
 //! are dropped from commits at or below the root version -- so a bug there is invisible to a
 //! latest-version read but shows up immediately under time travel.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{column_expr, Scalar};
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::engine_data::{
+    FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor, TypedGetData as _,
+};
+use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan};
+use delta_kernel::schema::{DataType, MapType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{
-    Engine, Expression as Expr, Predicate as Pred, PredicateRef, Snapshot, Version,
+    DeltaResult, Engine, Expression as Expr, Predicate as Pred, PredicateRef, Snapshot, Version,
 };
 use rstest::rstest;
-use test_utils::{engine_store_setup, read_scan};
+use test_utils::engine_store_setup;
 use url::Url;
 use uuid::Uuid;
 
-use crate::common::amt_test_utils::{
-    collect_scan_dvs, collect_scanned_files, dv_descriptor, remove_files_by_path,
-};
+use crate::common::amt_test_utils::{collect_scanned_files, dv_descriptor, remove_files_by_path};
 
 type TestEngine = Arc<DefaultEngine<TokioBackgroundExecutor>>;
 
@@ -52,9 +49,6 @@ const PARTITION_COL: &str = "category";
 // ==============================================================================
 
 /// Where a table keeps its file inventory.
-///
-/// Both modes enable column mapping, since AMT requires it -- that keeps the storage of file
-/// inventory the only difference between a scenario's two runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TreeMode {
     /// File inventory lives in root and leaf manifests reached through a content root.
@@ -167,6 +161,38 @@ impl<'a> Workload<'a> {
     fn reads_data(&self) -> bool {
         !self.ops.iter().any(|op| matches!(op, Op::AddDvTo { .. }))
     }
+
+    /// Whether the schema carries the partition column, which decides what a [`DataRow`] holds.
+    fn partitioned(&self) -> bool {
+        self.schema.contains(PARTITION_COL)
+    }
+
+    /// Whether the two runs can be held to the same base row IDs.
+    ///
+    /// A manifest commit that folds an already log-committed `add` into the tree hands that
+    /// file fresh row IDs instead of keeping its own (#254). Such a scenario therefore
+    /// disagrees with its log run on `baseRowId` alone, so it drops that one field and
+    /// compares everything else. Delete this along with the fix for #254.
+    ///
+    /// A manifest commit over files the tree already owns preserves their IDs, which is why
+    /// this only looks for a fold of a log-committed add.
+    fn compares_row_ids(&self) -> bool {
+        let mut log_committed_add = false;
+        for op in self.ops {
+            match op {
+                Op::Append {
+                    manifest_commit: true,
+                    ..
+                } if log_committed_add => return false,
+                Op::Append {
+                    manifest_commit: false,
+                    ..
+                } => log_committed_add = true,
+                _ => {}
+            }
+        }
+        true
+    }
 }
 
 /// Everything a scan can observe about a table at one version, normalized so that two runs
@@ -174,13 +200,194 @@ impl<'a> Workload<'a> {
 #[derive(Debug, PartialEq, Eq)]
 struct TableState {
     version: Version,
-    /// Pretty-printed scan output with data rows sorted, or `None` when the workload cannot
-    /// read data files.
-    data: Option<Vec<String>>,
-    /// Live files, each identified by the op that produced it and by the cardinality of its
-    /// deletion vector. Parquet file names contain a fresh UUID per write, so the raw paths
-    /// never match across runs.
-    files: BTreeSet<(usize, Option<i64>)>,
+    /// Every row the table returns, sorted, or `None` when the workload cannot read data files.
+    rows: Option<Vec<DataRow>>,
+    /// Live files, each paired with the op that produced it and sorted by it.
+    files: Vec<(usize, FileFacts)>,
+}
+
+/// One row of scan output. `category` is `None` unless the schema is [`partitioned_schema`].
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DataRow {
+    id: Option<i32>,
+    category: Option<String>,
+}
+
+/// What a scan reports about one live file, restricted to what must agree across both runs of
+/// a workload.
+///
+/// The file's path and modification time are deliberately absent: parquet names carry a fresh
+/// UUID per write and the timestamp is wall clock, so neither matches across runs. The op that
+/// wrote the file stands in for its path.
+///
+/// `numRecords` is absent for a different reason: a scan only fills it in from parsed stats,
+/// so it is null for a file described by a JSON commit and set for one described by a
+/// manifest. That reports where the file's stats live rather than anything about the file.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileFacts {
+    size: i64,
+    partition_values: BTreeMap<String, String>,
+    base_row_id: Option<i64>,
+    default_row_commit_version: Option<i64>,
+    tags: BTreeMap<String, String>,
+    deletion_vector: Option<ScanDv>,
+}
+
+/// A file's deletion vector in the shape a scan reports it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ScanDv {
+    storage_type: String,
+    path_or_inline_dv: String,
+    cardinality: i64,
+}
+
+/// Reads every scan-metadata row of `scan`, keyed by file path.
+fn scanned_files(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<(String, FileFacts)>> {
+    struct FileVisitor {
+        files: Vec<(String, FileFacts)>,
+    }
+
+    impl FilteredRowVisitor for FileVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| {
+                    let string_map =
+                        MapType::new(DataType::STRING, DataType::STRING, /* nullable */ true);
+                    (
+                        vec![
+                            ColumnName::new(["path"]),
+                            ColumnName::new(["size"]),
+                            ColumnName::new(["fileConstantValues", "partitionValues"]),
+                            ColumnName::new(["fileConstantValues", "baseRowId"]),
+                            ColumnName::new(["fileConstantValues", "defaultRowCommitVersion"]),
+                            ColumnName::new(["fileConstantValues", "tags"]),
+                            ColumnName::new(["deletionVector", "storageType"]),
+                            ColumnName::new(["deletionVector", "pathOrInlineDv"]),
+                            ColumnName::new(["deletionVector", "cardinality"]),
+                        ],
+                        vec![
+                            DataType::STRING,
+                            DataType::LONG,
+                            string_map.clone().into(),
+                            DataType::LONG,
+                            DataType::LONG,
+                            string_map.into(),
+                            DataType::STRING,
+                            DataType::STRING,
+                            DataType::LONG,
+                        ],
+                    )
+                });
+            (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+        }
+
+        fn visit_filtered<'a>(
+            &mut self,
+            getters: &[&'a dyn GetData<'a>],
+            rows: RowIndexIterator<'_>,
+        ) -> DeltaResult<()> {
+            for row_index in rows {
+                let path: String = getters[0].get(row_index, "path")?;
+                let partition_values: Option<HashMap<String, String>> =
+                    getters[2].get_opt(row_index, "fileConstantValues.partitionValues")?;
+                let tags: Option<HashMap<String, String>> =
+                    getters[5].get_opt(row_index, "fileConstantValues.tags")?;
+                let deletion_vector = getters[6]
+                    .get_opt(row_index, "deletionVector.storageType")?
+                    .map(|storage_type| -> DeltaResult<_> {
+                        Ok(ScanDv {
+                            storage_type,
+                            path_or_inline_dv: getters[7]
+                                .get(row_index, "deletionVector.pathOrInlineDv")?,
+                            cardinality: getters[8].get(row_index, "deletionVector.cardinality")?,
+                        })
+                    })
+                    .transpose()?;
+                self.files.push((
+                    path,
+                    FileFacts {
+                        size: getters[1].get(row_index, "size")?,
+                        partition_values: partition_values
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                        base_row_id: getters[3]
+                            .get_opt(row_index, "fileConstantValues.baseRowId")?,
+                        default_row_commit_version: getters[4]
+                            .get_opt(row_index, "fileConstantValues.defaultRowCommitVersion")?,
+                        tags: tags.unwrap_or_default().into_iter().collect(),
+                        deletion_vector,
+                    },
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    let mut visitor = FileVisitor { files: Vec::new() };
+    for scan_metadata in scan.scan_metadata(engine)? {
+        visitor.visit_rows_of(&scan_metadata?.scan_files)?;
+    }
+    Ok(visitor.files)
+}
+
+/// Every row `scan` returns, sorted so that two runs of a workload are comparable.
+///
+/// `partitioned` selects the columns to read, which is the only reason this needs to know
+/// anything about the table's schema.
+fn read_rows(scan: &Scan, engine: Arc<dyn Engine>, partitioned: bool) -> DeltaResult<Vec<DataRow>> {
+    struct RowCollector {
+        partitioned: bool,
+        rows: Vec<DataRow>,
+    }
+
+    impl RowVisitor for RowCollector {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static ID: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| (vec![ColumnName::new(["id"])], vec![DataType::INTEGER]));
+            static ID_AND_CATEGORY: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| {
+                    (
+                        vec![ColumnName::new(["id"]), ColumnName::new([PARTITION_COL])],
+                        vec![DataType::INTEGER, DataType::STRING],
+                    )
+                });
+            let selected = if self.partitioned {
+                &ID_AND_CATEGORY
+            } else {
+                &ID
+            };
+            (&selected.0, &selected.1)
+        }
+
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for row_index in 0..row_count {
+                let category = match getters.get(1) {
+                    Some(getter) => getter.get_opt(row_index, PARTITION_COL)?,
+                    None => None,
+                };
+                self.rows.push(DataRow {
+                    id: getters[0].get_opt(row_index, "id")?,
+                    category,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let mut collector = RowCollector {
+        partitioned,
+        rows: Vec::new(),
+    };
+    for batch in scan.execute(engine)? {
+        collector.visit_rows_of(batch?.as_ref())?;
+    }
+    collector.rows.sort_unstable();
+    Ok(collector.rows)
 }
 
 /// Runs `workload` under both tree modes and asserts the two tables look the same at every
@@ -304,10 +511,12 @@ fn create_table_for_mode(
     workload: &Workload<'_>,
     mode: TreeMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Column mapping is on in both modes because AMT requires it, and deletion vectors are
-    // on so a DV workload does not also change the protocol between modes.
+    // Column mapping and row tracking are on in both modes because AMT implies both, and
+    // deletion vectors are on so a DV workload does not change the protocol between modes
+    // either. What is left is the storage of file inventory, which is the point.
     let mut properties = vec![
         ("delta.columnMapping.mode", "id"),
+        ("delta.enableRowTracking", "true"),
         ("delta.feature.deletionVectors", "supported"),
     ];
     if mode == TreeMode::Amt {
@@ -342,16 +551,18 @@ async fn append(
         txn.with_manifest_commit()?;
     }
 
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
-    let ids: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
-    let columns: Vec<ArrayRef> = match partition {
-        Some(value) => vec![
-            ids,
-            Arc::new(StringArray::from(vec![value; values.len()])) as ArrayRef,
-        ],
-        None => vec![ids],
-    };
-    let batch = RecordBatch::try_new(arrow_schema, columns)?;
+    let rows: Vec<Vec<Scalar>> = values
+        .iter()
+        .map(|value| match partition {
+            Some(category) => vec![Scalar::from(*value), Scalar::from(category)],
+            None => vec![Scalar::from(*value)],
+        })
+        .collect();
+    let rows: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
+    let data = engine
+        .evaluation_handler()
+        .create_many(schema.clone(), &rows)?;
+    let data = ArrowEngineData::try_from_engine_data(data)?;
 
     let write_context = match partition {
         Some(value) => txn.partitioned_write_context(HashMap::from([(
@@ -360,9 +571,7 @@ async fn append(
         )]))?,
         None => txn.unpartitioned_write_context()?,
     };
-    let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context)
-        .await?;
+    let add_files_metadata = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(add_files_metadata);
 
     commit(txn, engine)
@@ -539,7 +748,7 @@ async fn test_parallel_scan_metadata_matches_scan_metadata_for_log_tables(
 /// residents come back too.
 #[tokio::test]
 #[ignore = "parallel_scan_metadata replays only commits and classic checkpoints, so files that \
-            live in the content tree are missing from its result"]
+            live in the content tree are missing from its result (#251)"]
 async fn test_parallel_scan_metadata_matches_scan_metadata_for_metadata_tree_tables(
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_parallel_matches_scan(TreeMode::Amt).await
@@ -564,44 +773,39 @@ fn capture_state(
     // otherwise do unnoticed.
     collect_scanned_files(snapshot.clone(), engine.as_ref())?;
 
-    let files = collect_scan_dvs(snapshot.clone().scan_builder().build()?, engine.as_ref())?
-        .iter()
-        .map(|(path, dv)| {
-            let origin = *file_origin
-                .get(path)
-                .unwrap_or_else(|| panic!("file {path} has no recorded origin"));
-            (origin, dv.as_ref().map(|dv| dv.cardinality))
-        })
-        .collect();
+    let compares_row_ids = workload.compares_row_ids();
+    let mut files: Vec<(usize, FileFacts)> =
+        scanned_files(snapshot.clone().scan_builder().build()?, engine.as_ref())?
+            .into_iter()
+            .map(|(path, mut facts)| {
+                let origin = *file_origin
+                    .get(&path)
+                    .unwrap_or_else(|| panic!("file {path} has no recorded origin"));
+                if !compares_row_ids {
+                    facts.base_row_id = None;
+                }
+                (origin, facts)
+            })
+            .collect();
+    files.sort_unstable();
 
-    let data = workload
+    let rows = workload
         .reads_data()
         .then(|| {
             let scan = snapshot.scan_builder().build()?;
-            read_scan(&scan, engine.clone() as Arc<dyn Engine>)
+            read_rows(
+                &scan,
+                engine.clone() as Arc<dyn Engine>,
+                workload.partitioned(),
+            )
         })
-        .transpose()?
-        .map(|batches| sorted_rows(&batches));
+        .transpose()?;
 
     Ok(TableState {
         version: snapshot_version,
-        data,
+        rows,
         files,
     })
-}
-
-/// Pretty-prints `batches` with the data rows sorted, leaving the table header and footer in
-/// place so a mismatch is readable.
-fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
-    let formatted = pretty_format_batches(batches)
-        .expect("batches are printable")
-        .to_string();
-    let mut lines: Vec<String> = formatted.trim().lines().map(str::to_string).collect();
-    if lines.len() > 3 {
-        let last = lines.len() - 1;
-        lines[2..last].sort_unstable();
-    }
-    lines
 }
 
 // ==============================================================================
@@ -791,7 +995,7 @@ async fn test_amt_skips_tree_resident_file_after_one_manifest_commit(
 )]
 #[tokio::test]
 #[ignore = "a manifest commit that reloads an existing content root drops the stats bounds of \
-            the entries already in it, so those files stop being skippable"]
+            the entries already in it, so those files stop being skippable (#252)"]
 async fn test_amt_skipping_after_a_second_manifest_commit(
     #[case] ops: [Op; 4],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -822,9 +1026,9 @@ async fn assert_skipping_at_least_as_good(
             .build()?;
         // Naming survivors by the op that wrote them keeps the failure readable, since the
         // parquet names are random.
-        let mut survivors: Vec<usize> = collect_scan_dvs(scan, engine.as_ref())?
-            .keys()
-            .map(|path| file_origin[path])
+        let mut survivors: Vec<usize> = scanned_files(scan, engine.as_ref())?
+            .iter()
+            .map(|(path, _)| file_origin[path])
             .collect();
         survivors.sort_unstable();
 
@@ -832,8 +1036,8 @@ async fn assert_skipping_at_least_as_good(
             .scan_builder()
             .with_predicate(predicate.clone())
             .build()?;
-        let batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?;
-        outcomes.push((survivors, matching_ids(&batches, THRESHOLD)));
+        let rows = read_rows(&scan, engine.clone() as Arc<dyn Engine>, false)?;
+        outcomes.push((survivors, matching_ids(&rows, THRESHOLD)));
     }
     let (amt_survivors, amt_ids) = &outcomes[0];
     let (log_survivors, log_ids) = &outcomes[1];
@@ -850,24 +1054,14 @@ async fn assert_skipping_at_least_as_good(
     Ok(())
 }
 
-/// The sorted `id` values above `threshold` across `batches`.
+/// The sorted `id` values above `threshold` in `rows`.
 ///
 /// A predicate only tells kernel which files it may skip, so surviving files still carry
 /// non-matching rows; filtering here isolates the rows the scan was actually asked for.
-fn matching_ids(batches: &[RecordBatch], threshold: i32) -> Vec<i32> {
-    let mut ids: Vec<i32> = batches
+fn matching_ids(rows: &[DataRow], threshold: i32) -> Vec<i32> {
+    let mut ids: Vec<i32> = rows
         .iter()
-        .flat_map(|batch| {
-            batch
-                .column_by_name("id")
-                .expect("scan output has an id column")
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("id is an int column")
-                .iter()
-                .flatten()
-                .collect::<Vec<_>>()
-        })
+        .filter_map(|row| row.id)
         .filter(|id| *id > threshold)
         .collect();
     ids.sort_unstable();
@@ -917,7 +1111,7 @@ async fn test_amt_matches_log_for_clustered_appends() -> Result<(), Box<dyn std:
 )]
 #[tokio::test]
 #[ignore = "AMT loses partition values: manifest commits read them back as null, and a root \
-            rebuild over a log-committed partitioned add errors out"]
+            rebuild over a log-committed partitioned add errors out (#253)"]
 async fn test_amt_matches_log_for_partitioned_appends(
     #[case] ops: [Op; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {

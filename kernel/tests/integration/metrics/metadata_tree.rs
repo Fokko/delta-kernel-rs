@@ -112,7 +112,7 @@ fn metadata_tree_scan_metadata_reads_the_manifests() -> DeltaResult<()> {
 /// file every such scan has to read.
 #[test]
 #[ignore = "the content root is read with FileMeta::size hardcoded to 0, so its bytes are \
-            missing from parquet_bytes_read"]
+            missing from parquet_bytes_read (#256)"]
 fn metadata_tree_scan_reports_bytes_for_every_manifest_it_reads() -> DeltaResult<()> {
     let (_temp_dir, table_url) = build_metadata_tree_table().expect("table builds");
 

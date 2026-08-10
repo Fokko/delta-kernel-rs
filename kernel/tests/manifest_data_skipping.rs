@@ -29,9 +29,15 @@ use delta_kernel::schema::{
 };
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 use rstest::rstest;
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{create_table, engine_store_setup, test_table_setup};
+use url::Url;
+
+use crate::manifest_commit_setup::{commit_at, create_manifest_commit_table, write_leaf};
 
 mod common;
+
+#[path = "support/manifest_commit_setup.rs"]
+mod manifest_commit_setup;
 
 /// Describes a test file with its metadata and stats for `create_add_files_with_stats`.
 struct TestFileStats<'a> {
@@ -1193,6 +1199,48 @@ async fn test_manifest_data_skipping_nested_struct_column_e2e(
         scanned, expected,
         "nested.leaf < 50 keeps only file1 (leaf 1-40); file2 (leaf 100-200) is skipped"
     );
+
+    Ok(())
+}
+
+/// A non-nullable column should not stop a metadata tree table from scanning its stats.
+///
+/// The content tree omits `null_value_count` for a column that cannot be null, but the read side
+/// projects that field for every column, so the scan fails to resolve it.
+///
+/// The error surfaces at `scan_metadata`, which is where any caller reorganizing a table has to
+/// start, so OPTIMIZE is unreachable on such a table rather than merely degraded. That is what
+/// keeps `test_batch_commit_preserves_base_row_ids_when_moving_files_between_leaves` (in
+/// `integration/features/row_tracking.rs`) on an all-nullable schema.
+#[tokio::test]
+#[ignore = "the content tree omits null_value_count for non-nullable columns but the scan \
+            projects it unconditionally, so resolving the column fails (#255)"]
+async fn test_manifest_stats_scan_supports_non_nullable_columns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    // `create_manifest_commit_table` declares `id` NOT NULL.
+    let mut txn = create_manifest_commit_table(&table_path, engine.as_ref())?;
+    let schema = txn.add_files_schema();
+    txn.with_manifest_commit()?;
+    write_leaf(
+        &mut txn,
+        engine.as_ref(),
+        schema,
+        vec![("file1.parquet", 1024, 1_000_000, 10)],
+    )?;
+    commit_at(txn, engine.as_ref(), 0)?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?;
+    let batches: Vec<_> = scan
+        .scan_metadata(engine.as_ref())?
+        .collect::<DeltaResult<_>>()?;
+    assert_eq!(batches.len(), 1);
 
     Ok(())
 }

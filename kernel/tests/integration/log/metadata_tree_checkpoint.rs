@@ -70,7 +70,7 @@ fn live_paths(url: &Url, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
 /// the log, together with a `_last_checkpoint` hint telling every later reader to trust it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "CheckpointWriter replays only the log segment, so checkpointing a metadata tree \
-            table writes a checkpoint that omits every file in the tree"]
+            table writes a checkpoint that omits every file in the tree (#249)"]
 async fn checkpointing_a_metadata_tree_table_preserves_its_files(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
