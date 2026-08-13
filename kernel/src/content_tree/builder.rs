@@ -298,10 +298,13 @@ pub(crate) struct ContentTreeNodeBuilder {
 }
 
 /// Lightweight aggregate stats computed when adding pre-built columnar batches.
+/// Every row in a batch shares one status
 struct BatchAggregates {
-    added_file_count: i32,
-    existing_file_count: i32,
+    status: TrackingStatus,
+    file_count: i32,
     total_record_count: i64,
+    /// `None` if every row's sequence number is null.
+    min_sequence_number: Option<i64>,
 }
 
 /// Converts a `usize` length to an `i32` file count, returning an error on overflow.
@@ -817,9 +820,10 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            added_file_count: file_count_from_len(engine_data.len())?,
-            existing_file_count: 0,
+            status: TrackingStatus::Added,
+            file_count: file_count_from_len(engine_data.len())?,
             total_record_count: agg_visitor.total_record_count,
+            min_sequence_number: agg_visitor.min_sequence_number,
         };
 
         Ok((transformed, aggregates))
@@ -1165,9 +1169,10 @@ impl ContentTreeNodeBuilder {
                     replaced_files_count += 1;
                     replaced_rows_count += entry.record_count;
                 }
-                // A Modified entry is a live file whose deletion vector changed; it contributes
-                // its rows, so it is tallied with Existing entries. Not produced until the
-                // DV-change flow lands in a later change.
+                // A Modified entry is a live file whose deletion vector changed, so it counts
+                // with Existing entries.
+                // TODO: add modified_files_count/modified_rows_count to ManifestInfo and count
+                // Modified separately.
                 TrackingStatus::Modified => {
                     existing_files_count += 1;
                     existing_rows_count += entry.record_count;
@@ -1178,10 +1183,28 @@ impl ContentTreeNodeBuilder {
         // Include pre-built batch aggregates
         for agg in &self.pre_built_aggregates {
             record_count += agg.total_record_count;
-            added_files_count += agg.added_file_count;
-            existing_files_count += agg.existing_file_count;
-            added_rows_count += agg.total_record_count;
-            min_sequence_number = min_sequence_number.min(self.version as i64);
+            match agg.status {
+                TrackingStatus::Added => {
+                    added_files_count += agg.file_count;
+                    added_rows_count += agg.total_record_count;
+                }
+                // See above TODO to have a separate count for Modified.
+                TrackingStatus::Existing | TrackingStatus::Modified => {
+                    existing_files_count += agg.file_count;
+                    existing_rows_count += agg.total_record_count;
+                }
+                TrackingStatus::Deleted => {
+                    deleted_files_count += agg.file_count;
+                    deleted_rows_count += agg.total_record_count;
+                }
+                TrackingStatus::Replaced => {
+                    replaced_files_count += agg.file_count;
+                    replaced_rows_count += agg.total_record_count;
+                }
+            }
+            if let Some(seq) = agg.min_sequence_number {
+                min_sequence_number = min_sequence_number.min(seq);
+            }
         }
 
         // If no entries, set min_sequence_number to 0
@@ -1363,9 +1386,10 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            added_file_count: 0,
-            existing_file_count: file_count_from_len(engine_data.len())?,
+            status: TrackingStatus::Existing,
+            file_count: file_count_from_len(engine_data.len())?,
             total_record_count: agg_visitor.total_record_count,
+            min_sequence_number: agg_visitor.min_sequence_number,
         };
 
         Ok((transformed, aggregates))
@@ -1590,9 +1614,10 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(filtered.as_ref())?;
 
         let aggregates = BatchAggregates {
-            added_file_count: 0,
-            existing_file_count: file_count_from_len(filtered.len())?,
+            status: TrackingStatus::Existing,
+            file_count: file_count_from_len(filtered.len())?,
             total_record_count: agg_visitor.total_record_count,
+            min_sequence_number: agg_visitor.min_sequence_number,
         };
         self.pre_built_data.push(filtered);
         self.pre_built_aggregates.push(aggregates);
@@ -1616,9 +1641,10 @@ impl ContentTreeNodeBuilder {
         let mut agg_visitor = TransformedAggregateVisitor::default();
         agg_visitor.visit_rows_of(data.as_ref())?;
         let aggregates = BatchAggregates {
-            added_file_count: 0,
-            existing_file_count: file_count_from_len(data.len())?,
+            status: TrackingStatus::Existing,
+            file_count: file_count_from_len(data.len())?,
             total_record_count: agg_visitor.total_record_count,
+            min_sequence_number: agg_visitor.min_sequence_number,
         };
         self.pre_built_data.push(data);
         self.pre_built_aggregates.push(aggregates);
@@ -1632,13 +1658,17 @@ impl ContentTreeNodeBuilder {
 #[derive(Default)]
 struct TransformedAggregateVisitor {
     total_record_count: i64,
+    min_sequence_number: Option<i64>,
 }
 
 impl RowVisitor for TransformedAggregateVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![column_name!("recordCount")];
-            let types = vec![DataType::LONG];
+            let names = vec![
+                column_name!("recordCount"),
+                ColumnName::new([TRACKING, super::TRACKING_SEQUENCE_NUMBER_FIELD]),
+            ];
+            let types = vec![DataType::LONG, DataType::LONG];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
@@ -1648,6 +1678,11 @@ impl RowVisitor for TransformedAggregateVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.total_record_count += record_count;
+            let sequence_number: Option<i64> = getters[1].get_opt(i, "tracking.sequenceNumber")?;
+            if let Some(seq) = sequence_number {
+                self.min_sequence_number =
+                    Some(self.min_sequence_number.map_or(seq, |min| min.min(seq)));
+            }
         }
         Ok(())
     }

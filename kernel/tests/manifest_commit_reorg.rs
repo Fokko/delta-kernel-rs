@@ -4,11 +4,11 @@
 mod amt_test_utils;
 
 use amt_test_utils::{
-    collect_scanned_files, id_and_value_schema, setup_test_tables_with_column_mapping,
-    verify_scanned_files,
+    collect_root_entries, collect_scanned_files, id_and_value_schema, leaf_path,
+    setup_test_tables_with_column_mapping, verify_scanned_files, ManifestInfo,
 };
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::Snapshot;
+use delta_kernel::{DataContentType, Snapshot};
 use test_utils::create_add_files_metadata;
 
 #[tokio::test]
@@ -45,6 +45,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
     // Verify files are in leaf A via scan
     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     assert_eq!(snapshot_v1.version(), 1);
+    let leaf_a_path = leaf_path(&snapshot_v1, &engine)?;
     let scanned = collect_scanned_files(snapshot_v1.clone(), &engine)?;
     verify_scanned_files(&scanned, &["fileA.parquet", "fileB.parquet"], &[]);
 
@@ -92,5 +93,24 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
         &["fileA.parquet", "fileB.parquet"],
         &[], // No DVs
     );
+
+    // Leaf B holds the moved rows, re-added as Existing.
+    // TODO: min_sequence_number should be 1, not 2. evaluate_scan_row_transform stamps the
+    // commit version instead of preserving defaultRowCommitVersion.
+    let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let leaf_b = collect_root_entries(&final_snapshot, &engine)?
+        .into_iter()
+        .find(|e| e.content_type == DataContentType::DataManifest && e.path != leaf_a_path)
+        .expect("a leaf reference for leaf B");
+    assert_eq!(
+        leaf_b.manifest_info,
+        Some(ManifestInfo {
+            existing_files_count: 2,
+            existing_rows_count: 125,
+            min_sequence_number: 2,
+            ..Default::default()
+        })
+    );
+
     Ok(())
 }

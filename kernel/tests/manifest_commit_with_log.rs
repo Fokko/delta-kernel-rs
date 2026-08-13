@@ -11,7 +11,7 @@ use amt_test_utils::{
     add_files, add_leaf, assert_entries, assert_leaf_entries, assert_root_entries, assert_scan_dv,
     collect_root_entries, dv_descriptor, leaf_path, leaf_ref_entry, remove_files_by_path,
     setup_amt_test_tables, single_id_column_schema, update_dvs_by_path, DataFile, Entry,
-    ExpectedDv,
+    ExpectedDv, ManifestInfo,
 };
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::BackReference;
@@ -75,7 +75,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         assert_root_entries(
             &snapshot,
             &engine,
-            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added).sequence_number(1)],
+            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added)
+                .sequence_number(1)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 2,
+                    added_rows_count: 150,
+                    min_sequence_number: 1,
+                    ..Default::default()
+                })],
         )?;
     }
 
@@ -100,7 +107,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         assert_root_entries(
             &snapshot,
             &engine,
-            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added).sequence_number(1)],
+            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added)
+                .sequence_number(1)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 2,
+                    added_rows_count: 150,
+                    min_sequence_number: 1,
+                    ..Default::default()
+                })],
         )?;
     }
 
@@ -201,7 +215,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             .expect("leaf1 still referenced");
         assert_eq!(
             **leaf1,
-            Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Existing).sequence_number(1)
+            Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Existing)
+                .sequence_number(1)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 2,
+                    added_rows_count: 150,
+                    min_sequence_number: 1,
+                    ..Default::default()
+                })
         );
         let leaf2 = leaf_refs
             .iter()
@@ -209,7 +230,14 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
             .expect("a new leaf reference for file5");
         assert_eq!(
             **leaf2,
-            Entry::leaf_ref(leaf2.path.clone(), TrackingStatus::Added).sequence_number(5)
+            Entry::leaf_ref(leaf2.path.clone(), TrackingStatus::Added)
+                .sequence_number(5)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 1,
+                    added_rows_count: 100,
+                    min_sequence_number: 5,
+                    ..Default::default()
+                })
         );
     }
     Ok(())
@@ -736,7 +764,14 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
         assert_root_entries(
             &snapshot,
             &engine,
-            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added).sequence_number(1)],
+            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added)
+                .sequence_number(1)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 4,
+                    added_rows_count: 375,
+                    min_sequence_number: 1,
+                    ..Default::default()
+                })],
         )?;
         assert_leaf_entries(
             &table_url,
@@ -815,7 +850,15 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             **leaf1,
             Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Existing)
                 .sequence_number(1)
-                .manifest_dv_cardinality(1)
+                // The leaf's own file is never rewritten, so its counts still describe what v1
+                // wrote; only dv_cardinality tracks file2's later removal.
+                .manifest_info(ManifestInfo {
+                    added_files_count: 4,
+                    added_rows_count: 375,
+                    min_sequence_number: 1,
+                    dv_cardinality: Some(1),
+                    ..Default::default()
+                })
         );
         // The remove happened in the v2 log commit, not in this manifest commit, so file2's leaf
         // position carries over: masked in manifest_dv, absent from the per-commit bitmaps.
@@ -829,7 +872,14 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
             .expect("a new leaf reference for file5");
         assert_eq!(
             **leaf2,
-            Entry::leaf_ref(leaf2.path.clone(), TrackingStatus::Added).sequence_number(3)
+            Entry::leaf_ref(leaf2.path.clone(), TrackingStatus::Added)
+                .sequence_number(3)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 1,
+                    added_rows_count: 50,
+                    min_sequence_number: 3,
+                    ..Default::default()
+                })
         );
 
         assert_leaf_entries(
@@ -903,7 +953,14 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
         assert_root_entries(
             &snapshot,
             &engine,
-            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added).sequence_number(1)],
+            &[Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Added)
+                .sequence_number(1)
+                .manifest_info(ManifestInfo {
+                    added_files_count: 1,
+                    added_rows_count: 100,
+                    min_sequence_number: 1,
+                    ..Default::default()
+                })],
         )?;
         assert_leaf_entries(
             &table_url,
@@ -977,7 +1034,13 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                     .deletion_vector(dv_v2_location.clone(), 5),
                 Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Deleted)
                     .sequence_number(1)
-                    .manifest_dv_cardinality(1),
+                    .manifest_info(ManifestInfo {
+                        added_files_count: 1,
+                        added_rows_count: 100,
+                        min_sequence_number: 1,
+                        dv_cardinality: Some(1),
+                        ..Default::default()
+                    }),
             ],
         )?;
         assert_leaf_entries(
@@ -1058,7 +1121,13 @@ async fn test_dv_addition_and_replacement_leaf_manifest() -> Result<(), Box<dyn 
                     .deletion_vector(dv_v4_location.clone(), 8),
                 Entry::leaf_ref(leaf1_path.clone(), TrackingStatus::Deleted)
                     .sequence_number(1)
-                    .manifest_dv_cardinality(1),
+                    .manifest_info(ManifestInfo {
+                        added_files_count: 1,
+                        added_rows_count: 100,
+                        min_sequence_number: 1,
+                        dv_cardinality: Some(1),
+                        ..Default::default()
+                    }),
             ],
         )?;
     }

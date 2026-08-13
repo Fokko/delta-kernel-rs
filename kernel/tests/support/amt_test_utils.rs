@@ -430,10 +430,30 @@ pub struct Entry {
     pub sequence_number: Option<i64>,
     pub dv_snapshot_id: Option<i64>,
     pub deletion_vector: Option<EntryDv>,
-    /// Cardinality of positions marked dead within a referenced leaf (`manifestInfo.dv`).
-    pub manifest_dv_cardinality: Option<i64>,
+    /// What a leaf-reference row reports about the leaf it points at (`manifestInfo`). `None` for
+    /// entries that aren't leaf references.
+    pub manifest_info: Option<ManifestInfo>,
     deleted_positions: Option<BTreeSet<u64>>,
     replaced_positions: Option<BTreeSet<u64>>,
+}
+
+/// A leaf-reference row's `manifestInfo`: per-status counts for the leaf's own entries, plus the
+/// cardinality of positions masked dead within it.
+///
+/// Mirrors kernel's `ManifestInfo`, which is crate-private. `dv` itself is not compared -- tests
+/// assert the positions it encodes via [`Entry::has_manifest_dv_positions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManifestInfo {
+    pub added_files_count: i32,
+    pub existing_files_count: i32,
+    pub deleted_files_count: i32,
+    pub replaced_files_count: i32,
+    pub added_rows_count: i64,
+    pub existing_rows_count: i64,
+    pub deleted_rows_count: i64,
+    pub replaced_rows_count: i64,
+    pub min_sequence_number: i64,
+    pub dv_cardinality: Option<i64>,
 }
 
 impl PartialEq for Entry {
@@ -444,7 +464,7 @@ impl PartialEq for Entry {
             && self.sequence_number == other.sequence_number
             && self.dv_snapshot_id == other.dv_snapshot_id
             && self.deletion_vector == other.deletion_vector
-            && self.manifest_dv_cardinality == other.manifest_dv_cardinality
+            && self.manifest_info == other.manifest_info
     }
 }
 impl Eq for Entry {}
@@ -459,7 +479,7 @@ impl Entry {
             sequence_number: None,
             dv_snapshot_id: None,
             deletion_vector: None,
-            manifest_dv_cardinality: None,
+            manifest_info: None,
             deleted_positions: None,
             replaced_positions: None,
         }
@@ -494,9 +514,10 @@ impl Entry {
         self
     }
 
-    /// Sets the expected `manifest_dv_cardinality`.
-    pub fn manifest_dv_cardinality(mut self, n: i64) -> Self {
-        self.manifest_dv_cardinality = Some(n);
+    /// Sets the expected `manifestInfo`. Required on leaf-reference entries, which always carry
+    /// one; use `..Default::default()` to assert the unlisted counts are zero.
+    pub fn manifest_info(mut self, info: ManifestInfo) -> Self {
+        self.manifest_info = Some(info);
         self
     }
 
@@ -679,8 +700,19 @@ fn collect_manifest_entries(location: &Url, engine: &dyn Engine) -> DeltaResult<
             StructField::nullable(
                 "manifestInfo",
                 DataType::Struct(Box::new(
-                    StructType::try_new([StructField::nullable("dvCardinality", DataType::LONG)])
-                        .unwrap(),
+                    StructType::try_new([
+                        StructField::nullable("addedFilesCount", DataType::INTEGER),
+                        StructField::nullable("existingFilesCount", DataType::INTEGER),
+                        StructField::nullable("deletedFilesCount", DataType::INTEGER),
+                        StructField::nullable("replacedFilesCount", DataType::INTEGER),
+                        StructField::nullable("addedRowsCount", DataType::LONG),
+                        StructField::nullable("existingRowsCount", DataType::LONG),
+                        StructField::nullable("deletedRowsCount", DataType::LONG),
+                        StructField::nullable("replacedRowsCount", DataType::LONG),
+                        StructField::nullable("minSequenceNumber", DataType::LONG),
+                        StructField::nullable("dvCardinality", DataType::LONG),
+                    ])
+                    .unwrap(),
                 )),
             ),
         ])
@@ -716,6 +748,15 @@ fn collect_manifest_entries(location: &Url, engine: &dyn Engine) -> DeltaResult<
                             ColumnName::new(["tracking", "replacedPositions"]),
                             ColumnName::new(["deletionVector", "location"]),
                             ColumnName::new(["deletionVector", "cardinality"]),
+                            ColumnName::new(["manifestInfo", "addedFilesCount"]),
+                            ColumnName::new(["manifestInfo", "existingFilesCount"]),
+                            ColumnName::new(["manifestInfo", "deletedFilesCount"]),
+                            ColumnName::new(["manifestInfo", "replacedFilesCount"]),
+                            ColumnName::new(["manifestInfo", "addedRowsCount"]),
+                            ColumnName::new(["manifestInfo", "existingRowsCount"]),
+                            ColumnName::new(["manifestInfo", "deletedRowsCount"]),
+                            ColumnName::new(["manifestInfo", "replacedRowsCount"]),
+                            ColumnName::new(["manifestInfo", "minSequenceNumber"]),
                             ColumnName::new(["manifestInfo", "dvCardinality"]),
                         ],
                         vec![
@@ -727,6 +768,15 @@ fn collect_manifest_entries(location: &Url, engine: &dyn Engine) -> DeltaResult<
                             DataType::BINARY,
                             DataType::BINARY,
                             DataType::STRING,
+                            DataType::LONG,
+                            DataType::INTEGER,
+                            DataType::INTEGER,
+                            DataType::INTEGER,
+                            DataType::INTEGER,
+                            DataType::LONG,
+                            DataType::LONG,
+                            DataType::LONG,
+                            DataType::LONG,
                             DataType::LONG,
                             DataType::LONG,
                         ],
@@ -762,8 +812,43 @@ fn collect_manifest_entries(location: &Url, engine: &dyn Engine) -> DeltaResult<
                         getters[7].get_opt(i, "deletionVector.location")?;
                     let dv_cardinality: Option<i64> =
                         getters[8].get_opt(i, "deletionVector.cardinality")?;
-                    let manifest_dv_cardinality: Option<i64> =
-                        getters[9].get_opt(i, "manifestInfo.dvCardinality")?;
+                    // Only leaf-reference rows carry manifestInfo, and addedFilesCount is
+                    // non-null whenever the struct is present, so use it to detect presence.
+                    let added_files_count: Option<i32> =
+                        getters[9].get_opt(i, "manifestInfo.addedFilesCount")?;
+                    let manifest_info = added_files_count
+                        .map(|added_files_count| -> DeltaResult<ManifestInfo> {
+                            Ok(ManifestInfo {
+                                added_files_count,
+                                existing_files_count: getters[10]
+                                    .get_opt(i, "manifestInfo.existingFilesCount")?
+                                    .unwrap_or(0),
+                                deleted_files_count: getters[11]
+                                    .get_opt(i, "manifestInfo.deletedFilesCount")?
+                                    .unwrap_or(0),
+                                replaced_files_count: getters[12]
+                                    .get_opt(i, "manifestInfo.replacedFilesCount")?
+                                    .unwrap_or(0),
+                                added_rows_count: getters[13]
+                                    .get_opt(i, "manifestInfo.addedRowsCount")?
+                                    .unwrap_or(0),
+                                existing_rows_count: getters[14]
+                                    .get_opt(i, "manifestInfo.existingRowsCount")?
+                                    .unwrap_or(0),
+                                deleted_rows_count: getters[15]
+                                    .get_opt(i, "manifestInfo.deletedRowsCount")?
+                                    .unwrap_or(0),
+                                replaced_rows_count: getters[16]
+                                    .get_opt(i, "manifestInfo.replacedRowsCount")?
+                                    .unwrap_or(0),
+                                min_sequence_number: getters[17]
+                                    .get_opt(i, "manifestInfo.minSequenceNumber")?
+                                    .unwrap_or(0),
+                                dv_cardinality: getters[18]
+                                    .get_opt(i, "manifestInfo.dvCardinality")?,
+                            })
+                        })
+                        .transpose()?;
                     self.entries.push(Entry {
                         path,
                         content_type: data_content_type_from_repr(content_type_repr),
@@ -776,7 +861,7 @@ fn collect_manifest_entries(location: &Url, engine: &dyn Engine) -> DeltaResult<
                                 cardinality,
                             },
                         ),
-                        manifest_dv_cardinality,
+                        manifest_info,
                         deleted_positions,
                         replaced_positions,
                     });

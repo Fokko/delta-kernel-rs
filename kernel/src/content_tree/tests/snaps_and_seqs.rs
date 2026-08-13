@@ -16,7 +16,7 @@ use crate::content_tree::builder::{build_partition_type, ContentTreeNodeBuilder}
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
-    TrackingStatus,
+    ManifestInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData};
 use crate::row_tracking::CursorRowIdAllocator;
@@ -297,6 +297,123 @@ fn test_two_commits_move_to_leaf_tracking() -> Result<(), Box<dyn std::error::Er
     assert_eq!(
         a_tracking.sequence_number.unwrap() + 1,
         b_tracking.sequence_number.unwrap()
+    );
+
+    Ok(())
+}
+
+/// `write_leaf`'s `manifest_info` takes `min_sequence_number` from a pre-built log batch's own
+/// entries.
+#[test]
+fn test_pre_built_log_batch_preserves_existing_entry_sequence_number(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = crate::engine::sync::SyncEngine::new();
+    let temp_dir = tempfile::tempdir()?;
+    let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+    // Produce a ContentTreeNodeEntry-schema batch for file_a, added at V1 (sequence_number = 1).
+    let file_a = Add {
+        stats: Some(r#"{"numRecords":7}"#.to_string()),
+        ..make_add("file_a.parquet", 1024)
+    };
+    let mut source = ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+    source.add(file_a, 1, 1)?;
+    let source_node = source.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
+
+    // Roll that batch forward into a builder at a later version.
+    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
+    for batch in source_node.data {
+        builder.add_pre_built_log_batch(batch)?;
+    }
+    let leaf_entry = builder.write_leaf(&engine, 5, &mut CursorRowIdAllocator::new(0))?;
+
+    let manifest_info = leaf_entry.manifest_info.as_ref().expect("manifest_info");
+    assert_eq!(
+        *manifest_info,
+        ManifestInfo {
+            existing_files_count: 1,
+            existing_rows_count: 7,
+            min_sequence_number: 1,
+            ..Default::default()
+        }
+    );
+
+    Ok(())
+}
+
+/// A leaf holding both a freshly added batch and a carried-forward one splits its counts across
+/// added and existing, and takes `min_sequence_number` from the older batch.
+#[test]
+fn test_write_leaf_manifest_info_counts_added_and_existing_batches(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = crate::engine::sync::SyncEngine::new();
+    let temp_dir = tempfile::tempdir()?;
+    let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+    // A batch for file_a, first added at V1 (7 rows).
+    let file_a = Add {
+        stats: Some(r#"{"numRecords":7}"#.to_string()),
+        ..make_add("file_a.parquet", 1024)
+    };
+    let mut source = ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
+    source.add(file_a, 1, 1)?;
+    let source_node = source.build(&engine, 1, &mut CursorRowIdAllocator::new(0))?;
+
+    // At V5: carry V1's batch forward AND add file_b fresh (11 rows).
+    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 5, test_table_schema());
+    for batch in source_node.data {
+        builder.add_pre_built_log_batch(batch)?;
+    }
+    let file_b = Add {
+        stats: Some(r#"{"numRecords":11}"#.to_string()),
+        ..make_add("file_b.parquet", 2048)
+    };
+    builder.add(file_b, 5, 5)?;
+    let leaf_entry = builder.write_leaf(&engine, 5, &mut CursorRowIdAllocator::new(0))?;
+
+    let manifest_info = leaf_entry.manifest_info.as_ref().expect("manifest_info");
+    assert_eq!(
+        *manifest_info,
+        ManifestInfo {
+            added_files_count: 1,
+            added_rows_count: 11,
+            existing_files_count: 1,
+            existing_rows_count: 7,
+            min_sequence_number: 1,
+            ..Default::default()
+        }
+    );
+
+    Ok(())
+}
+
+/// `write_leaf`'s `manifest_info` attributes a freshly added batch to the added counts, at the
+/// version writing it.
+#[test]
+fn test_write_leaf_manifest_info_counts_added_batch() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = crate::engine::sync::SyncEngine::new();
+    let temp_dir = tempfile::tempdir()?;
+    let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+    let mut builder = ContentTreeNodeBuilder::new_for(table_root, 3, test_table_schema());
+    for (path, records) in [("file_a.parquet", 7), ("file_b.parquet", 11)] {
+        let add = Add {
+            stats: Some(format!(r#"{{"numRecords":{records}}}"#)),
+            ..make_add(path, 1024)
+        };
+        builder.add(add, 3, 3)?;
+    }
+    let leaf_entry = builder.write_leaf(&engine, 3, &mut CursorRowIdAllocator::new(0))?;
+
+    let manifest_info = leaf_entry.manifest_info.as_ref().expect("manifest_info");
+    assert_eq!(
+        *manifest_info,
+        ManifestInfo {
+            added_files_count: 2,
+            added_rows_count: 18,
+            min_sequence_number: 3,
+            ..Default::default()
+        }
     );
 
     Ok(())
