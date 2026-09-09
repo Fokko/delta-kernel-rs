@@ -569,7 +569,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
             ),
         ),
         StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-        StructField::nullable("backReference", BackReference::nullable_schema()),
+        StructField::nullable("backReference", BackReference::to_schema()),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -659,10 +659,16 @@ fn get_add_transform_expr(
             column_expr_ref!("add.defaultRowCommitVersion"),
             column_expr_ref!("add.tags"),
             column_expr_ref!("add.clusteringProvider"),
-            Arc::new(Expression::struct_from([
-                column_expr_ref!("add.backReference.manifest"),
-                column_expr_ref!("add.backReference.pos"),
-            ])),
+            // Null-mask the whole `backReference` struct when the source is absent, so its
+            // (non-nullable) children are never surfaced as present-with-null. Presence is keyed
+            // off `manifest`; `visit_back_reference_at` enforces the both-or-neither invariant.
+            Arc::new(Expression::struct_with_nullability_from(
+                [
+                    column_expr_ref!("add.backReference.manifest"),
+                    column_expr_ref!("add.backReference.pos"),
+                ],
+                Expression::from_pred(column_expr!("add.backReference.manifest").is_not_null()),
+            )),
         ])),
         num_records_expr,
     ];
@@ -711,10 +717,17 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("fileConstantValues.baseRowId"),
                 column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
                 column_expr_ref!("fileConstantValues.clusteringProvider"),
-                Arc::new(Expression::struct_from([
-                    column_expr_ref!("fileConstantValues.backReference.manifest"),
-                    column_expr_ref!("fileConstantValues.backReference.pos"),
-                ])),
+                // Null-mask the whole `backReference` struct when absent (see the sibling
+                // transform above) so its non-nullable children are never present-with-null.
+                Arc::new(Expression::struct_with_nullability_from(
+                    [
+                        column_expr_ref!("fileConstantValues.backReference.manifest"),
+                        column_expr_ref!("fileConstantValues.backReference.pos"),
+                    ],
+                    Expression::from_pred(
+                        column_expr!("fileConstantValues.backReference.manifest").is_not_null(),
+                    ),
+                )),
             ]),
         )]))
     });

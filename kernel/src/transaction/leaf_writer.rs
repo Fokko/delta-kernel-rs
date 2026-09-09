@@ -369,7 +369,7 @@ mod tests {
     use crate::actions::BackReference;
     use crate::content_tree::parse_or_join_url;
     use crate::schema::{
-        ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType, ToSchema as _,
     };
 
     /// Helper to create a test engine, table root URL, and schema
@@ -781,7 +781,7 @@ mod tests {
                             true,
                         ))),
                     ),
-                    StructField::nullable("backReference", BackReference::nullable_schema()),
+                    StructField::nullable("backReference", BackReference::to_schema()),
                 ]),
             ),
             StructField::nullable("numRecords", DataType::LONG),

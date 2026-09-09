@@ -309,18 +309,20 @@ mod tests {
 
     #[test]
     fn partial_back_reference_fails() {
+        // A present `backReference` with only one child set is malformed. Its children are
+        // non-nullable in the scan-row schema, so such a row is rejected up front at JSON-decode
+        // time (Arrow refuses unmasked nulls in a non-nullable struct child) rather than reaching
+        // validation.
         let engine = test_engine();
         let row = format!(
             r#"{{"path":"leaf.parquet","size":100,"modificationTime":1,"stats":null,"deletionVector":null,{FC_VALUES},"backReference":{{"manifest":"m.json","pos":null}}}},"numRecords":10}}"#
         );
-        let batch = scan_row_batch(&engine, &[&row], vec![true]);
-        let err = err_message(validate_remove_metadata_for_amt_log_commit(
-            std::iter::once(&batch),
-        ));
-        assert!(
-            err.contains("backReference.manifest") || err.contains("must both be present"),
-            "unexpected error: {err}"
-        );
+        let strings: StringArray = std::iter::once(Some(row.as_str())).collect();
+        let result = engine
+            .json_handler()
+            .parse_json(string_array_to_engine_data(strings), scan_row_schema());
+        let err = err_message(result.map(|_| ()));
+        assert!(err.contains("unmasked nulls"), "unexpected error: {err}");
     }
 
     #[test]

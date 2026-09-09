@@ -813,7 +813,18 @@ impl CommitInfo {
 /// Present on `add` and `remove` actions when the `metadataTree-experimental` table feature is
 /// enabled. Identifies the manifest file and row position of an existing tree entry that the action
 /// supersedes or cancels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Both fields are non-nullable (as reflected in the derived [`ToSchema`]): per the protocol, when
+/// a `backReference` is present both `manifest` and `pos` must be present. The optionality of a
+/// back reference is expressed by the enclosing field being nullable (the whole struct is null when
+/// absent), never by present children being null. Producers that build this struct from a
+/// possibly-absent source must null-mask the whole struct accordingly -- see the scan-metadata
+/// transforms in [`crate::scan::log_replay`], which use `struct_with_nullability_from` for exactly
+/// this. [`visit_back_reference_at`] enforces the both-or-neither invariant at parse time.
+///
+/// [`ToSchema`]: crate::schema::ToSchema
+/// [`visit_back_reference_at`]: crate::actions::visitors::visit_back_reference_at
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     test,
     derive(Serialize, Deserialize, Default),
@@ -824,27 +835,6 @@ pub struct BackReference {
     pub manifest: String,
     /// Row position (0-indexed) of the file entry within the manifest.
     pub pos: i64,
-}
-
-impl BackReference {
-    /// Schema for `backReference` on add/remove actions and scan metadata transforms.
-    ///
-    /// TODO: `manifest` and `pos` should be non-nullable when `backReference` is present per the
-    /// protocol; nullable inner fields are likely a bug. We use them as a workaround because the
-    /// Arrow JSON decoder can emit a non-null `backReference` struct with null children when the
-    /// field is absent. [`visit_back_reference_at`] enforces both-or-neither at parse time.
-    pub(crate) fn nullable_schema() -> StructType {
-        StructType::new_unchecked([
-            StructField::nullable("manifest", DataType::STRING),
-            StructField::nullable("pos", DataType::LONG),
-        ])
-    }
-}
-
-impl crate::schema::ToSchema for BackReference {
-    fn to_schema() -> StructType {
-        BackReference::nullable_schema()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1497,7 +1487,7 @@ mod tests {
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                 StructField::nullable("clusteringProvider", DataType::STRING),
-                StructField::nullable("backReference", BackReference::nullable_schema()),
+                StructField::nullable("backReference", BackReference::to_schema()),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1549,7 +1539,7 @@ mod tests {
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                StructField::nullable("backReference", BackReference::nullable_schema()),
+                StructField::nullable("backReference", BackReference::to_schema()),
             ]),
         )]));
         assert_eq!(schema, expected);

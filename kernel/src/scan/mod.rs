@@ -471,7 +471,7 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
             StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
             StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-            StructField::nullable("backReference", BackReference::nullable_schema()),
+            StructField::nullable("backReference", BackReference::to_schema()),
         ]),
     )])
     .into()
@@ -731,7 +731,7 @@ impl Scan {
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
                     StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-                    StructField::nullable("backReference", BackReference::nullable_schema()),
+                    StructField::nullable("backReference", BackReference::to_schema()),
                 ]),
             )])
         });

@@ -33,7 +33,7 @@ use crate::scan::log_replay::{
 };
 use crate::schema::{
     column_name, ArrayType, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MapType,
-    MetadataValue, Schema, SchemaRef, StructField, StructType,
+    MetadataValue, Schema, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::utils::require;
 #[cfg(test)]
@@ -1772,7 +1772,7 @@ pub(crate) fn log_replay_schema() -> SchemaRef {
             DataType::Struct(Box::new(StructType::new_unchecked([
                 StructField::nullable("path", DataType::STRING),
                 StructField::nullable("deletionVector", remove_dv),
-                StructField::nullable("backReference", BackReference::nullable_schema()),
+                StructField::nullable("backReference", BackReference::to_schema()),
             ]))),
         ),
     ]))

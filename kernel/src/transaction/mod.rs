@@ -2116,13 +2116,21 @@ fn build_remove_transform(
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
         // Preserve back reference before dropping FILE_CONSTANT_VALUES_NAME.
-        // This tells the transaction whether files are in leaf manifests.
+        // This tells the transaction whether files are in leaf manifests. Null-mask the whole
+        // struct when the source is absent so its non-nullable children are never serialized as
+        // present-with-null (which would not round-trip against the strict remove schema).
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::struct_from([
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "manifest"]),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "pos"]),
-            ])
+            Expression::struct_with_nullability_from(
+                [
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "manifest"]),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "pos"]),
+                ],
+                Expression::from_pred(
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "backReference", "manifest"])
+                        .is_not_null(),
+                ),
+            )
             .into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
