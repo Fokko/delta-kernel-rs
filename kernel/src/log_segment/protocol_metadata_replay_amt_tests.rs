@@ -10,6 +10,7 @@ use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
+use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::{
@@ -21,6 +22,17 @@ fn one_column_schema() -> SchemaRef {
     test_schema_flat_with_column_mapping()
         .project(&["id"])
         .unwrap()
+}
+
+// A top-level commit carrying both AMT protocol and metaData (no checkpoint action), so P&M
+// resolves without consulting any checkpoint action.
+fn full_pm_commit(schema: SchemaRef) -> String {
+    let config = adaptive_metadata_table_configuration(schema, &[]);
+    format!(
+        "{}\n{}",
+        serde_json::json!({ "protocol": config.protocol() }),
+        serde_json::json!({ "metaData": config.metadata() }),
+    )
 }
 
 // Builds a commit line with a `checkpoint` action that carries protocol and metadata at
@@ -240,4 +252,152 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     let schema = snapshot.schema();
     assert!(schema.field("name").is_some());
     assert_eq!(schema.num_fields(), 2);
+}
+
+// The latest checkpoint action is memoized on the log segment: the non-plan replay seeds it in
+// place, while the plan path leaves it unset (its MAX-version selection can diverge from the
+// first-match scan) until the lazy accessor resolves it. Either way the accessor returns it.
+#[tokio::test]
+async fn last_checkpoint_action_is_seeded_by_non_plan_replay_and_lazy_on_plan() {
+    check_seeding(non_plan_engine, true).await;
+    #[cfg(feature = "declarative-plans")]
+    check_seeding(|store| SyncEngine::new_with_store(store), false).await;
+}
+
+async fn check_seeding<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    expect_seeded: bool,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    assert_eq!(
+        snapshot.log_segment().checkpoint_cache.0.get().is_some(),
+        expect_seeded,
+        "replay seeding expectation"
+    );
+    let action = snapshot
+        .log_segment()
+        .last_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action");
+    assert_eq!(action.version(), 0);
+    assert_eq!(action.path(), "metadata/root.parquet");
+    // Resolving through the accessor memoizes it regardless of replay path.
+    assert!(snapshot.log_segment().checkpoint_cache.0.get().is_some());
+}
+
+// When P&M resolve from commits above the checkpoint action, replay terminates before reaching
+// it, so nothing is seeded (a replay miss does not prove absence) -- but the lazy scan still finds
+// it. Covers both replay paths.
+#[tokio::test]
+async fn last_checkpoint_action_falls_back_to_scan_when_replay_stops_early() {
+    check_lazy_fallback(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_lazy_fallback(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn check_lazy_fallback<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        full_pm_commit(test_schema_flat_with_column_mapping()),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.version(), 1);
+
+    assert!(
+        snapshot.log_segment().checkpoint_cache.0.get().is_none(),
+        "replay stopped before the checkpoint action, so nothing should be seeded"
+    );
+    let action = snapshot
+        .log_segment()
+        .last_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action");
+    assert_eq!(action.version(), 0);
+}
+
+// Appending a commit that carries a new checkpoint action must invalidate the inherited cache, so
+// the extended segment reports the new action, not the stale one.
+#[tokio::test]
+async fn appended_commit_resets_the_checkpoint_action_cache() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = non_plan_engine(store.clone());
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .build(&engine)
+        .unwrap();
+    // The base segment resolved and cached the v0 checkpoint action.
+    assert_eq!(
+        snapshot
+            .log_segment()
+            .last_checkpoint_action(&engine)
+            .unwrap()
+            .unwrap()
+            .version(),
+        0
+    );
+
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        checkpoint_commit(1, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+    let tail = ParsedLogPath::create_parsed_published_commit(&table_root, 1);
+    let appended = snapshot
+        .log_segment()
+        .new_with_commit_appended(tail)
+        .unwrap();
+
+    assert!(
+        appended.checkpoint_cache.0.get().is_none(),
+        "appending a commit must reset the inherited cache"
+    );
+    assert_eq!(
+        appended
+            .last_checkpoint_action(&engine)
+            .unwrap()
+            .unwrap()
+            .version(),
+        1
+    );
 }

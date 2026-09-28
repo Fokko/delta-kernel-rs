@@ -641,6 +641,8 @@ mod tests {
                 ..Default::default()
             },
             last_checkpoint_metadata: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_cache: Default::default(),
         }
     }
 

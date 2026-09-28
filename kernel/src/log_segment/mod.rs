@@ -13,6 +13,8 @@ use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -125,6 +127,54 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+
+    /// Memoized latest AMT `checkpoint` action, populated best-effort during P&M replay and
+    /// otherwise resolved lazily. See [`Self::last_checkpoint_action`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) checkpoint_cache: CheckpointActionCache,
+}
+
+/// Memoizes the latest AMT [`CheckpointAction`] a [`LogSegment`] covers.
+///
+/// An unset [`OnceLock`] means "not resolved yet"; `Some(None)` is not stored -- only a found
+/// action is ever cached, so a lazy scan always runs when replay could not populate it (replay's
+/// early termination means a replay miss does not prove absence). The cache is derived state, so
+/// it never participates in [`LogSegment`] equality and is not carried across a clone that mutates
+/// the segment's commit contents.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+pub(crate) struct CheckpointActionCache(std::sync::OnceLock<Option<CheckpointAction>>);
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Clone for CheckpointActionCache {
+    fn clone(&self) -> Self {
+        let cache = std::sync::OnceLock::new();
+        if let Some(action) = self.0.get() {
+            let _ = cache.set(action.clone());
+        }
+        Self(cache)
+    }
+}
+
+// Derived state, not identity: two segments with equal contents are equal regardless of whether
+// either has resolved its checkpoint action, so the cache always compares equal.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl PartialEq for CheckpointActionCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Eq for CheckpointActionCache {}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl std::fmt::Debug for CheckpointActionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CheckpointActionCache")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
@@ -280,6 +330,8 @@ impl LogSegment {
                 ascending_commit_files: vec![commit_file],
                 ..Default::default()
             },
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_cache: CheckpointActionCache::default(),
         })
     }
 
@@ -328,6 +380,8 @@ impl LogSegment {
             log_root,
             last_checkpoint_metadata,
             listed: listed_files,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_cache: CheckpointActionCache::default(),
         };
 
         info!(segment = %log_segment.summary());
@@ -665,6 +719,13 @@ impl LogSegment {
 
         let mut new_log_segment = self.clone();
 
+        // The appended commit may carry a new AMT checkpoint action, so the inherited cache is
+        // stale for the extended segment.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            new_log_segment.checkpoint_cache = CheckpointActionCache::default();
+        }
+
         new_log_segment.end_version = tail_commit_file.version;
         new_log_segment
             .listed
@@ -708,6 +769,12 @@ impl LogSegment {
         );
 
         let mut new_log_segment = self.clone();
+        // This clears the segment's commit files, so the inherited cache no longer describes the
+        // segment's contents.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            new_log_segment.checkpoint_cache = CheckpointActionCache::default();
+        }
         new_log_segment.checkpoint_version = Some(checkpoint.version);
         let checkpoint_version = checkpoint.version;
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
@@ -876,6 +943,47 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// The latest AMT `checkpoint` action this segment covers, or `None` if it has none.
+    ///
+    /// Memoized: P&M replay seeds it when it happens to parse a checkpoint action, and otherwise
+    /// this resolves it lazily with a single log scan and caches the result. Repeated calls do not
+    /// re-scan.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn last_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        if let Some(cached) = self.checkpoint_cache.0.get() {
+            return Ok(cached.clone());
+        }
+        let action = self.find_checkpoint_action(engine)?;
+        // A concurrent resolve resolves to the same action, so a lost race is benign.
+        let _ = self.checkpoint_cache.0.set(action.clone());
+        Ok(action)
+    }
+
+    /// Populates the checkpoint-action cache with an action parsed elsewhere (P&M replay), if it is
+    /// not already set. Only a found action is ever cached; absence is never asserted this way,
+    /// since a replay miss does not prove the table has no checkpoint action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn seed_checkpoint_action(&self, action: CheckpointAction) {
+        let _ = self.checkpoint_cache.0.set(Some(action));
+    }
+
+    /// Scans the log for the latest AMT `checkpoint` action. Reads commits newest-first, so the
+    /// first one found is the latest; classic checkpoint files lack the action and yield `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn find_checkpoint_action(&self, engine: &dyn Engine) -> DeltaResult<Option<CheckpointAction>> {
+        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
+        for batch in self.read_actions(engine, schema)? {
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+            {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
     }
 
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
@@ -1385,6 +1493,8 @@ impl LogSegment {
                 latest_commit_file: None,
                 max_published_version: None,
             },
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_cache: CheckpointActionCache::default(),
         }
     }
 
