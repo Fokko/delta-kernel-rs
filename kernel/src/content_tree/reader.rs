@@ -4,9 +4,10 @@
 //! the inverse of [`super::builder`]. This is the minimal read path: a root manifest's live `Data`
 //! entries become `Add` actions, its live `DataManifest` entries are expanded into the `Add`
 //! actions of the leaf manifests they reference, and every other root entry is dropped. A leaf
-//! manifest may contain only `Data` entries and errors otherwise. Statistics, partition values,
-//! tags, and deletion vectors are not yet carried across (see the per-field TODOs); the only entry
-//! data that flows into the action is the file location, size, and row-tracking numbers.
+//! manifest may contain only `Data` entries and errors otherwise; the entries its parent's manifest
+//! deletion vector (`manifestInfo.dv`) marks as not live are skipped. Statistics, partition values,
+//! tags, and data-file deletion vectors are not yet carried across (see the per-field TODOs); the
+//! only entry data that flows into the action is the file location, size, and row-tracking numbers.
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
 
@@ -20,6 +21,7 @@ use url::Url;
 use crate::actions::{CheckpointAction, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
+use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
     struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
     TrackingInfo, TrackingStatus, AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, DV_INFO,
@@ -87,7 +89,7 @@ pub(crate) fn read_add_actions_from_amt(
     for batch in batches {
         let batch = batch?;
         leaves.visit_rows_of(batch.as_ref())?;
-        root_actions.push(converter.convert(batch.as_ref())?);
+        root_actions.push(converter.convert(batch.as_ref(), None)?);
     }
     let leaf_actions =
         LeafToAddActions::try_new(engine, leaves.leaves, schemas.leaf, ctx, cancellation_token)?;
@@ -118,8 +120,9 @@ struct LeafRef {
     file_meta: FileMeta,
     /// Tracking info of the referencing root `DataManifest` entry.
     parent_info: TrackingInfo,
-    /// The root entry's `manifestInfo.dv`: a deletion vector over the leaf's entry positions.
-    manifest_dv: Option<Bytes>,
+    /// The root entry's decoded `manifestInfo.dv`: the leaf entry positions that are not live.
+    /// `None` when every position is live.
+    manifest_dv: Option<MumblingBitmap>,
     /// The root entry's `manifestInfo.formatVersion`: the format version the leaf was written
     /// with.
     format_version: i32,
@@ -169,22 +172,30 @@ impl LeafRef {
         let location: &str = fields[0].get(row, LOCATION)?;
         let size: i64 = fields[1].get(row, FILE_SIZE_IN_BYTES)?;
         let manifest_dv: Option<&[u8]> = fields[2].get_opt(row, MANIFEST_DV)?;
+        let manifest_dv = manifest_dv
+            .map(|dv| MumblingBitmap::deserialize(Bytes::copy_from_slice(dv)))
+            .transpose()
+            .map_err(|e| {
+                KernelError::invalid_checkpoint(format!(
+                    "AMT DataManifest entry '{location}' has a malformed \
+                     {MANIFEST_INFO}.{MANIFEST_DV}: {e}"
+                ))
+            })?;
         Ok(Self {
             file_meta: amt_manifest_filemeta(location, size, table_root, "AMT leaf manifest")?,
             parent_info: TrackingInfo::try_from_getters(row, tracking)?,
-            manifest_dv: manifest_dv.map(Bytes::copy_from_slice),
+            manifest_dv: manifest_dv.filter(|dv| !dv.is_empty()),
             format_version: fields[3].get(row, FORMAT_VERSION)?,
             has_column_files: has_column_files(fields[4].get_struct_list(row, COLUMN_FILES)?)?,
         })
     }
 
     /// Rejects a leaf the read path cannot yet read: one written before Iceberg v4, or one whose
-    /// parent has a manifest deletion vector or column files, which the read path cannot yet apply
-    /// to the leaf's entries.
+    /// parent has column files, which the read path cannot yet apply to the leaf's entries.
     ///
     /// # Errors
     /// Returns an unsupported error if the parent's `manifestInfo.formatVersion` is not
-    /// [`AMT_FORMAT_VERSION`], or the parent has a manifest deletion vector or column files.
+    /// [`AMT_FORMAT_VERSION`], or the parent has column files.
     fn check_readable(&self) -> KernelResult<()> {
         let location = &self.file_meta.location;
         if self.format_version != AMT_FORMAT_VERSION {
@@ -192,12 +203,6 @@ impl LeafRef {
                 "AMT read path only supports format version {AMT_FORMAT_VERSION} leaf \
                  manifests; DataManifest entry '{location}' has {MANIFEST_INFO}.{FORMAT_VERSION} {}",
                 self.format_version
-            )));
-        }
-        if self.manifest_dv.is_some() {
-            return Err(KernelError::unsupported(format!(
-                "AMT read path does not yet support manifest deletion vectors; \
-                 DataManifest entry '{location}' has {MANIFEST_INFO}.{MANIFEST_DV} set"
             )));
         }
         if self.has_column_files {
@@ -296,15 +301,18 @@ impl EntryConverter {
     /// Translates a content-tree entry batch into an `Add`-action batch, keeping only the rows that
     /// read as live data files.
     ///
-    /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its
-    /// tracking status is [live](TrackingStatus::is_live); every other entry is dropped via the
-    /// returned selection vector. [`DataContentType::DataManifest`] entries are dropped too:
-    /// expanding a leaf manifest into its data files is the caller's responsibility.
+    /// An entry becomes an `Add` when `retained` keeps it, its `contentType` is
+    /// [`DataContentType::Data`], and its tracking status is [live](TrackingStatus::is_live); every
+    /// other entry is dropped via the returned selection vector. [`DataContentType::DataManifest`]
+    /// entries are dropped too: expanding a leaf manifest into its data files is the caller's
+    /// responsibility.
     ///
     /// # Parameters
     /// - `entries`: a content-tree entry batch matching the converter's input schema (for a root
     ///   converter, [`ContentTreeNodeEntry::to_schema`], the columnar form produced by
     ///   [`super::builder`]).
+    /// - `retained`: per-row mask of the entries a manifest deletion vector keeps, or `None` to
+    ///   keep every entry. Dropped entries are neither parsed nor validated.
     ///
     /// # Returns
     /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
@@ -315,10 +323,15 @@ impl EntryConverter {
     /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
     /// delete manifest entry is live, if a selected (live `Data`) entry is not Parquet, has a
     /// non-zero partition spec id, or carries a deletion vector, column files, or a
-    /// `modifiedSnapshotId` (none yet supported by the read path), if the evaluator fails to
-    /// evaluate, or if the selection vector length exceeds the batch.
-    fn convert(&self, entries: &dyn EngineData) -> KernelResult<FilteredEngineData> {
-        let mut selector = AddSelectionVisitor::default();
+    /// `modifiedSnapshotId` (none yet supported by the read path), if `retained` is shorter than
+    /// the batch, if the evaluator fails to evaluate, or if the selection vector length exceeds the
+    /// batch.
+    fn convert(
+        &self,
+        entries: &dyn EngineData,
+        retained: Option<&[bool]>,
+    ) -> KernelResult<FilteredEngineData> {
+        let mut selector = AddSelectionVisitor::new(retained);
         selector.visit_rows_of(entries)?;
         let actions = self.evaluator.evaluate(entries)?;
         FilteredEngineData::try_new(actions, selector.selection)
@@ -346,10 +359,13 @@ fn make_root_entry_converter(
 }
 
 /// Converts the entry batches of one leaf manifest into `Add` actions, filling null tracking
-/// fields from the root `DataManifest` entry that references the leaf.
+/// fields from the root `DataManifest` entry that references the leaf and skipping the entries its
+/// manifest deletion vector marks as not live.
 struct LeafReadContext {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
+    /// The parent's manifest deletion vector over the leaf's entry positions.
+    manifest_dv: Option<MumblingBitmap>,
     converter: EntryConverter,
 }
 
@@ -359,12 +375,18 @@ impl LeafReadContext {
     /// # Parameters
     /// - `engine`: provides the evaluation handler for the entry->`Add` transform.
     /// - `parent`: tracking info of the root `DataManifest` entry referencing the leaf.
+    /// - `manifest_dv`: the parent's `manifestInfo.dv`, whose set positions are skipped.
     /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
     ///
     /// # Errors
     /// Returns an error if `parent` has a null `sequenceNumber` or `firstRowId`, or if the
     /// evaluator cannot be constructed.
-    fn new(engine: &dyn Engine, parent: &TrackingInfo, ctx: &ReadContext) -> KernelResult<Self> {
+    fn new(
+        engine: &dyn Engine,
+        parent: &TrackingInfo,
+        manifest_dv: Option<MumblingBitmap>,
+        ctx: &ReadContext,
+    ) -> KernelResult<Self> {
         // Root entries always carry explicit tracking values since nothing above them can be
         // inherited from, so a null here is a malformed root rather than a value to inherit.
         let require = |value: Option<i64>, field: &str| {
@@ -384,6 +406,7 @@ impl LeafReadContext {
         };
         Ok(Self {
             next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,
+            manifest_dv,
             converter: make_entry_converter(engine, ctx, &sources, LEAF_INPUT_SCHEMA.clone())?,
         })
     }
@@ -392,29 +415,34 @@ impl LeafReadContext {
     /// [`EntryConverter::convert`]. Batches must be passed in manifest order, since null
     /// `firstRowId`s are assigned sequentially across them.
     ///
-    /// Unreadable leaves, including those whose parent has a manifest deletion vector, are
-    /// rejected before they are read (see [`LeafRef::check_readable`]). TODO(#3663): supporting
-    /// manifest deletion vectors means masking the selection after `firstRowId` assignment, which
-    /// must still run over every entry.
+    /// Entries masked by the manifest deletion vector are unselected, but still consume their
+    /// `firstRowId` range so the surviving entries keep their row IDs.
     ///
     /// # Errors
-    /// Returns an error if an entry is malformed for a leaf (see [`LeafEntryVisitor`]), or any
-    /// error from [`EntryConverter::convert`].
+    /// Returns an error if a masked batch has an invalid `_row_index` (see
+    /// [`ManifestDvMaskVisitor`]), if an entry is malformed for a leaf (see
+    /// [`LeafEntryVisitor`]), or any error from [`EntryConverter::convert`].
     fn convert_leaf_entries_to_add_actions(
         &mut self,
         entries: &dyn EngineData,
     ) -> KernelResult<FilteredEngineData> {
+        let retained = self
+            .manifest_dv
+            .as_ref()
+            .map(|dv| manifest_dv_retained(entries, dv))
+            .transpose()?;
+        let retained = retained.as_deref();
         // Only update `self` once the whole batch succeeds, so a failed batch leaves the cursor
         // unchanged.
         let (first_row_ids, next_first_row_id) =
-            validate_and_assign_first_row_ids(entries, self.next_first_row_id)?;
+            validate_and_assign_first_row_ids(entries, self.next_first_row_id, retained)?;
 
         let helper_column =
             ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
         let augmented =
             entries.append_columns(FIRST_ROW_ID_HELPER_SCHEMA.clone(), vec![helper_column])?;
 
-        let filtered = self.converter.convert(augmented.as_ref())?;
+        let filtered = self.converter.convert(augmented.as_ref(), retained)?;
         self.next_first_row_id = next_first_row_id;
         Ok(filtered)
     }
@@ -473,25 +501,24 @@ impl LeafToAddActions {
                 dup.file_meta.location
             )));
         }
-        let pending = leaves
-            .iter()
-            .map(|leaf| {
-                leaf.check_readable()?;
-                let location = leaf.file_meta.location.to_string();
-                let context =
-                    LeafReadContext::new(engine, &leaf.parent_info, ctx).map_err(|e| match e {
-                        KernelError::MissingData(msg) => {
-                            KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
-                        }
-                        e => e,
-                    })?;
-                Ok((location, context))
-            })
-            .collect::<KernelResult<_>>()?;
-        let batches = if leaves.is_empty() {
+        let mut pending = VecDeque::with_capacity(leaves.len());
+        let mut files = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            leaf.check_readable()?;
+            let location = leaf.file_meta.location.to_string();
+            let context = LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, ctx)
+                .map_err(|e| match e {
+                    KernelError::MissingData(msg) => {
+                        KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
+                    }
+                    e => e,
+                })?;
+            pending.push_back((location, context));
+            files.push(leaf.file_meta);
+        }
+        let batches = if files.is_empty() {
             None
         } else {
-            let files: Vec<FileMeta> = leaves.into_iter().map(|l| l.file_meta).collect();
             Some(
                 engine
                     .parquet_handler()
@@ -617,15 +644,17 @@ fn make_entry_converter(
 /// per-row values and the next unassigned row ID.
 ///
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
-/// ID, which then advances by the entry's `recordCount`.
+/// ID, which then advances by the entry's `recordCount`. An entry `retained` drops still advances
+/// the cursor this way, but is otherwise not validated and resolves to null.
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
 fn validate_and_assign_first_row_ids(
     entries: &dyn EngineData,
     seed: i64,
+    retained: Option<&[bool]>,
 ) -> KernelResult<(Vec<Scalar>, i64)> {
-    let mut visitor = LeafEntryVisitor::new(seed);
+    let mut visitor = LeafEntryVisitor::new(seed, retained);
     visitor.visit_rows_of(entries)?;
     Ok((visitor.first_row_ids, visitor.next_first_row_id))
 }
@@ -694,8 +723,8 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 }
 
 /// Builds the selection vector picking the entries that become `Add` actions: a live
-/// ([`TrackingStatus::is_live`]) [`DataContentType::Data`] entry is selected; any other entry is
-/// not.
+/// ([`TrackingStatus::is_live`]) [`DataContentType::Data`] entry the retained mask keeps is
+/// selected; any other entry is not. Entries the mask drops are not parsed.
 ///
 /// Fails closed on entries the read path cannot yet represent as an `Add`, rather than silently
 /// dropping or mis-translating them:
@@ -704,12 +733,22 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 /// - a selected entry that carries a deletion vector: the read path does not yet populate
 ///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop.
-#[derive(Default)]
-struct AddSelectionVisitor {
+struct AddSelectionVisitor<'r> {
+    /// Per-row mask of the entries a manifest deletion vector keeps; `None` keeps every entry.
+    retained: Option<&'r [bool]>,
     selection: Vec<bool>,
 }
 
-impl RowVisitor for AddSelectionVisitor {
+impl<'r> AddSelectionVisitor<'r> {
+    fn new(retained: Option<&'r [bool]>) -> Self {
+        Self {
+            retained,
+            selection: Vec::new(),
+        }
+    }
+}
+
+impl RowVisitor for AddSelectionVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
@@ -744,6 +783,10 @@ impl RowVisitor for AddSelectionVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.selection.reserve(row_count);
         for row in 0..row_count {
+            if is_masked(self.retained, self.selection.len())? {
+                self.selection.push(false);
+                continue;
+            }
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
             let status = TrackingStatus::try_from_repr(getters[1].get(row, TRACKING_STATUS)?)?;
             let location: &str = getters[2].get(row, LOCATION)?;
@@ -818,6 +861,72 @@ impl RowVisitor for LeafRefVisitor<'_> {
     }
 }
 
+/// Builds the retained mask of a leaf entry batch: `false` for each entry whose leaf position (its
+/// `_row_index`) is set in `dv`.
+///
+/// # Errors
+/// Returns an error if a `_row_index` is null or negative.
+fn manifest_dv_retained(entries: &dyn EngineData, dv: &MumblingBitmap) -> KernelResult<Vec<bool>> {
+    let mut visitor = ManifestDvMaskVisitor {
+        dv,
+        retained: Vec::new(),
+    };
+    visitor.visit_rows_of(entries)?;
+    Ok(visitor.retained)
+}
+
+/// Visitor behind [`manifest_dv_retained`].
+struct ManifestDvMaskVisitor<'a> {
+    dv: &'a MumblingBitmap,
+    retained: Vec<bool>,
+}
+
+impl RowVisitor for ManifestDvMaskVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new([LEAF_ROW_INDEX_COLUMN])],
+                vec![DataType::LONG],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        self.retained.reserve(row_count);
+        for row in 0..row_count {
+            let position: i64 = getters[0].get(row, LEAF_ROW_INDEX_COLUMN)?;
+            if position < 0 {
+                return Err(KernelError::internal_error(format!(
+                    "AMT leaf manifest entry has a negative '{LEAF_ROW_INDEX_COLUMN}': {position}"
+                )));
+            }
+            // The bitmap cannot hold a position beyond `u32`, so such an entry is never masked.
+            let masked = u32::try_from(position).is_ok_and(|pos| self.dv.contains(pos));
+            self.retained.push(!masked);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `retained` drops the entry at batch row `row`. `None` keeps every entry.
+///
+/// # Errors
+/// Returns an internal error if `retained` has no value for `row`.
+fn is_masked(retained: Option<&[bool]>, row: usize) -> KernelResult<bool> {
+    let Some(retained) = retained else {
+        return Ok(false);
+    };
+    match retained.get(row) {
+        Some(&kept) => Ok(!kept),
+        None => Err(KernelError::internal_error(format!(
+            "AMT manifest deletion vector mask has {} rows, but the batch has more",
+            retained.len()
+        ))),
+    }
+}
+
 /// Rejects a selected (live `Data`) entry carrying a field the read path cannot yet translate into
 /// its `Add`. `getters` is [`AddSelectionVisitor`]'s column order.
 fn check_selected_entry<'a>(
@@ -889,26 +998,46 @@ impl RowVisitor for ColumnFileCounter {
 
 /// Visitor behind [`validate_and_assign_first_row_ids`].
 ///
-/// Errors if a leaf entry is not `Data`, has an unknown status, is live and non-`Added` with a
-/// null `sequenceNumber` or `firstRowId`, or needs a `firstRowId` but has a negative
-/// `recordCount`, or if assignment overflows `i64`.
-struct LeafEntryVisitor {
+/// Errors if an entry has an unknown status, or needs a `firstRowId` but has a negative
+/// `recordCount`, or if assignment overflows `i64`. An entry the retained mask keeps also errors
+/// if it is not `Data`, or is live and non-`Added` with a null `sequenceNumber` or `firstRowId`.
+struct LeafEntryVisitor<'r> {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
+    /// Per-row mask of the entries a manifest deletion vector keeps; `None` keeps every entry.
+    retained: Option<&'r [bool]>,
     /// Resolved `firstRowId` per row, in entry order.
     first_row_ids: Vec<Scalar>,
 }
 
-impl LeafEntryVisitor {
-    fn new(next_first_row_id: i64) -> Self {
+impl<'r> LeafEntryVisitor<'r> {
+    fn new(next_first_row_id: i64, retained: Option<&'r [bool]>) -> Self {
         Self {
             next_first_row_id,
+            retained,
             first_row_ids: Vec::new(),
         }
     }
+
+    /// Assigns the next unassigned `firstRowId` to an entry of `record_count` rows.
+    fn assign_first_row_id(&mut self, record_count: i64) -> KernelResult<i64> {
+        if record_count < 0 {
+            return Err(KernelError::generic(format!(
+                "AMT content-tree leaf entry has a negative '{RECORD_COUNT}': {record_count}"
+            )));
+        }
+        let assigned = self.next_first_row_id;
+        self.next_first_row_id = assigned.checked_add(record_count).ok_or_else(|| {
+            KernelError::generic(format!(
+                "AMT content-tree '{FIRST_ROW_ID}' assignment overflowed i64 at \
+                 {assigned} + {record_count}"
+            ))
+        })?;
+        Ok(assigned)
+    }
 }
 
-impl RowVisitor for LeafEntryVisitor {
+impl RowVisitor for LeafEntryVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
@@ -937,55 +1066,51 @@ impl RowVisitor for LeafEntryVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.first_row_ids.reserve(row_count);
         for row in 0..row_count {
-            // A leaf manifest holds only data file entries.
-            let content_type = DataContentType::try_from_repr(getters[4].get(row, CONTENT_TYPE)?)?;
-            if content_type != DataContentType::Data {
-                let location: &str = getters[5].get(row, LOCATION)?;
-                return Err(KernelError::generic(format!(
-                    "AMT leaf manifest entry '{location}' has content type {content_type:?}; \
-                     leaf manifests may only contain Data entries"
-                )));
-            }
+            // A masked entry never becomes an `Add`, so it is only parsed as far as row-ID
+            // assignment needs.
+            let masked = is_masked(self.retained, self.first_row_ids.len())?;
             let status = TrackingStatus::try_from_repr(getters[2].get(row, TRACKING_STATUS)?)?;
-            // Only `Added` entries may inherit `sequenceNumber`. Dropped entries never become an
-            // `Add`, so they are not checked.
-            let sequence_number: Option<i64> = getters[3].get_opt(row, SEQUENCE_NUMBER)?;
-            if status.is_live() && status != TrackingStatus::Added && sequence_number.is_none() {
-                return Err(KernelError::missing_data(format!(
-                    "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
-                )));
-            }
-            let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
-                // An already-materialized `firstRowId` is kept and does not consume row IDs.
-                Some(existing) => Scalar::Long(existing),
-                // Only `Added` entries are assigned a fresh range of `recordCount` row IDs.
-                None if status == TrackingStatus::Added => {
-                    let record_count: i64 = getters[0].get(row, RECORD_COUNT)?;
-                    if record_count < 0 {
-                        return Err(KernelError::generic(format!(
-                            "AMT content-tree leaf entry has a negative '{RECORD_COUNT}': \
-                             {record_count}"
-                        )));
-                    }
-                    let assigned = self.next_first_row_id;
-                    self.next_first_row_id =
-                        assigned.checked_add(record_count).ok_or_else(|| {
-                            KernelError::generic(format!(
-                                "AMT content-tree '{FIRST_ROW_ID}' assignment overflowed i64 at \
-                             {assigned} + {record_count}"
-                            ))
-                        })?;
-                    Scalar::Long(assigned)
+            if !masked {
+                // A leaf manifest holds only data file entries.
+                let content_type =
+                    DataContentType::try_from_repr(getters[4].get(row, CONTENT_TYPE)?)?;
+                if content_type != DataContentType::Data {
+                    let location: &str = getters[5].get(row, LOCATION)?;
+                    return Err(KernelError::generic(format!(
+                        "AMT leaf manifest entry '{location}' has content type {content_type:?}; \
+                         leaf manifests may only contain Data entries"
+                    )));
                 }
-                None if status.is_live() => {
+                // Only `Added` entries may inherit `sequenceNumber`. Dropped entries never become
+                // an `Add`, so they are not checked.
+                let sequence_number: Option<i64> = getters[3].get_opt(row, SEQUENCE_NUMBER)?;
+                if status.is_live() && status != TrackingStatus::Added && sequence_number.is_none()
+                {
+                    return Err(KernelError::missing_data(format!(
+                        "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
+                    )));
+                }
+            }
+            let first_row_id = match getters[1].get_opt(row, FIRST_ROW_ID)? {
+                // An already-materialized `firstRowId` is kept and does not consume row IDs.
+                Some(existing) => Some(existing),
+                // Only `Added` entries are assigned a fresh range of `recordCount` row IDs. A
+                // masked entry still consumes its range, so the IDs of later entries do not
+                // depend on the manifest deletion vector.
+                None if status == TrackingStatus::Added => {
+                    Some(self.assign_first_row_id(getters[0].get(row, RECORD_COUNT)?)?)
+                }
+                None if status.is_live() && !masked => {
                     return Err(KernelError::missing_data(format!(
                         "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
                     )));
                 }
                 // Dropped entries never become an `Add`.
-                None => Scalar::Null(DataType::LONG),
+                None => None,
             };
-            self.first_row_ids.push(assigned);
+            let first_row_id = first_row_id.filter(|_| !masked);
+            self.first_row_ids
+                .push(first_row_id.map_or(Scalar::Null(DataType::LONG), Scalar::Long));
         }
         Ok(())
     }
@@ -1001,6 +1126,7 @@ mod tests {
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
+    use crate::content_tree::mumbling::test_encoding::encode_positions;
     use crate::content_tree::test_utils::{
         added_data_entry, data_manifest_entry, entry_batch, struct_batch, with_field,
         write_manifest,
@@ -1033,7 +1159,7 @@ mod tests {
         entries: &dyn EngineData,
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
-        make_root_entry_converter(engine, ctx)?.convert(entries)
+        make_root_entry_converter(engine, ctx)?.convert(entries, None)
     }
 
     /// Runs the read path over `entries`.
@@ -1156,11 +1282,17 @@ mod tests {
     }
 
     #[rstest]
-    fn leaf_ref_carries_parent_fields(#[values(false, true)] with_dv: bool) {
+    #[case::no_dv(None, None)]
+    #[case::empty_dv_reads_as_none(Some(vec![]), None)]
+    #[case::dv(Some(vec![1, 3, 300]), Some(vec![1, 3, 300]))]
+    fn leaf_ref_carries_parent_fields(
+        #[case] dv_positions: Option<Vec<u32>>,
+        #[case] expected_positions: Option<Vec<u32>>,
+    ) {
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
         entry.manifest_info = Some(ManifestInfo {
             format_version: 9,
-            dv: with_dv.then(|| Bytes::from_static(b"dv")),
+            dv: dv_positions.as_deref().map(encode_positions),
             ..Default::default()
         });
         let leaf = collect_leaf_refs(&[&[entry.clone()]])
@@ -1168,8 +1300,19 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(leaf.parent_info, entry.tracking);
-        assert_eq!(leaf.manifest_dv, with_dv.then(|| Bytes::from_static(b"dv")));
+        let positions = leaf.manifest_dv.map(|dv| dv.iter().collect::<Vec<_>>());
+        assert_eq!(positions, expected_positions);
         assert_eq!(leaf.format_version, 9);
+    }
+
+    #[test]
+    fn leaf_ref_rejects_malformed_manifest_dv() {
+        let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
+        entry.manifest_info.as_mut().unwrap().dv = Some(Bytes::from_static(b"dv"));
+        assert_result_error_with_message(
+            collect_leaf_refs(&[&[entry]]),
+            "AMT DataManifest entry 'leaf.parquet' has a malformed manifestInfo.dv",
+        );
     }
 
     #[test]
@@ -1531,6 +1674,144 @@ mod tests {
         );
     }
 
+    /// Writes a leaf of `entries` whose parent (sequence 5, `firstRowId` 100) carries a manifest
+    /// deletion vector over `masked`.
+    fn write_masked_leaf(
+        engine: &dyn Engine,
+        path: &str,
+        entries: &[ContentTreeNodeEntry],
+        masked: &[u32],
+    ) -> ContentTreeNodeEntry {
+        let mut leaf = write_leaf(engine, path, entries, 5, 100);
+        leaf.tracking.status = TrackingStatus::Modified;
+        leaf.manifest_info.as_mut().unwrap().dv = Some(encode_positions(masked));
+        leaf
+    }
+
+    #[rstest]
+    fn read_add_actions_from_amt_skips_entries_masked_by_manifest_dv(
+        #[values(ReadShape::AsIs, ReadShape::Split)] shape: ReadShape,
+    ) {
+        let engine = shaped_engine(shape);
+        let existing = with_status(
+            leaf_entry("e.parquet", 1, 1, Some(1), Some(3), Some(4000)),
+            TrackingStatus::Existing,
+        );
+        let masked_leaf = write_masked_leaf(
+            &engine,
+            "metadata/masked.parquet",
+            &[
+                leaf_entry("a.parquet", 100, 10, None, None, None),
+                leaf_entry("b.parquet", 200, 20, None, None, None),
+                existing,
+                leaf_entry("d.parquet", 400, 30, None, None, None),
+            ],
+            &[0, 2],
+        );
+        let unmasked_leaf = write_leaf(
+            &engine,
+            "metadata/unmasked.parquet",
+            &[leaf_entry("c.parquet", 300, 5, None, None, None)],
+            7,
+            9000,
+        );
+        let checkpoint = write_root(&engine, &[masked_leaf, unmasked_leaf]);
+
+        let actual = read_tree(&engine, &checkpoint).unwrap();
+        // Masked `a.parquet` still consumes row IDs 100..110, so the surviving entries keep the
+        // IDs they would have without the manifest deletion vector.
+        let expected = expected_adds(
+            &engine,
+            &[
+                ("b.parquet", 200, 110, 5),
+                ("d.parquet", 400, 130, 5),
+                ("c.parquet", 300, 9000, 7),
+            ],
+        );
+        assert_eq!(
+            concat_batches(&expected.schema(), &actual).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_reads_no_adds_from_fully_masked_leaf() {
+        let engine = memory_engine();
+        // Position 7 lies past the leaf's last entry, which masks nothing.
+        let leaf = write_masked_leaf(
+            &engine,
+            "metadata/leaf.parquet",
+            &[
+                leaf_entry("a.parquet", 100, 10, None, None, None),
+                leaf_entry("b.parquet", 200, 20, None, None, None),
+            ],
+            &[0, 1, 7],
+        );
+        let checkpoint = write_root(&engine, &[leaf]);
+        let actual = read_tree(&engine, &checkpoint).unwrap();
+        assert!(actual.iter().all(|batch| batch.num_rows() == 0));
+    }
+
+    /// An entry masked by the manifest deletion vector is not validated, so a field the read path
+    /// rejects on a live entry does not fail the read. The masked entry still consumes its
+    /// `firstRowId` range when it is `Added`, which `b_base_row_id` reflects.
+    #[rstest]
+    #[case::data_file_dv(
+        |e: &mut ContentTreeNodeEntry| e.deletion_vector = Some(test_dv()),
+        110,
+        "non-null 'deletionVector'"
+    )]
+    #[case::column_files(
+        |e: &mut ContentTreeNodeEntry| e.column_files = Some(vec![test_column_file()]),
+        110,
+        "non-null 'columnFiles'"
+    )]
+    #[case::modified_snapshot_id(
+        |e: &mut ContentTreeNodeEntry| e.tracking.modified_snapshot_id = Some(3),
+        110,
+        "non-null 'modifiedSnapshotId'"
+    )]
+    #[case::partition_spec(|e: &mut ContentTreeNodeEntry| e.spec_id = Some(7), 110, "has specId 7")]
+    #[case::non_data_content_type(
+        |e: &mut ContentTreeNodeEntry| e.content_type = DataContentType::DataManifest,
+        110,
+        "has content type DataManifest"
+    )]
+    #[case::live_non_added_without_sequence_number(
+        |e: &mut ContentTreeNodeEntry| e.tracking.status = TrackingStatus::Existing,
+        100,
+        "live non-Added leaf entry has a null 'sequenceNumber'"
+    )]
+    fn read_add_actions_from_amt_validates_only_unmasked_entries(
+        #[case] edit: fn(&mut ContentTreeNodeEntry),
+        #[case] b_base_row_id: i64,
+        #[case] message: &str,
+        #[values(true, false)] masked: bool,
+    ) {
+        let engine = memory_engine();
+        let mut a = leaf_entry("a.parquet", 100, 10, None, None, None);
+        edit(&mut a);
+        let entries = [a, leaf_entry("b.parquet", 200, 20, None, None, None)];
+        let path = "metadata/leaf.parquet";
+        let leaf = if masked {
+            write_masked_leaf(&engine, path, &entries, &[0])
+        } else {
+            write_leaf(&engine, path, &entries, 5, 100)
+        };
+        let checkpoint = write_root(&engine, &[leaf]);
+
+        let actual = read_tree(&engine, &checkpoint);
+        if masked {
+            let expected = expected_adds(&engine, &[("b.parquet", 200, b_base_row_id, 5)]);
+            assert_eq!(
+                concat_batches(&expected.schema(), &actual.unwrap()).unwrap(),
+                expected
+            );
+        } else {
+            assert_result_error_with_message(actual, message);
+        }
+    }
+
     #[rstest]
     #[case::unexpected_file(
         Scalar::from("memory:///table/other.parquet"),
@@ -1546,7 +1827,7 @@ mod tests {
         let mut actions = LeafToAddActions {
             pending: VecDeque::from([(
                 leaf,
-                LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap(),
+                LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap(),
             )]),
             batches: None,
         };
@@ -1586,12 +1867,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::manifest_dv(
-        |leaf: &mut ContentTreeNodeEntry| {
-            leaf.manifest_info.as_mut().unwrap().dv = Some(Bytes::from_static(b"dv"))
-        },
-        "does not yet support manifest deletion vectors"
-    )]
     #[case::pre_v4_leaf(
         |leaf: &mut ContentTreeNodeEntry| leaf.manifest_info.as_mut().unwrap().format_version = 0,
         "has manifestInfo.formatVersion 0"
@@ -1751,7 +2026,7 @@ mod tests {
 
         for (entries, (selection, row)) in batches.iter().zip(expected) {
             let filtered = converter
-                .convert(entry_batch(&engine, entries).as_ref())
+                .convert(entry_batch(&engine, entries).as_ref(), None)
                 .unwrap();
             assert_eq!(filtered.selection_vector(), selection.as_slice());
             assert_eq!(
@@ -2007,7 +2282,7 @@ mod tests {
             leaf_entry("a.parquet", 100, 10, None, None, None),
             leaf_entry("b.parquet", 200, 20, None, None, None),
         ];
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
                 .unwrap(),
@@ -2039,7 +2314,7 @@ mod tests {
             Some(99),
             Some(500),
         )];
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
                 .unwrap(),
@@ -2093,7 +2368,7 @@ mod tests {
         let engine = SyncEngine::new();
         let mut entries = preceding;
         entries.push(leaf_entry("a.parquet", 1, 10, None, None, None));
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
                 .unwrap(),
@@ -2113,7 +2388,7 @@ mod tests {
     #[test]
     fn first_row_id_assignment_continues_across_batches() {
         let engine = SyncEngine::new();
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
 
         let batch1 = [
             leaf_entry("a.parquet", 1, 10, None, None, None),
@@ -2163,7 +2438,7 @@ mod tests {
             leaf_entry("e.parquet", 1, 7, Some(3), sequence_number, first_row_id),
             status,
         );
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, expected_field);
@@ -2180,7 +2455,7 @@ mod tests {
         // overflow (seed 100 + i64::MAX).
         let engine = SyncEngine::new();
         let entry = leaf_entry("a.parquet", 1, record_count, None, None, None);
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, expected_message);
@@ -2203,7 +2478,7 @@ mod tests {
             file_sequence_number,
             first_row_id,
         );
-        let result = LeafReadContext::new(&engine, &parent, &read_ctx());
+        let result = LeafReadContext::new(&engine, &parent, None, &read_ctx());
         assert_result_error_with_message(result, expected_field);
     }
 
@@ -2213,7 +2488,7 @@ mod tests {
         let engine = SyncEngine::new();
         let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
         entry.deletion_vector = Some(test_dv());
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, "deletion vector");
@@ -2226,7 +2501,7 @@ mod tests {
         let engine = SyncEngine::new();
         let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
         entry.content_type = content_type;
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, &format!("content type {content_type:?}"));
@@ -2235,7 +2510,7 @@ mod tests {
     #[test]
     fn leaf_empty_batch_yields_empty_and_preserves_next_row_id() {
         let engine = SyncEngine::new();
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let empty = filtered_to_batch(
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[]).as_ref())
                 .unwrap(),

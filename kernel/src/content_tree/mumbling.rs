@@ -340,22 +340,56 @@ fn take(bytes: &mut Bytes, n: usize) -> KernelResult<Bytes> {
     Ok(bytes.split_to(n))
 }
 
+/// Test-only Mumbling bitmap encoding, for building bitmap buffers without a real encoder.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_encoding {
+    use std::collections::BTreeMap;
+
+    use bytes::Bytes;
+
+    use super::{
+        DENSE_BYTES, DESCRIPTOR_LEN_BITS, DESCRIPTOR_TYPE_BITS, FORMAT_VERSION, PFOR_CHUNK,
+    };
 
     /// A container body for building test buffers.
-    enum Body {
+    pub(crate) enum Body {
         /// Sparse container: the sorted set values (the descriptor stores the count).
         Sparse(Vec<u8>),
         /// Dense container: the raw 32-byte MSB-first bitset (descriptor `0x20`).
         Dense([u8; DENSE_BYTES]),
     }
 
+    /// Encode the set `positions` as a Mumbling bitmap, choosing a sparse container when it fits
+    /// the descriptor's set count and a dense one otherwise.
+    pub(crate) fn encode_positions(positions: &[u32]) -> Bytes {
+        let mut containers: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        for &pos in positions {
+            containers
+                .entry((pos >> 8) as usize)
+                .or_default()
+                .push(pos as u8);
+        }
+        let container_count = containers.keys().last().map_or(0, |&idx| idx + 1);
+        let entries: Vec<_> = containers
+            .into_iter()
+            .map(|(idx, mut values)| {
+                values.sort_unstable();
+                values.dedup();
+                let body = if values.len() <= DESCRIPTOR_LEN_BITS as usize {
+                    Body::Sparse(values)
+                } else {
+                    Body::Dense(dense_bytes(&values))
+                };
+                (idx, body)
+            })
+            .collect();
+        encode_bitmap(container_count, &entries, None)
+    }
+
     /// Encode `values` as a PFOR byte array using the trivial `b1 = 8` scheme (one raw byte per
     /// value, no exceptions), which the spec permits. Lets full-bitmap tests build descriptor
     /// arrays without a real PFOR encoder.
-    fn encode_pfor_raw(values: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode_pfor_raw(values: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         for chunk in values.chunks(PFOR_CHUNK) {
             out.extend_from_slice(&[0x08, 0x00, 0x00]); // b1=8, b2=0, e=0, m=0
@@ -367,7 +401,7 @@ mod tests {
     /// Build a full Mumbling bitmap buffer from `(container_index, body)` entries. Unlisted
     /// containers get an empty sparse descriptor. `cardinality` overrides the computed value (for
     /// the mismatch test).
-    fn encode_bitmap(
+    pub(crate) fn encode_bitmap(
         container_count: usize,
         entries: &[(usize, Body)],
         cardinality: Option<u32>,
@@ -402,13 +436,19 @@ mod tests {
     }
 
     /// Build a dense 32-byte bitset from a set of in-container values (MSB-first).
-    fn dense_bytes(values: &[u8]) -> [u8; DENSE_BYTES] {
+    pub(crate) fn dense_bytes(values: &[u8]) -> [u8; DENSE_BYTES] {
         let mut block = [0u8; DENSE_BYTES];
         for &v in values {
             block[v as usize / 8] |= 1 << (7 - (v % 8));
         }
         block
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_encoding::{dense_bytes, encode_bitmap, encode_pfor_raw, Body};
+    use super::*;
 
     /// The deleted (unselected) positions of a deletion selection vector, ascending.
     fn deleted_positions(selection: &[bool]) -> Vec<usize> {
@@ -708,6 +748,15 @@ mod tests {
         }
         // A position in a container index beyond the bitmap is unset, not a panic.
         assert!(!bitmap.contains(0xFFFFF));
+    }
+
+    #[rstest::rstest]
+    #[case::empty(vec![])]
+    #[case::sparse_across_containers(vec![0, 3, 255, 256, 0x12345])]
+    #[case::dense_container((0..40).chain([1000]).collect())]
+    fn encode_positions_round_trips(#[case] positions: Vec<u32>) {
+        let bitmap = MumblingBitmap::deserialize(test_encoding::encode_positions(&positions));
+        assert_eq!(bitmap.unwrap().iter().collect::<Vec<_>>(), positions);
     }
 
     #[test]
