@@ -452,7 +452,7 @@ pub(crate) fn as_checkpoint_skipping_predicate(
 }
 
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
-fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) -> Pred {
+pub(crate) fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) -> Pred {
     let pred_fn = match (ord, inverted) {
         (Ordering::Less, false) => Pred::lt,
         (Ordering::Less, true) => Pred::ge,
@@ -467,7 +467,7 @@ fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) 
 /// Collects sub-predicates into a junction (AND/OR), replacing unsupported sub-predicates (None)
 /// with a single NULL literal to preserve correct three-valued logic. One NULL is enough to
 /// produce the correct behavior during predicate evaluation; additional NULLs are redundant.
-fn collect_junction_preds(
+pub(crate) fn collect_junction_preds(
     mut op: JunctionPredicateOp,
     preds: &mut dyn Iterator<Item = Option<Pred>>,
     inverted: bool,

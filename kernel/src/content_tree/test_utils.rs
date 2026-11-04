@@ -11,8 +11,8 @@ use crate::content_tree::{
     AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo,
     ManifestInfo, TrackingInfo, TrackingStatus,
 };
-use crate::expressions::{Scalar, StructData};
-use crate::schema::ToSchema as _;
+use crate::expressions::{ArrayData, Scalar, StructData};
+use crate::schema::{ArrayType, StructField, StructType, ToSchema as _};
 use crate::{Engine, EngineData, FileMeta};
 
 /// A valid relative AMT deletion vector, convertible to a `DeletionVectorDescriptor`.
@@ -126,7 +126,29 @@ pub(crate) fn write_manifest(
     location: Url,
     entries: &[ContentTreeNodeEntry],
 ) -> FileMeta {
-    let data = entry_batch(engine, entries);
+    write_batch(engine, location, entry_batch(engine, entries))
+}
+
+/// Writes `entries` like [`write_manifest`], followed by a `content_stats` column (described by
+/// `content_stats`) holding `stats[i]` for entry `i`.
+pub(crate) fn write_manifest_with_stats(
+    engine: &dyn Engine,
+    location: Url,
+    entries: &[ContentTreeNodeEntry],
+    content_stats: &StructField,
+    stats: Vec<Scalar>,
+) -> FileMeta {
+    let column_type = ArrayType::new(content_stats.data_type().clone(), true);
+    let column = ArrayData::try_new(column_type, stats).unwrap();
+    let schema = Arc::new(StructType::new_unchecked([content_stats.clone()]));
+    let data = entry_batch(engine, entries)
+        .append_columns(schema, vec![column])
+        .unwrap();
+    write_batch(engine, location, data)
+}
+
+/// Writes `data` as a single-batch parquet file at `location` and returns its [`FileMeta`].
+fn write_batch(engine: &dyn Engine, location: Url, data: Box<dyn EngineData>) -> FileMeta {
     let size = engine
         .parquet_handler()
         .write_parquet_file(location.clone(), Box::new(iter::once(Ok(data))))
@@ -147,7 +169,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue};
 
     /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
     fn manifest_entries() -> Vec<ContentTreeNodeEntry> {

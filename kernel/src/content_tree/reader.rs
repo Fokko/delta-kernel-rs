@@ -10,6 +10,12 @@
 //! file location, size, row-tracking numbers, and deletion vector.
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
+//!
+//! Given an [`AmtSkippingFilter`], the read also drops the entries whose `content_stats` prove
+//! that no row matches the scan predicate. A root `DataManifest` entry dropped this way is never
+//! read; this keeps every other leaf's row IDs, which are seeded by its own root entry. A skipped
+//! leaf entry is only deselected: row-ID assignment and manifest deletion vector positions still
+//! count it.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
@@ -25,6 +31,7 @@ use crate::content_tree::dv_conversion::{
     ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
+use crate::content_tree::skipping::AmtSkippingFilter;
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
     DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
@@ -58,12 +65,15 @@ use crate::{
 /// - `engine`: provides the parquet and evaluation handlers.
 /// - `checkpoint`: the AMT `checkpoint` action whose content tree to read.
 /// - `ctx`: the per-read values the entries cannot supply (see [`ReadContext`]).
+/// - `skipping`: when set, also drops the data files and leaf manifests whose stats prove that no
+///   row matches its predicate. Only reads that produce scan results may skip: anything that
+///   carries entries forward must read every one.
 /// - `cancellation_token`: when cancelled, stops the manifest reads with
 ///   [`KernelError::Cancelled`].
 ///
 /// # Returns
 /// An iterator of `Add`-action batches (schema [`LOG_ADD_SCHEMA`]) whose selection vectors keep
-/// only live data files.
+/// only live data files that `skipping` does not drop.
 ///
 /// # Errors
 /// Returns an error if a manifest cannot be read or holds a malformed or unsupported entry. Leaf
@@ -73,11 +83,12 @@ pub(crate) fn read_add_actions_from_amt(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     ctx: &ReadContext,
+    skipping: Option<&AmtSkippingFilter>,
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> KernelResult<Box<dyn KernelResultIterator<FilteredEngineData>>> {
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
-    let schemas = ManifestReadSchema::new();
+    let schemas = ManifestReadSchema::new(skipping.map(AmtSkippingFilter::content_stats_field));
     let converter = make_root_entry_converter(engine, ctx)?;
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
@@ -91,11 +102,21 @@ pub(crate) fn read_add_actions_from_amt(
         )?;
     for batch in batches {
         let batch = batch?;
-        leaves.visit_rows_of(batch.as_ref())?;
-        root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
+        let keep = skipping
+            .map(|filter| filter.apply(batch.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        leaves.visit_batch(batch.as_ref(), &keep)?;
+        root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default(), &keep)?);
     }
-    let leaf_actions =
-        LeafToAddActions::try_new(engine, leaves.leaves, schemas.leaf, ctx, cancellation_token)?;
+    let leaf_actions = LeafToAddActions::try_new(
+        engine,
+        leaves.leaves,
+        schemas.leaf,
+        ctx,
+        skipping,
+        cancellation_token,
+    )?;
     Ok(Box::new(
         root_actions.into_iter().map(Ok).chain(leaf_actions),
     ))
@@ -235,9 +256,10 @@ struct ManifestReadSchema {
 }
 
 impl ManifestReadSchema {
-    /// Builds the manifest read schemas.
-    fn new() -> Self {
-        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+    /// Builds the manifest read schemas, which end with `content_stats` when given (see
+    /// [`AmtSkippingFilter::content_stats_field`]).
+    fn new(content_stats: Option<&StructField>) -> Self {
+        let entry_schema = ContentTreeNodeEntry::to_schema();
         let metadata = [
             StructField::create_metadata_column(
                 LEAF_FILE_PATH_COLUMN,
@@ -248,10 +270,13 @@ impl ManifestReadSchema {
                 MetadataColumnSpec::RowIndex,
             ),
         ];
-        let leaf = StructType::new_unchecked(entry_schema.fields().cloned().chain(metadata));
+        let content_stats = content_stats.cloned();
+        let root = entry_schema.fields().cloned().chain(content_stats.clone());
+        let leaf = entry_schema.fields().cloned().chain(metadata);
+        let leaf = leaf.chain(content_stats);
         Self {
-            root: entry_schema,
-            leaf: Arc::new(leaf),
+            root: Arc::new(StructType::new_unchecked(root)),
+            leaf: Arc::new(StructType::new_unchecked(leaf)),
         }
     }
 }
@@ -308,13 +333,16 @@ impl EntryConverter {
     /// tracking status is [live](TrackingStatus::is_live); every other entry is dropped via the
     /// returned selection vector. [`DataContentType::DataManifest`] entries are dropped too:
     /// expanding a leaf manifest into its data files is the caller's responsibility. Rows marked in
-    /// `removed` are dropped without being parsed or checked.
+    /// `removed` are dropped without being parsed or checked. Rows `keep` marks `false` are checked
+    /// like any other, then dropped.
     ///
     /// # Parameters
     /// - `entries`: a content-tree entry batch matching the converter's input schema (for a root
     ///   converter, [`ContentTreeNodeEntry::to_schema`], the columnar form produced by
     ///   [`super::builder`]).
     /// - `removed`: the entries a manifest deletion vector removes.
+    /// - `keep`: per entry, whether its rows might match the scan predicate (see
+    ///   [`AmtSkippingFilter::apply`]); entries past its end might.
     ///
     /// # Returns
     /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
@@ -331,9 +359,11 @@ impl EntryConverter {
         &self,
         entries: &dyn EngineData,
         removed: RemovedEntries<'_>,
+        keep: &[bool],
     ) -> KernelResult<FilteredEngineData> {
         let mut visitor = AddSelectionVisitor {
             removed,
+            keep,
             selection: Vec::new(),
             deletion_vectors: AddDeletionVectorColumns::default(),
         };
@@ -378,6 +408,8 @@ struct LeafReadContext {
     manifest_dv: Option<MumblingBitmap>,
     /// Leaf position of the next unconverted entry.
     next_position: usize,
+    /// Drops the entries whose stats prove that no row matches the scan predicate.
+    skipping: Option<AmtSkippingFilter>,
 }
 
 impl LeafReadContext {
@@ -420,7 +452,13 @@ impl LeafReadContext {
             converter: make_entry_converter(engine, ctx, &sources, LEAF_INPUT_SCHEMA.clone())?,
             manifest_dv,
             next_position: 0,
+            skipping: None,
         })
+    }
+
+    /// Also drops the entries `skipping` rules out (see [`AmtSkippingFilter::apply`]).
+    fn with_skipping(self, skipping: Option<AmtSkippingFilter>) -> Self {
+        Self { skipping, ..self }
     }
 
     /// Converts one batch of leaf entries into an `Add`-action batch, like
@@ -451,7 +489,13 @@ impl LeafReadContext {
         let augmented =
             entries.append_columns(FIRST_ROW_ID_HELPER_SCHEMA.clone(), vec![helper_column])?;
 
-        let filtered = self.converter.convert(augmented.as_ref(), removed)?;
+        let keep = self
+            .skipping
+            .as_ref()
+            .map(|filter| filter.apply(entries))
+            .transpose()?
+            .unwrap_or_default();
+        let filtered = self.converter.convert(augmented.as_ref(), removed, &keep)?;
         self.next_first_row_id = next_first_row_id;
         self.next_position += entries.len();
         Ok(filtered)
@@ -513,7 +557,8 @@ struct LeafToAddActions {
 
 impl LeafToAddActions {
     /// Validates and reads all the leaves, with `read_schema` (see [`ManifestReadSchema::leaf`]),
-    /// stopping when `cancellation_token` is cancelled.
+    /// dropping the entries `skipping` rules out, and stopping when `cancellation_token` is
+    /// cancelled.
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
@@ -525,6 +570,7 @@ impl LeafToAddActions {
         leaves: Vec<LeafRef>,
         read_schema: SchemaRef,
         ctx: &ReadContext,
+        skipping: Option<&AmtSkippingFilter>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         let mut seen = HashSet::new();
@@ -546,7 +592,8 @@ impl LeafToAddActions {
                                 "{msg} (leaf manifest '{location}')"
                             )),
                             e => e,
-                        })?;
+                        })?
+                        .with_skipping(skipping.cloned());
                 Ok(((location, context), leaf.file_meta))
             })
             .collect::<KernelResult<_>>()?;
@@ -590,8 +637,8 @@ impl LeafToAddActions {
                 "AMT leaf manifest batch from '{file}' matches no remaining leaf manifest"
             )));
         };
-        // TODO(#3263): leaf batches also carry the `_file` and `_row_index` metadata columns, which
-        // the leaf converter's input schema does not declare.
+        // TODO(#3263): leaf batches also carry the `_file` and `_row_index` metadata columns, and
+        // with skipping `content_stats`, which the leaf converter's input schema does not declare.
         context.convert_leaf_entries_to_add_actions(batch)
     }
 }
@@ -790,6 +837,8 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 ///   equivalent.
 struct AddSelectionVisitor<'r> {
     removed: RemovedEntries<'r>,
+    /// Per row, whether its rows might match the scan predicate; rows past the end might.
+    keep: &'r [bool],
     selection: Vec<bool>,
     /// The helper columns `Add.deletionVector` is built from, with a row for every entry: only a
     /// selected entry's deletion vector is kept.
@@ -859,19 +908,26 @@ impl RowVisitor for AddSelectionVisitor<'_> {
             } else {
                 self.deletion_vectors.push_null();
             }
-            self.selection.push(selected);
+            // A skipped entry is still checked above, so skipping never hides a malformed one.
+            let kept = self.keep.get(self.selection.len()) != Some(&false);
+            self.selection.push(selected && kept);
         }
         Ok(())
     }
 }
 
 /// Collects a [`LeafRef`] for every live `DataManifest` entry of the root-manifest entry batches
-/// it visits, in row order across batches. Non-live `DataManifest` entries and all other entries
-/// are skipped.
+/// it visits, in row order across batches. Non-live `DataManifest` entries, those `keep` drops,
+/// and all other entries are skipped.
 struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
     leaves: Vec<LeafRef>,
+    /// Per row of the current batch, whether its leaf might hold matching rows; rows past the end
+    /// might.
+    keep: Vec<bool>,
+    /// Rows of the current batch visited so far: `visit` may cover a batch in several calls.
+    visited: usize,
 }
 
 impl<'u> LeafRefVisitor<'u> {
@@ -879,7 +935,17 @@ impl<'u> LeafRefVisitor<'u> {
         Self {
             table_root,
             leaves: Vec::new(),
+            keep: Vec::new(),
+            visited: 0,
         }
+    }
+
+    /// Visits one root-manifest batch, skipping the leaves `keep` (see
+    /// [`AmtSkippingFilter::apply`]) drops. Rows past the end of `keep` are kept.
+    fn visit_batch(&mut self, batch: &dyn EngineData, keep: &[bool]) -> KernelResult<()> {
+        self.keep = keep.to_vec();
+        self.visited = 0;
+        self.visit_rows_of(batch)
     }
 }
 
@@ -908,8 +974,14 @@ impl RowVisitor for LeafRefVisitor<'_> {
                 continue;
             }
             let leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
-            self.leaves.push(leaf);
+            if self.keep.get(self.visited + row) != Some(&false) {
+                self.leaves.push(leaf);
+            } else {
+                // A skipped leaf is never read, but must still be one the read path can read.
+                leaf.check_readable()?;
+            }
         }
+        self.visited += row_count;
         Ok(())
     }
 }
@@ -1161,16 +1233,17 @@ mod tests {
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
+    use crate::content_tree::stats::field_with_id;
     use crate::content_tree::test_utils::{
         added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap, struct_batch,
-        test_dv_info, with_field, write_manifest,
+        test_dv_info, with_field, write_manifest, write_manifest_with_stats,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::expressions::StructData;
+    use crate::expressions::{Predicate, StructData, col};
     use crate::object_store::memory::InMemory;
     use crate::scan::state::DvInfo;
     use crate::schema::StructType;
@@ -1194,7 +1267,7 @@ mod tests {
         entries: &dyn EngineData,
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
-        make_root_entry_converter(engine, ctx)?.convert(entries, RemovedEntries::default())
+        make_root_entry_converter(engine, ctx)?.convert(entries, RemovedEntries::default(), &[])
     }
 
     /// Runs the read path over `entries`.
@@ -1403,7 +1476,7 @@ mod tests {
     #[test]
     fn manifest_read_schema_adds_leaf_metadata_columns() {
         let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
-        let schemas = ManifestReadSchema::new();
+        let schemas = ManifestReadSchema::new(None);
 
         assert_eq!(schemas.root, entry_schema);
         let leaf: Vec<_> = schemas.leaf.fields().collect();
@@ -1431,7 +1504,7 @@ mod tests {
             added_data_entry("b.parquet", 1, 1, 1, 0),
         ];
         let file = write_manifest(&engine, location.clone(), &entries);
-        let schemas = ManifestReadSchema::new();
+        let schemas = ManifestReadSchema::new(None);
 
         let batches: Vec<RecordBatch> = engine
             .parquet_handler()
@@ -1560,12 +1633,14 @@ mod tests {
         entry
     }
 
-    /// Reads `checkpoint`'s content tree, returning each batch's selected `Add` rows.
+    /// Reads `checkpoint`'s content tree with `skipping`, returning each batch's selected `Add`
+    /// rows.
     fn read_tree(
         engine: &dyn Engine,
         checkpoint: &CheckpointAction,
+        skipping: Option<&AmtSkippingFilter>,
     ) -> KernelResult<Vec<RecordBatch>> {
-        read_add_actions_from_amt(engine, checkpoint, &read_ctx(), None)?
+        read_add_actions_from_amt(engine, checkpoint, &read_ctx(), skipping, None)?
             .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
             .collect()
     }
@@ -1599,7 +1674,7 @@ mod tests {
             ],
         );
 
-        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let actual = read_tree(&engine, &checkpoint, None).unwrap();
         let expected = expected_adds(
             &engine,
             &[("a.parquet", 100, 0, 5), ("b.parquet", 200, 10, 5)],
@@ -1662,7 +1737,7 @@ mod tests {
         };
 
         let mut adds = AddVisitor::default();
-        for batch in read_tree(&engine, &checkpoint).unwrap() {
+        for batch in read_tree(&engine, &checkpoint, None).unwrap() {
             adds.visit_rows_of(&ArrowEngineData::new(batch)).unwrap();
         }
         let [add, no_dv_add] = adds.adds.as_slice() else {
@@ -1750,7 +1825,7 @@ mod tests {
             ],
         );
 
-        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let actual = read_tree(&engine, &checkpoint, None).unwrap();
         // Null leaf `firstRowId`s are assigned from their parent's, and null sequence numbers
         // inherit the parent's, across batches.
         let expected = expected_adds(
@@ -1822,7 +1897,7 @@ mod tests {
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &leaf_entries, 5, 100);
         edit_parent(&mut leaf);
         let checkpoint = write_root(&engine, &[leaf]);
-        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+        assert_result_error_with_message(read_tree(&engine, &checkpoint, None), message);
     }
 
     #[rstest]
@@ -1842,7 +1917,9 @@ mod tests {
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         edit_parent(&mut leaf);
         let checkpoint = write_root(&engine, &[leaf]);
-        let err = read_tree(&engine, &checkpoint).unwrap_err().to_string();
+        let err = read_tree(&engine, &checkpoint, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(message), "{err}");
         assert!(
             err.contains("'memory:///table/metadata/leaf.parquet'"),
@@ -1900,7 +1977,7 @@ mod tests {
             ],
         );
 
-        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let actual = read_tree(&engine, &checkpoint, None).unwrap();
         // The removed `b.parquet` still consumes its 20 row IDs, so `c.parquet` keeps the
         // `baseRowId` it had before the deletion vector was set.
         let expected = expected_adds(
@@ -1949,7 +2026,7 @@ mod tests {
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[removed, kept], 5, 100);
         let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
 
-        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let actual = read_tree(&engine, &checkpoint, None).unwrap();
         let expected = expected_adds(&engine, &[("kept.parquet", 1, 500, 4)]);
         assert_eq!(
             concat_batches(&expected.schema(), &actual).unwrap(),
@@ -1975,7 +2052,7 @@ mod tests {
         edit_removed(&mut removed);
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[removed], 5, 100);
         let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
-        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+        assert_result_error_with_message(read_tree(&engine, &checkpoint, None), message);
     }
 
     #[rstest]
@@ -1991,7 +2068,7 @@ mod tests {
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         leaf.manifest_info.as_mut().unwrap().dv = Some(dv);
         let checkpoint = write_root(&engine, &[leaf]);
-        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+        assert_result_error_with_message(read_tree(&engine, &checkpoint, None), message);
     }
 
     #[rstest]
@@ -2028,7 +2105,7 @@ mod tests {
                 with_manifest_dv(last, last_dv),
             ],
         );
-        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+        assert_result_error_with_message(read_tree(&engine, &checkpoint, None), message);
     }
 
     #[test]
@@ -2037,7 +2114,7 @@ mod tests {
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
         assert_result_error_with_message(
-            read_tree(&engine, &checkpoint),
+            read_tree(&engine, &checkpoint, None),
             "'memory:///table/metadata/leaf.parquet' has 0 entries, but its manifestInfo.dv \
              removes position 0",
         );
@@ -2065,9 +2142,10 @@ mod tests {
             200,
         );
         let checkpoint = write_root(&engine, &[malformed, valid]);
-        let results: Vec<_> = read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), None)
-            .unwrap()
-            .collect();
+        let results: Vec<_> =
+            read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), None, None)
+                .unwrap()
+                .collect();
         let first_error = results.iter().position(Result::is_err).unwrap();
         let after = &results[first_error + 1..];
         assert!(!after.is_empty());
@@ -2080,7 +2158,7 @@ mod tests {
         let missing = data_manifest_entry("metadata/missing.parquet", 1, TrackingStatus::Added);
         let checkpoint = write_root(&engine, &[missing]);
         assert_result_error_with_message(
-            read_tree(&engine, &checkpoint),
+            read_tree(&engine, &checkpoint, None),
             "metadata/missing.parquet",
         );
     }
@@ -2091,7 +2169,7 @@ mod tests {
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         let checkpoint = write_root(&engine, &[leaf.clone(), leaf]);
         assert_result_error_with_message(
-            read_tree(&engine, &checkpoint),
+            read_tree(&engine, &checkpoint, None),
             "references leaf manifest 'memory:///table/metadata/leaf.parquet' more than once",
         );
     }
@@ -2111,7 +2189,7 @@ mod tests {
             &[added_data_entry("a.parquet", 100, 10, 0, 5), leaf],
         );
         let read = |token: CancellationTokenRef| {
-            read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), Some(&token))
+            read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), None, Some(&token))
         };
 
         let cancelled = Arc::new(TestCancellationToken::cancelled());
@@ -2129,7 +2207,7 @@ mod tests {
     fn read_add_actions_from_amt_errors_on_missing_root() {
         let engine = memory_engine();
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
-        assert_result_error_with_message(read_tree(&engine, &checkpoint), ROOT_PATH);
+        assert_result_error_with_message(read_tree(&engine, &checkpoint, None), ROOT_PATH);
     }
 
     #[test]
@@ -2181,6 +2259,7 @@ mod tests {
                 .convert(
                     entry_batch(&engine, entries).as_ref(),
                     RemovedEntries::default(),
+                    &[],
                 )
                 .unwrap();
             assert_eq!(filtered.selection_vector(), selection.as_slice());
@@ -2737,6 +2816,208 @@ mod tests {
             out.try_into_record_batch().unwrap(),
             expected.try_into_record_batch().unwrap()
         );
+    }
+
+    // === Data skipping ===
+
+    /// The skipping filter for `x > 100`, over a table whose only column `x` (field ID 1) is a
+    /// LONG.
+    fn x_gt_100(engine: &dyn Engine) -> AmtSkippingFilter {
+        let schema = StructType::new_unchecked([field_with_id("x", DataType::LONG, true, 1)]);
+        let predicate = Predicate::gt(col!("x"), lit(100i64));
+        AmtSkippingFilter::try_new(engine, &predicate, &schema).unwrap()
+    }
+
+    /// The `content_stats` of an entry whose 10 `x` values lie within `bounds`, or a null struct
+    /// when `bounds` is `None`.
+    fn x_stats(filter: &AmtSkippingFilter, bounds: Option<(i64, i64)>) -> Scalar {
+        let stats_type = filter.content_stats_field().data_type();
+        let (DataType::Struct(stats), Some((lower, upper))) = (stats_type, bounds) else {
+            return Scalar::Null(stats_type.clone());
+        };
+        let leaf_field = stats.fields().next().unwrap();
+        let DataType::Struct(leaf) = leaf_field.data_type() else {
+            panic!("leaf stats must be a struct");
+        };
+        let leaf_values = [lower, upper, 10, 0].map(Scalar::Long).to_vec();
+        let leaf_stats =
+            StructData::try_new(leaf.fields().cloned().collect(), leaf_values).unwrap();
+        let fields = vec![leaf_field.clone()];
+        Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf_stats)]).unwrap())
+    }
+
+    /// Writes `entries` with their `x` stats as the root manifest and returns a checkpoint action
+    /// referencing it.
+    fn write_root_with_stats(
+        engine: &dyn Engine,
+        filter: &AmtSkippingFilter,
+        entries: &[(ContentTreeNodeEntry, Option<(i64, i64)>)],
+    ) -> CheckpointAction {
+        let location = table_root().join(ROOT_PATH).unwrap();
+        let root = write_with_stats(engine, filter, location, entries);
+        checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap()
+    }
+
+    /// Writes `entries` with their `x` stats as a manifest at `location`.
+    fn write_with_stats(
+        engine: &dyn Engine,
+        filter: &AmtSkippingFilter,
+        location: Url,
+        entries: &[(ContentTreeNodeEntry, Option<(i64, i64)>)],
+    ) -> FileMeta {
+        let (entries, stats): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .map(|(entry, bounds)| (entry.clone(), x_stats(filter, *bounds)))
+            .unzip();
+        write_manifest_with_stats(
+            engine,
+            location,
+            &entries,
+            filter.content_stats_field(),
+            stats,
+        )
+    }
+
+    /// A live root `DataManifest` entry for the leaf at `path` (which need not exist), with the
+    /// given parent `sequenceNumber` and `firstRowId`.
+    fn leaf_ref_entry(
+        path: &str,
+        size: i64,
+        sequence_number: i64,
+        first_row_id: i64,
+    ) -> ContentTreeNodeEntry {
+        let mut entry = data_manifest_entry(path, size, TrackingStatus::Added);
+        entry.tracking = parent_tracking(
+            Some(1),
+            Some(sequence_number),
+            Some(sequence_number),
+            Some(first_row_id),
+        );
+        entry
+    }
+
+    /// A pruned root entry is dropped and a pruned leaf is never read (its file does not exist),
+    /// while the surviving leaves' entries keep the row IDs they get without skipping: each leaf
+    /// is seeded by its own root entry, and a pruned or manifest-DV-removed leaf entry still
+    /// consumes its row IDs.
+    #[rstest]
+    fn read_add_actions_from_amt_skips_entries_and_leaves_ruled_out_by_stats(
+        #[values(ReadShape::AsIs, ReadShape::Split)] shape: ReadShape,
+    ) {
+        let engine = shaped_engine(shape);
+        let filter = x_gt_100(&engine);
+        let leaf = table_root().join("metadata/leaf.parquet").unwrap();
+        let leaf = write_with_stats(
+            &engine,
+            &filter,
+            leaf,
+            &[
+                (
+                    leaf_entry("a.parquet", 1, 10, None, None, None),
+                    Some((0, 10)),
+                ),
+                (
+                    leaf_entry("b.parquet", 2, 20, None, None, None),
+                    Some((150, 300)),
+                ),
+                (
+                    leaf_entry("c.parquet", 3, 30, None, None, None),
+                    Some((150, 300)),
+                ),
+                (leaf_entry("d.parquet", 4, 5, None, None, None), None),
+            ],
+        );
+        let leaf = with_manifest_dv(
+            leaf_ref_entry("metadata/leaf.parquet", leaf.size as i64, 6, 2000),
+            &[2],
+        );
+        let after = table_root().join("metadata/after.parquet").unwrap();
+        let after = write_with_stats(
+            &engine,
+            &filter,
+            after,
+            &[(
+                leaf_entry("e.parquet", 5, 1, None, None, None),
+                Some((101, 101)),
+            )],
+        );
+        let after = leaf_ref_entry("metadata/after.parquet", after.size as i64, 7, 3000);
+        let checkpoint = write_root_with_stats(
+            &engine,
+            &filter,
+            &[
+                (added_data_entry("skip.parquet", 10, 1, 0, 4), Some((0, 10))),
+                (
+                    added_data_entry("keep.parquet", 20, 1, 50, 4),
+                    Some((50, 200)),
+                ),
+                (
+                    leaf_ref_entry("metadata/missing.parquet", 1, 5, 1000),
+                    Some((0, 50)),
+                ),
+                (leaf, Some((0, 500))),
+                (after, None),
+            ],
+        );
+
+        let actual = read_tree(&engine, &checkpoint, Some(&filter)).unwrap();
+        let expected = expected_adds(
+            &engine,
+            &[
+                ("keep.parquet", 20, 50, 4),
+                ("b.parquet", 2, 2010, 6),
+                ("d.parquet", 4, 2060, 6),
+                ("e.parquet", 5, 3000, 7),
+            ],
+        );
+        assert_eq!(
+            concat_batches(&expected.schema(), &actual).unwrap(),
+            expected
+        );
+    }
+
+    /// Entries without stats are kept, and the same tree reads in full without skipping.
+    #[test]
+    fn read_add_actions_from_amt_keeps_entries_without_stats() {
+        let engine = memory_engine();
+        let filter = x_gt_100(&engine);
+        let checkpoint = write_root_with_stats(
+            &engine,
+            &filter,
+            &[(added_data_entry("a.parquet", 10, 1, 0, 4), None)],
+        );
+        let expected = expected_adds(&engine, &[("a.parquet", 10, 0, 4)]);
+        for skipping in [Some(&filter), None] {
+            let actual = read_tree(&engine, &checkpoint, skipping).unwrap();
+            assert_eq!(actual, vec![expected.clone()]);
+        }
+    }
+
+    /// Skipping never hides a root entry the read path cannot yet read.
+    #[rstest]
+    #[case::pre_v4_leaf(
+        ContentTreeNodeEntry {
+            manifest_info: Some(ManifestInfo::default()),
+            ..leaf_ref_entry("metadata/missing.parquet", 1, 5, 1000)
+        },
+        "format version"
+    )]
+    #[case::entry_with_column_files(
+        ContentTreeNodeEntry {
+            column_files: Some(vec![test_column_file()]),
+            ..added_data_entry("a.parquet", 10, 1, 0, 4)
+        },
+        COLUMN_FILES
+    )]
+    fn read_add_actions_from_amt_validates_skipped_entries(
+        #[case] entry: ContentTreeNodeEntry,
+        #[case] message: &str,
+    ) {
+        let engine = memory_engine();
+        let filter = x_gt_100(&engine);
+        let checkpoint = write_root_with_stats(&engine, &filter, &[(entry, Some((0, 10)))]);
+        let result = read_tree(&engine, &checkpoint, Some(&filter));
+        assert_result_error_with_message(result, message);
     }
 
     /// Materializes a [`FilteredEngineData`] by applying its selection vector, so tests can compare

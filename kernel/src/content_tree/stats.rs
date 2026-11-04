@@ -128,7 +128,12 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 /// [`ColumnMetadataKey::ParquetFieldId`] -- the same annotation the `#[field_id = N]` derive macro
 /// attaches to the other `content_tree` structs. It carries no `delta.columnMapping.*` logical
 /// annotations, which are consumed by (not produced from) logical->physical conversion.
-fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> StructField {
+pub(crate) fn field_with_id(
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    field_id: i32,
+) -> StructField {
     StructField::new(name, data_type, nullable).with_metadata([(
         ColumnMetadataKey::ParquetFieldId.as_ref(),
         MetadataValue::Number(field_id as i64),
@@ -325,7 +330,7 @@ fn leaf_stats_field(
 
     // Keyed by the base stats field ID, not the source column's field ID, and without its logical
     // (column-mapping) metadata.
-    let name = ColumnName::new(path).to_string();
+    let name = stats_field_name(&ColumnName::new(path));
     Ok(Some(field_with_id(
         &name,
         stats_struct.into(),
@@ -531,6 +536,11 @@ where
 /// unimplemented) geospatial column.
 pub(crate) fn stats_schema(table_struct: &StructType) -> KernelResult<StructType> {
     collect_stats_schema(table_struct, None)
+}
+
+/// The name of `column`'s stats struct within a [`stats_schema`]: the column's full path.
+pub(crate) fn stats_field_name(column: &ColumnName) -> String {
+    column.to_string()
 }
 
 /// Generates the AMT `content_stats` schema projected to the leaves that carry Delta stats.
